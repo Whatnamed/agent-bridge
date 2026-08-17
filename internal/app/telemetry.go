@@ -715,11 +715,16 @@ func (t *requestTelemetry) observeEvent(direction string, event map[string]any) 
 		t.record.Timeline = append(t.record.Timeline, timeline)
 	}
 
+	// TTFT is intentionally measured at the downstream boundary: this is the
+	// first text delta that the client can actually observe. For Responses the
+	// downstream event keeps the upstream event shape; for Chat Completions the
+	// adapter emits chat.completion.chunk with content in choices[].delta.
+	if direction == "downstream" && downstreamOutputTextEvent(eventType, event) && t.record.FirstOutputTextDeltaMS == nil {
+		t.record.FirstOutputTextDeltaMS = durationPointer(now.Sub(t.started))
+	}
+
 	if direction != "upstream" {
 		return
-	}
-	if firstOutputEvent(eventType, event) && t.record.FirstOutputTextDeltaMS == nil {
-		t.record.FirstOutputTextDeltaMS = durationPointer(now.Sub(t.started))
 	}
 	if reasoningEvent(eventType, item) {
 		if t.record.FirstReasoningEventMS == nil {
@@ -855,6 +860,26 @@ func firstOutputEvent(eventType string, event map[string]any) bool {
 	if eventType == "response.output_item.done" {
 		item := mapAny(event["item"])
 		return stringValue(item["type"]) == "message" && messageHasText(item)
+	}
+	return false
+}
+
+func downstreamOutputTextEvent(eventType string, event map[string]any) bool {
+	if firstOutputEvent(eventType, event) {
+		return true
+	}
+	if eventType != "chat.completion.chunk" {
+		return false
+	}
+	for _, rawChoice := range sliceAny(event["choices"]) {
+		choice := mapAny(rawChoice)
+		if choice == nil {
+			continue
+		}
+		delta := mapAny(choice["delta"])
+		if stringValue(delta["content"]) != "" || stringValue(choice["text"]) != "" {
+			return true
+		}
 	}
 	return false
 }

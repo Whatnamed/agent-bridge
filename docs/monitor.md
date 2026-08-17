@@ -16,6 +16,8 @@ when the upstream supplies them, and stream/event counters.
 The in-memory event timeline is limited by `telemetry.event_memory_limit` and
 defaults to 200 metadata-only events. Each event contains direction, relative
 time, event type, sequence number, item type, and a short hash of an item ID.
+TTFT is measured at the downstream boundary: it is the first non-empty text
+delta visible to the client, not merely the first upstream event.
 The monitor never stores prompt text, output text, reasoning text, encrypted
 reasoning content, tool names, tool arguments/results, authorization headers,
 tokens, or arbitrary request/response JSON.
@@ -65,9 +67,11 @@ GET /dashboard/api/requests/{internal_request_id}
 
 Supported request filters include `range` (`1h`, `6h`, `24h`, `7d`, `30d`, or
 `today`), `model`, `effort`, `status`, and `endpoint`. Supported sorts are
-`newest`, `slowest`, `highest_input`, and `highest_reasoning`. Detail responses
-include the bounded metadata timeline; persistence deliberately excludes that
-timeline.
+`newest`, `slowest`, `highest_input`, and `highest_reasoning`; the UI exposes
+bounded pagination with 50 records per page. Detail responses include request
+and completion timestamps, HTTP/stream/client metadata, supplied usage fields,
+reasoning/tool/event counters, timing fields, and the bounded metadata
+timeline. Persistence deliberately excludes that timeline.
 
 When `dashboard.enabled=false`, all dashboard paths return `404`. Dashboard
 requests are not telemetry request records.

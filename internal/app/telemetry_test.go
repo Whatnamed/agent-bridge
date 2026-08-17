@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -50,6 +51,7 @@ func TestTelemetryCapturesMetadataWithoutPersistingContent(t *testing.T) {
 			"output_tokens": 8, "output_tokens_details": map[string]any{"reasoning_tokens": 5}, "total_tokens": 18,
 		},
 	}})
+	telemetry.observeDownstreamEvent(map[string]any{"type": "response.output_text.delta", "delta": "PRIVATE OUTPUT"})
 	capture := &responseCapture{ResponseWriter: httptest.NewRecorder()}
 	_, _ = capture.Write([]byte("PRIVATE OUTPUT"))
 	store.finish(telemetry, request, capture, int64(len(`{"input":"PRIVATE PROMPT"}`)))
@@ -241,10 +243,22 @@ func TestDashboardServesAPIAndRejectsUnknownRequest(t *testing.T) {
 	defer store.close()
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
 	telemetry := store.begin(request, "/v1/responses")
-	telemetry.observeRequest(map[string]any{"model": "gpt-5.6-luna"}, "/v1/responses")
+	telemetry.observeRequest(map[string]any{
+		"model":     "gpt-5.6-luna",
+		"reasoning": map[string]any{"effort": "max"},
+	}, "/v1/responses")
 	capture := &responseCapture{ResponseWriter: httptest.NewRecorder()}
 	_, _ = capture.Write([]byte("ok"))
 	store.finish(telemetry, request, capture, 2)
+	secondRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"other-model"}`))
+	secondTelemetry := store.begin(secondRequest, "/v1/chat/completions")
+	secondTelemetry.observeRequest(map[string]any{
+		"model": "other-model", "stream": false,
+		"reasoning": map[string]any{"effort": "low"},
+	}, "/v1/chat/completions")
+	secondCapture := &responseCapture{ResponseWriter: httptest.NewRecorder()}
+	secondCapture.WriteHeader(http.StatusBadRequest)
+	store.finish(secondTelemetry, secondRequest, secondCapture, 3)
 	server := &server{cfg: cfg, telemetry: store}
 
 	page := httptest.NewRecorder()
@@ -253,7 +267,7 @@ func TestDashboardServesAPIAndRejectsUnknownRequest(t *testing.T) {
 		t.Fatalf("dashboard page = %d %s", page.Code, page.Body.String())
 	}
 	list := httptest.NewRecorder()
-	server.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/dashboard/api/requests?limit=1", nil))
+	server.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/dashboard/api/requests?limit=2", nil))
 	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), "gpt-5.6-luna") {
 		t.Fatalf("request list = %d %s", list.Code, list.Body.String())
 	}
@@ -261,8 +275,29 @@ func TestDashboardServesAPIAndRejectsUnknownRequest(t *testing.T) {
 	if err := json.Unmarshal(list.Body.Bytes(), &listPayload); err != nil {
 		t.Fatal(err)
 	}
+	if total, ok := numberAsInt(listPayload["total"]); !ok || total != 2 {
+		t.Fatalf("request total = %#v", listPayload["total"])
+	}
 	items := sliceAny(listPayload["data"])
 	id := stringValue(mapAny(items[0])["internal_request_id"])
+	filtered := httptest.NewRecorder()
+	server.ServeHTTP(filtered, httptest.NewRequest(http.MethodGet, "/dashboard/api/requests?range=24h&effort=max&endpoint=%2Fv1%2Fresponses&limit=10", nil))
+	var filteredPayload map[string]any
+	if err := json.Unmarshal(filtered.Body.Bytes(), &filteredPayload); err != nil {
+		t.Fatal(err)
+	}
+	if total, ok := numberAsInt(filteredPayload["total"]); !ok || total != 1 {
+		t.Fatalf("filtered total = %#v", filteredPayload["total"])
+	}
+	pageTwo := httptest.NewRecorder()
+	server.ServeHTTP(pageTwo, httptest.NewRequest(http.MethodGet, "/dashboard/api/requests?range=24h&limit=1&offset=1&sort=newest", nil))
+	var pageTwoPayload map[string]any
+	if err := json.Unmarshal(pageTwo.Body.Bytes(), &pageTwoPayload); err != nil {
+		t.Fatal(err)
+	}
+	if pageTwo.Code != http.StatusOK || len(sliceAny(pageTwoPayload["data"])) != 1 || boolValue(pageTwoPayload["has_more"]) {
+		t.Fatalf("pagination response = %#v", pageTwoPayload)
+	}
 	detail := httptest.NewRecorder()
 	server.ServeHTTP(detail, httptest.NewRequest(http.MethodGet, "/dashboard/api/requests/"+id, nil))
 	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), "timeline") {
@@ -301,5 +336,237 @@ func TestTelemetryContextDoesNotChangeCancelledRequestSemantics(t *testing.T) {
 	store.finish(telemetry, request, capture, 2)
 	if store.recentRecords()[0].Outcome != "cancelled" {
 		t.Fatalf("cancelled outcome = %s", store.recentRecords()[0].Outcome)
+	}
+}
+
+func TestTelemetryTracksTerminalOutcomesAndMissingUsage(t *testing.T) {
+	cases := []struct {
+		name            string
+		eventType       string
+		httpStatus      int
+		stream          bool
+		streamError     bool
+		wantOutcome     string
+		wantFailed      int
+		wantIncomplete  int
+		wantInputTokens bool
+	}{
+		{name: "response failed", eventType: "response.failed", httpStatus: http.StatusOK, stream: true, wantOutcome: "failed", wantFailed: 1, wantInputTokens: true},
+		{name: "response incomplete", eventType: "response.incomplete", httpStatus: http.StatusOK, stream: true, wantOutcome: "failed", wantIncomplete: 1, wantInputTokens: true},
+		{name: "upstream stream error", httpStatus: http.StatusBadGateway, stream: true, streamError: true, wantOutcome: "failed"},
+		{name: "non streamed response", eventType: "response.completed", httpStatus: http.StatusOK, stream: false, wantOutcome: "success", wantInputTokens: true},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := defaultConfig()
+			cfg.StateDir = t.TempDir()
+			store := newTelemetryStore(cfg, nil)
+			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"test-model"}`))
+			telemetry := store.begin(request, "/v1/responses")
+			telemetry.observeRequest(map[string]any{"model": "test-model", "stream": test.stream, "reasoning": map[string]any{"effort": "max"}}, "/v1/responses")
+			if test.eventType != "" {
+				telemetry.observeUpstreamEvent(map[string]any{
+					"type": test.eventType,
+					"response": map[string]any{
+						"model": "test-model",
+						"usage": map[string]any{"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+					},
+				})
+				if !test.stream {
+					telemetry.observeFinalResponse(map[string]any{"model": "test-model", "usage": map[string]any{"input_tokens": 11, "output_tokens": 7, "total_tokens": 18}})
+				}
+			} else if test.streamError {
+				telemetry.observeStreamError()
+			}
+			capture := &responseCapture{ResponseWriter: httptest.NewRecorder()}
+			capture.WriteHeader(test.httpStatus)
+			store.finish(telemetry, request, capture, 29)
+			store.close()
+
+			records := store.recentRecords()
+			if len(records) != 1 {
+				t.Fatalf("records = %d", len(records))
+			}
+			record := records[0]
+			if record.Outcome != test.wantOutcome || record.ResponseFailedCount != test.wantFailed || record.ResponseIncompleteCount != test.wantIncomplete {
+				t.Fatalf("record outcome/counters = %#v", record)
+			}
+			if test.wantInputTokens != (record.InputTokens != nil) {
+				t.Fatalf("input token presence = %v, want %v", record.InputTokens != nil, test.wantInputTokens)
+			}
+			if test.streamError != record.UpstreamStreamError {
+				t.Fatalf("stream error = %v, want %v", record.UpstreamStreamError, test.streamError)
+			}
+		})
+	}
+}
+
+func TestTelemetryTracksReasoningSummaryToolsAndDownstreamTTFT(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	cfg.TelemetryEventMemoryLimit = 64
+	store := newTelemetryStore(cfg, nil)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.6-luna"}`))
+	telemetry := store.begin(request, "/v1/responses")
+	telemetry.observeRequest(map[string]any{"model": "gpt-5.6-luna", "stream": true, "reasoning": map[string]any{"effort": "max"}, "parallel_tool_calls": true}, "/v1/responses")
+	telemetry.observePrepared(map[string]any{"model": "gpt-5.6-luna", "reasoning": map[string]any{"effort": "max"}, "include": []any{"reasoning.encrypted_content"}})
+	for _, id := range []string{"reasoning-one", "reasoning-two"} {
+		telemetry.observeUpstreamEvent(map[string]any{"type": "response.output_item.added", "item": map[string]any{"id": id, "type": "reasoning", "encrypted_content": "cipher-" + id, "summary": []any{map[string]any{"type": "summary_text"}}}})
+		telemetry.observeUpstreamEvent(map[string]any{"type": "response.output_item.done", "item": map[string]any{"id": id, "type": "reasoning", "encrypted_content": "cipher-" + id, "summary": []any{map[string]any{"type": "summary_text"}}}})
+	}
+	telemetry.observeUpstreamEvent(map[string]any{"type": "response.reasoning_summary_text.delta", "delta": "private summary"})
+	telemetry.observeUpstreamEvent(map[string]any{"type": "response.reasoning_summary_text.delta", "delta": "private summary 2"})
+	telemetry.observeUpstreamEvent(map[string]any{"type": "response.output_item.added", "item": map[string]any{"id": "call-one", "type": "function_call"}})
+	telemetry.observeUpstreamEvent(map[string]any{"type": "response.output_item.done", "item": map[string]any{"id": "call-one", "type": "function_call"}})
+	telemetry.observeUpstreamEvent(map[string]any{"type": "response.completed", "response": map[string]any{"model": "gpt-5.6-luna", "usage": map[string]any{"input_tokens": 100, "input_tokens_details": map[string]any{"cached_tokens": 40}, "output_tokens": 30, "output_tokens_details": map[string]any{"reasoning_tokens": 20}, "total_tokens": 130}}})
+	telemetry.observeDownstreamEvent(map[string]any{"type": "response.output_text.delta", "delta": "visible text"})
+	capture := &responseCapture{ResponseWriter: httptest.NewRecorder()}
+	capture.Write([]byte("visible text"))
+	store.finish(telemetry, request, capture, 42)
+	store.close()
+
+	record := store.recentRecords()[0]
+	if record.ReasoningItemCount != 2 || record.ReadableReasoningItems != 2 || record.EncryptedReasoningItems != 2 || record.ReasoningSummaryDeltas != 2 {
+		t.Fatalf("reasoning counters = %#v", record)
+	}
+	if record.ToolCallCount != 1 || record.FunctionCallCount != 1 || record.UpstreamEventCount != 9 || record.DownstreamEventCount != 1 {
+		t.Fatalf("tool/event counters = %#v", record)
+	}
+	if record.TTFTMS == nil || record.FirstUpstreamEventMS == nil || record.FirstReasoningEventMS == nil || record.FirstToolCallMS == nil {
+		t.Fatalf("timing fields = %#v", record)
+	}
+	if record.InputTokens == nil || *record.InputTokens != 100 || record.CachedInputTokens == nil || *record.CachedInputTokens != 40 || record.OutputTokens == nil || *record.OutputTokens != 30 || record.ReasoningTokens == nil || *record.ReasoningTokens != 20 || record.TotalTokens == nil || *record.TotalTokens != 130 {
+		t.Fatalf("usage fields = %#v", record)
+	}
+	data, err := os.ReadFile(filepath.Join(store.telemetryDir, time.Now().Local().Format(telemetryDateLayout)+".jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"cipher-reasoning-one", "private summary", "visible text"} {
+		if bytes.Contains(data, []byte(secret)) {
+			t.Fatalf("telemetry persisted %q: %s", secret, data)
+		}
+	}
+}
+
+func TestTelemetryWriteFailureDoesNotChangeModelOutcome(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	store := newTelemetryStore(cfg, nil)
+	badPath := filepath.Join(t.TempDir(), "telemetry-file")
+	if err := os.WriteFile(badPath, []byte("not a directory"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store.telemetryDir = badPath
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	telemetry := store.begin(request, "/v1/responses")
+	telemetry.observeRequest(map[string]any{"model": "test-model"}, "/v1/responses")
+	capture := &responseCapture{ResponseWriter: httptest.NewRecorder()}
+	capture.Write([]byte("ok"))
+	store.finish(telemetry, request, capture, 2)
+	store.close()
+	if store.recentRecords()[0].Outcome != "success" || store.writerErrorCount() == 0 {
+		t.Fatalf("write failure changed outcome or was not recorded: %#v errors=%d", store.recentRecords()[0], store.writerErrorCount())
+	}
+}
+
+func TestTelemetryQuotaRefreshIsBoundedAndFailOpen(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	fetcher := &testQuotaFetcher{snapshot: map[string]any{"available": true}}
+	store := newTelemetryStore(cfg, fetcher)
+	defer store.close()
+	store.refreshQuota()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && fetcher.calls.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	store.refreshQuota()
+	store.refreshQuota()
+	if calls := fetcher.calls.Load(); calls != 1 {
+		t.Fatalf("quota calls = %d, want one call inside refresh window", calls)
+	}
+	if store.quotaSnapshot() == nil || store.quotaUpdateTime().IsZero() {
+		t.Fatalf("quota snapshot = %#v fetched_at=%v", store.quotaSnapshot(), store.quotaUpdateTime())
+	}
+
+	failing := &testQuotaFetcher{err: context.DeadlineExceeded}
+	failingStore := newTelemetryStore(cfg, failing)
+	defer failingStore.close()
+	failingStore.refreshQuota()
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && !failingStore.quotaUnavailable() {
+		time.Sleep(time.Millisecond)
+	}
+	if !failingStore.quotaUnavailable() {
+		t.Fatal("quota failure was not recorded")
+	}
+}
+
+func TestTelemetryRecordsSurviveRestartWithoutTimelinePersistence(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	first := newTelemetryStore(cfg, nil)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	telemetry := first.begin(request, "/v1/responses")
+	telemetry.observeRequest(map[string]any{"model": "restart-model"}, "/v1/responses")
+	telemetry.observeUpstreamEvent(map[string]any{"type": "response.completed"})
+	capture := &responseCapture{ResponseWriter: httptest.NewRecorder()}
+	capture.Write([]byte("ok"))
+	first.finish(telemetry, request, capture, 2)
+	first.close()
+
+	second := newTelemetryStore(cfg, nil)
+	defer second.close()
+	records := second.recentRecords()
+	if len(records) != 1 || records[0].Model != "restart-model" || records[0].Timeline != nil {
+		t.Fatalf("reloaded records = %#v", records)
+	}
+}
+
+type testQuotaFetcher struct {
+	calls    atomic.Int32
+	snapshot map[string]any
+	err      error
+}
+
+func (f *testQuotaFetcher) fetchQuota(context.Context) (map[string]any, error) {
+	f.calls.Add(1)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return cloneMap(f.snapshot), nil
+}
+
+func BenchmarkTelemetrySyntheticEvents(b *testing.B) {
+	for _, enabled := range []bool{false, true} {
+		name := "disabled"
+		if enabled {
+			name = "enabled"
+		}
+		b.Run(name, func(b *testing.B) {
+			cfg := defaultConfig()
+			cfg.TelemetryEventMemoryLimit = 200
+			var store *telemetryStore
+			if enabled {
+				store = &telemetryStore{cfg: cfg, enabled: true}
+			}
+			event := map[string]any{"type": "response.output_text.delta", "sequence_number": 1, "delta": "x"}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				var telemetry *requestTelemetry
+				if store != nil {
+					request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+					telemetry = store.begin(request, "/v1/responses")
+				}
+				for j := 0; j < 1000; j++ {
+					if telemetry != nil {
+						telemetry.observeUpstreamEvent(event)
+					}
+				}
+			}
+			b.StopTimer()
+		})
 	}
 }

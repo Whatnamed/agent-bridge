@@ -38,11 +38,15 @@ func newContractEnvironment(t *testing.T, mutate func(*config)) *contractEnviron
 	if mutate != nil {
 		mutate(&cfg)
 	}
+	cfg.StateDir = t.TempDir()
 	b := newBackend(cfg)
+	telemetry := newTelemetryStore(cfg, b)
+	t.Cleanup(telemetry.close)
 	s := &server{
 		cfg: cfg, backend: b,
 		responses: newResponseStore(cfg.MaxStored),
 		chats:     newChatStore(cfg.MaxStored),
+		telemetry: telemetry,
 	}
 	if cfg.Concurrency > 0 {
 		s.slots = make(chan struct{}, cfg.Concurrency)
