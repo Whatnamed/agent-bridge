@@ -11,6 +11,24 @@ $script:TestConfig = [pscustomobject]@{
     BridgePort = 18080
 }
 
+$script:RuntimeTestConfig = [pscustomobject]@{
+    BridgePackageSpec = 'openai-api-server-via-codex==0.2.0'
+    BridgeCommand = 'openai-api-server-via-codex'
+    BridgeHost = '127.0.0.1'
+    BridgePort = 18080
+    RunDirectory = 'C:\Users\hasee\.config\openai-api-server-via-codex\run'
+    PidFilePath = 'C:\Users\hasee\.config\openai-api-server-via-codex\run\server-127.0.0.1-18080.pid'
+    LogFilePath = 'C:\Users\hasee\.config\openai-api-server-via-codex\run\server-127.0.0.1-18080.log'
+    AuthJsonPath = 'C:\Users\hasee\.codex\auth.json'
+}
+
+function Get-TestArgumentValue {
+    param([string[]]$Arguments, [string]$Flag)
+    $index = [Array]::IndexOf($Arguments, $Flag)
+    if ($index -lt 0 -or $index + 1 -ge $Arguments.Count) { return $null }
+    return $Arguments[$index + 1]
+}
+
 function New-TestProcessRecord {
     param(
         [int]$ProcessId,
@@ -209,5 +227,43 @@ Describe 'Codex Bridge ownership and state model' {
         $stopped.StartEnabled | Should Be $true
         $stopped.StopEnabled | Should Be $false
         $abnormal.StopEnabled | Should Be $false
+    }
+}
+
+Describe 'Codex Bridge deterministic runtime arguments' {
+    It 'passes explicit target host, port, state, PID, log, and auth paths' {
+        $start = New-BridgeRuntimeArguments -Config $script:RuntimeTestConfig -Verb 'start' -IncludeAuthJson -IncludeVerbose
+        $stop = New-BridgeRuntimeArguments -Config $script:RuntimeTestConfig -Verb 'stop'
+        $status = New-BridgeRuntimeArguments -Config $script:RuntimeTestConfig -Verb 'status'
+
+        foreach ($arguments in @($start, $stop, $status)) {
+            (Get-TestArgumentValue -Arguments $arguments -Flag '--host') | Should Be '127.0.0.1'
+            (Get-TestArgumentValue -Arguments $arguments -Flag '--port') | Should Be '18080'
+            (Get-TestArgumentValue -Arguments $arguments -Flag '--state-dir') | Should Be $script:RuntimeTestConfig.RunDirectory
+            (Get-TestArgumentValue -Arguments $arguments -Flag '--pid-file') | Should Be $script:RuntimeTestConfig.PidFilePath
+            (Get-TestArgumentValue -Arguments $arguments -Flag '--log-file') | Should Be $script:RuntimeTestConfig.LogFilePath
+        }
+
+        (Get-TestArgumentValue -Arguments $start -Flag '--auth-json') | Should Be $script:RuntimeTestConfig.AuthJsonPath
+        (@($start | Where-Object { $_ -eq '--verbose' }).Count) | Should Be 1
+        (@($stop | Where-Object { $_ -eq '--auth-json' }).Count) | Should Be 0
+        (@($status | Where-Object { $_ -eq '--auth-json' }).Count) | Should Be 0
+    }
+
+    It 'does not inherit host or port from an external config object' {
+        $externalConfig = [pscustomobject]@{ Host = '0.0.0.0'; Port = 19090 }
+        $start = New-BridgeRuntimeArguments -Config $script:RuntimeTestConfig -Verb 'start' -IncludeAuthJson
+
+        (@($start | Where-Object { $_ -eq $externalConfig.Host }).Count) | Should Be 0
+        (@($start | Where-Object { $_ -eq ([string]$externalConfig.Port) }).Count) | Should Be 0
+        (Get-TestArgumentValue -Arguments $start -Flag '--host') | Should Be $script:RuntimeTestConfig.BridgeHost
+        (Get-TestArgumentValue -Arguments $start -Flag '--port') | Should Be ([string]$script:RuntimeTestConfig.BridgePort)
+    }
+
+    It 'keeps the configured PID and log paths under the configured run directory' {
+        ([IO.Path]::GetDirectoryName($script:RuntimeTestConfig.PidFilePath)) | Should Be $script:RuntimeTestConfig.RunDirectory
+        ([IO.Path]::GetDirectoryName($script:RuntimeTestConfig.LogFilePath)) | Should Be $script:RuntimeTestConfig.RunDirectory
+        ([IO.Path]::GetFileName($script:RuntimeTestConfig.PidFilePath)) | Should Be 'server-127.0.0.1-18080.pid'
+        ([IO.Path]::GetFileName($script:RuntimeTestConfig.LogFilePath)) | Should Be 'server-127.0.0.1-18080.log'
     }
 }

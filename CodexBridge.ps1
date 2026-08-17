@@ -37,7 +37,8 @@ if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
     throw 'USERPROFILE is not available; refusing to construct Codex runtime paths.'
 }
 $RunDirectory = Join-Path (Join-Path $env:USERPROFILE '.config') 'openai-api-server-via-codex\run'
-$PidFileName = 'server-127.0.0.1-18080.pid'
+$PidFileName = "server-$BridgeHost-$BridgePort.pid"
+$LogFileName = "server-$BridgeHost-$BridgePort.log"
 $HealthUri = "http://$BridgeHost`:$BridgePort/healthz"
 $AuthJsonPath = Join-Path (Join-Path $env:USERPROFILE '.codex') 'auth.json'
 $DesktopPath = [Environment]::GetFolderPath('Desktop')
@@ -68,6 +69,8 @@ $script:Config = [pscustomobject]@{
     BridgePort = $BridgePort
     RunDirectory = $RunDirectory
     PidFilePath = (Join-Path $RunDirectory $PidFileName)
+    LogFileName = $LogFileName
+    LogFilePath = (Join-Path $RunDirectory $LogFileName)
     HealthUri = $HealthUri
     AuthJsonPath = $AuthJsonPath
     HealthTimeoutMilliseconds = $HealthTimeoutMilliseconds
@@ -235,14 +238,7 @@ function Get-DeepProcessRecords {
 }
 
 function Find-LogPath {
-    $exactPath = Join-Path $script:Config.RunDirectory 'server-127.0.0.1-18080.log'
-    try {
-        if (Test-Path -LiteralPath $exactPath -PathType Leaf) { return $exactPath }
-        if (-not (Test-Path -LiteralPath $script:Config.RunDirectory -PathType Container)) { return $null }
-        $candidate = Get-ChildItem -LiteralPath $script:Config.RunDirectory -File -Filter 'server-127.0.0.1-18080*.log' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        if ($candidate) { return $candidate.FullName }
-    } catch { }
-    return $null
+    return $script:Config.LogFilePath
 }
 
 function New-BridgeObservation {
@@ -500,7 +496,7 @@ function Wait-ForStarted {
     if (-not $lastObservation) { $lastObservation = Get-BridgeObservation -Deep }
     $terminated = Stop-ControllerOwnedInvocation -Invocation $Invocation
     $summary = if ($terminated) { Get-InvocationSummary -Invocation $Invocation } else { [pscustomobject]@{ Exited = $false; ExitCode = $null; StdOut = ''; StdErr = '' } }
-    [pscustomobject]@{ Success = $false; Observation = $lastObservation; Message = if ($terminated) { "Codex Bridge 启动超时。请打开日志：$($lastObservation.LogPath ?? (Join-Path $script:Config.RunDirectory 'server-127.0.0.1-18080.log'))" } else { '启动命令超时且未能确认回收，未继续执行其他进程操作。' }; ExitCode = $summary.ExitCode; InvocationExited = $summary.Exited; StdOut = $summary.StdOut; StdErr = $summary.StdErr }
+    [pscustomobject]@{ Success = $false; Observation = $lastObservation; Message = if ($terminated) { "Codex Bridge 启动超时。请打开日志：$($lastObservation.LogPath ?? $script:Config.LogFilePath)" } else { '启动命令超时且未能确认回收，未继续执行其他进程操作。' }; ExitCode = $summary.ExitCode; InvocationExited = $summary.Exited; StdOut = $summary.StdOut; StdErr = $summary.StdErr }
 }
 
 function Cleanup-StartedInvocation {
@@ -640,7 +636,7 @@ function Invoke-StartOperation {
     if ($before.ObservedState -ne 'Stopped' -or $before.PidFilePresent -or @($before.AllBridgePids).Count -gt 0) { return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = '检测到 bridge 进程、PID 文件或不完整运行证据，未重复启动。请先执行停止或查看日志。'; FallbackUsed = $false } }
     if (-not (Test-Path -LiteralPath $script:Config.UvxPath -PathType Leaf)) { return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = "找不到 uvx：$($script:Config.UvxPath)"; FallbackUsed = $false } }
     if (-not (Test-Path -LiteralPath $script:Config.AuthJsonPath -PathType Leaf)) { return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = "找不到 Codex OAuth 文件：$($script:Config.AuthJsonPath)"; FallbackUsed = $false } }
-    $startArguments = @('--from', $script:Config.BridgePackageSpec, $script:Config.BridgeCommand, 'start', '--verbose')
+    $startArguments = New-BridgeRuntimeArguments -Config $script:Config -Verb 'start' -IncludeAuthJson -IncludeVerbose
     $invocation = $null
     try { $invocation = New-HiddenProcess -Arguments $startArguments } catch { return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = $_.Exception.Message; FallbackUsed = $false } }
     $waitResult = $null
@@ -664,7 +660,7 @@ function Invoke-StopOperation {
     if ((Test-StoppedEvidence -Observation $before) -and @($before.ForeignListenerPids).Count -eq 0) { Remove-StalePidFileIfSafe -Observation $before | Out-Null; return [pscustomobject]@{ Success = $true; Operation = 'Stop'; Observation = Get-BridgeObservation -Deep; Message = 'Codex Bridge 已停止'; FallbackUsed = $false } }
     if (-not $before.CanAttemptOfficialStop) { return [pscustomobject]@{ Success = $false; Operation = 'Stop'; Observation = $before; Message = '没有足够证据确认当前 bridge daemon，未执行官方 stop 或强制终止。'; FallbackUsed = $false; Refused = $true } }
     $snapshot = $before.OwnershipSnapshot
-    $stopArguments = @('--from', $script:Config.BridgePackageSpec, $script:Config.BridgeCommand, 'stop')
+    $stopArguments = New-BridgeRuntimeArguments -Config $script:Config -Verb 'stop'
     $official = Invoke-UvxCommand -Arguments $stopArguments -WaitMilliseconds 15000
     if (-not $official.Exited) { return [pscustomobject]@{ Success = $false; Operation = 'Stop'; Observation = Get-BridgeObservation -Deep; Message = "官方 stop invocation 未能确认退出，未进入 bridge fallback。$($official.Error)"; FallbackUsed = $false; Refused = $true; OfficialExitCode = $official.ExitCode; StdOut = $official.StdOut; StdErr = $official.StdErr } }
     Start-Sleep -Milliseconds $script:Config.StopGraceMilliseconds
@@ -805,7 +801,7 @@ function Show-Notice {
 
 function Show-OperationError {
     param([string]$Message)
-    $logPath = if ($script:CurrentObservation -and $script:CurrentObservation.LogPath) { $script:CurrentObservation.LogPath } else { Join-Path $script:Config.RunDirectory 'server-127.0.0.1-18080.log' }
+    $logPath = if ($script:CurrentObservation -and $script:CurrentObservation.LogPath) { $script:CurrentObservation.LogPath } else { $script:Config.LogFilePath }
     [void][System.Windows.Forms.MessageBox]::Show($form,"$Message`n`n日志：$logPath",'Codex Bridge',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error)
 }
 
@@ -897,7 +893,7 @@ function Request-ControllerExit {
 }
 
 function Open-Log {
-    $path = if ($script:CurrentObservation -and $script:CurrentObservation.LogPath) { $script:CurrentObservation.LogPath } else { Join-Path $script:Config.RunDirectory 'server-127.0.0.1-18080.log' }
+    $path = if ($script:CurrentObservation -and $script:CurrentObservation.LogPath) { $script:CurrentObservation.LogPath } else { $script:Config.LogFilePath }
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { [void][System.Windows.Forms.MessageBox]::Show($form,"日志不存在。`n`n运行目录：$($script:Config.RunDirectory)",'Codex Bridge',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information); return }
     try { $startInfo = [System.Diagnostics.ProcessStartInfo]::new(); $startInfo.FileName = $path; $startInfo.UseShellExecute = $true; [void][System.Diagnostics.Process]::Start($startInfo) } catch { Show-OperationError -Message "无法打开日志：$($_.Exception.Message)" }
 }

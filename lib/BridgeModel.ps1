@@ -13,6 +13,30 @@ function Get-BridgeRecordValue {
     return $property.Value
 }
 
+function New-BridgeRuntimeArguments {
+    param(
+        [Parameter(Mandatory)] $Config,
+        [ValidateSet('start','stop','status')]
+        [string] $Verb,
+        [switch] $IncludeAuthJson,
+        [switch] $IncludeVerbose
+    )
+
+    $arguments = @(
+        '--from', [string]$Config.BridgePackageSpec,
+        [string]$Config.BridgeCommand,
+        $Verb,
+        '--host', [string]$Config.BridgeHost,
+        '--port', [string]$Config.BridgePort,
+        '--state-dir', [string]$Config.RunDirectory,
+        '--pid-file', [string]$Config.PidFilePath,
+        '--log-file', [string]$Config.LogFilePath
+    )
+    if ($IncludeAuthJson) { $arguments += @('--auth-json', [string]$Config.AuthJsonPath) }
+    if ($IncludeVerbose) { $arguments += '--verbose' }
+    return [string[]]$arguments
+}
+
 function Get-BridgeCreationStamp {
     param($Value)
 

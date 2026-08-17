@@ -22,9 +22,13 @@
 - port：`18080`
 - health：`http://127.0.0.1:18080/healthz`
 - run directory：`$env:USERPROFILE\.config\openai-api-server-via-codex\run\`
+- PID file：`$env:USERPROFILE\.config\openai-api-server-via-codex\run\server-127.0.0.1-18080.pid`
+- log file：`$env:USERPROFILE\.config\openai-api-server-via-codex\run\server-127.0.0.1-18080.log`
 - auth path：`$env:USERPROFILE\.codex\auth.json`
 
 当前固定使用已验证的 `0.2.0`。将来升级只修改顶部的 `$BridgeVersion`，启动和停止逻辑会自动使用同一个版本配置。
+
+控制器通过统一的 runtime argument builder 为 `start`、`stop` 和 `status` 显式传入 host、port、state directory、PID file 和 log file；`start` 另外显式传入 auth path。外部 `config.toml`、环境变量或 bridge 默认值不会改变控制器认知的目标 instance。
 
 ## 安装和启动
 
@@ -61,7 +65,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File E:\Codex\CodexBridge\InstallShortc
 停止总是先执行固定版本的官方命令：
 
 ```text
-uvx --from openai-api-server-via-codex==0.2.0 openai-api-server-via-codex stop
+uvx --from openai-api-server-via-codex==0.2.0 openai-api-server-via-codex stop --host 127.0.0.1 --port 18080 --state-dir <RunDirectory> --pid-file <PidFilePath> --log-file <LogFilePath>
 ```
 
 官方 stop 返回后，控制器会确认它自己的 CLI invocation 已退出，并捕获有上限的 stdout/stderr；超时时只回收该控制器创建的 CLI invocation process tree，无法确认退出时不会进入 bridge fallback。
