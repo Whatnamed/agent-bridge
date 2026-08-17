@@ -15,7 +15,7 @@ jobs:
 
       - name: Install Pester 3
         shell: pwsh
-        run: Install-Module Pester -RequiredVersion 3.4.0 -Scope CurrentUser -Force -AllowClobber
+        run: Install-Module Pester -RequiredVersion 3.4.0 -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck
 
       - name: Parse PowerShell sources
         shell: pwsh
