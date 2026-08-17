@@ -637,19 +637,13 @@ func BenchmarkTelemetrySyntheticEvents(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			cfg := defaultConfig()
 			cfg.TelemetryEventMemoryLimit = 200
-			var store *telemetryStore
-			if enabled {
-				store = &telemetryStore{cfg: cfg, enabled: true}
-			}
+			store := &telemetryStore{cfg: cfg, enabled: enabled}
 			event := map[string]any{"type": "response.output_text.delta", "sequence_number": 1, "delta": "x"}
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				var telemetry *requestTelemetry
-				if store != nil {
-					request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
-					telemetry = store.begin(request, "/v1/responses")
-				}
+				request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+				telemetry := store.begin(request, "/v1/responses")
 				for j := 0; j < 1000; j++ {
 					if telemetry != nil {
 						telemetry.observeUpstreamEvent(event)
