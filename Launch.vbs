@@ -13,25 +13,31 @@ If Not fso.FileExists(scriptPath) Then
 End If
 
 pwshPath = shell.ExpandEnvironmentStrings("%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe")
-If Not fso.FileExists(pwshPath) Then
-    pwshPath = "pwsh.exe"
-End If
-
 shell.CurrentDirectory = controllerDirectory
 
-commandLine = ExecutableToken(pwshPath) & " -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File " & Quote(scriptPath)
-launched = TryLaunch(shell, commandLine, scriptPath)
+launched = False
+If fso.FileExists(pwshPath) Then
+    commandLine = ExecutableToken(pwshPath) & " -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File " & Quote(scriptPath)
+    launched = TryLaunch(shell, commandLine, scriptPath)
+End If
 
 If Not launched Then
-    ' The WindowsApps execution alias can exist while being unusable by WSH.
-    ' Fall back to the pwsh.exe found through PATH without changing PATH.
+    pwshPath = shell.ExpandEnvironmentStrings("%ProgramFiles%\PowerShell\7\pwsh.exe")
+    If fso.FileExists(pwshPath) Then
+        commandLine = ExecutableToken(pwshPath) & " -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File " & Quote(scriptPath)
+        launched = TryLaunch(shell, commandLine, scriptPath)
+    End If
+End If
+
+If Not launched Then
+    ' Last resort: use PowerShell 7 resolved through PATH without changing PATH.
     pwshPath = "pwsh.exe"
     commandLine = ExecutableToken(pwshPath) & " -NoLogo -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File " & Quote(scriptPath)
     launched = TryLaunch(shell, commandLine, scriptPath)
 End If
 
 If Not launched Then
-    MsgBox "Unable to start PowerShell 7. WindowsApps and PATH were both tried.", vbCritical, "Codex Bridge"
+    MsgBox "Unable to start PowerShell 7. WindowsApps, ProgramFiles and PATH were all tried.", vbCritical, "Codex Bridge"
     WScript.Quit 3
 End If
 
@@ -48,7 +54,7 @@ Function ExecutableToken(value)
 End Function
 
 Function TryLaunch(shellObject, fullCommandLine, targetScript)
-    Dim child, startError
+    Dim child, startError, attempt
     TryLaunch = False
     On Error Resume Next
     Set child = shellObject.Exec(fullCommandLine)
@@ -58,13 +64,17 @@ Function TryLaunch(shellObject, fullCommandLine, targetScript)
 
     If startError <> 0 Or child Is Nothing Then Exit Function
 
-    ' Give pwsh enough time to create the controller, while keeping WScript hidden.
-    WScript.Sleep 700
-    If ControllerIsRunning(targetScript) Then
-        TryLaunch = True
-    ElseIf child.Status = 0 Then
-        TryLaunch = True
-    End If
+    ' Confirm the controller process rather than treating a still-running pwsh
+    ' launcher as success. This also lets the caller try the next PowerShell 7
+    ' location when an alias or installation is unusable.
+    For attempt = 1 To 20
+        If ControllerIsRunning(targetScript) Then
+            TryLaunch = True
+            Exit For
+        End If
+        If child.Status <> 0 Then Exit For
+        WScript.Sleep 100
+    Next
 
     Set child = Nothing
 End Function

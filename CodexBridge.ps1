@@ -13,6 +13,14 @@ if ([System.Threading.Thread]::CurrentThread.ApartmentState -ne [System.Threadin
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+$ControllerDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ModelPath = Join-Path $ControllerDirectory 'lib\BridgeModel.ps1'
+if (-not (Test-Path -LiteralPath $ModelPath -PathType Leaf)) {
+    [Console]::Error.WriteLine("Bridge model not found: $ModelPath")
+    exit 3
+}
+. $ModelPath
+
 # ---- Runtime configuration: change BridgeVersion only when upgrading the verified bridge. ----
 $UvxPath = 'E:\Dev\uv\uvx.exe'
 $BridgePackage = 'openai-api-server-via-codex'
@@ -21,21 +29,33 @@ $BridgeCommand = $BridgePackage
 $BridgePackageSpec = "$BridgePackage==$BridgeVersion"
 $BridgeIdentityMarker = $BridgePackage
 $BridgeExecutableName = "$BridgePackage.exe"
+$BridgeSupervisorCommandMarker = 'daemon-run'
 $BridgeHost = '127.0.0.1'
 [int]$BridgePort = 18080
-$RunDirectory = 'C:\Users\hasee\.config\openai-api-server-via-codex\run'
+
+if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+    throw 'USERPROFILE is not available; refusing to construct Codex runtime paths.'
+}
+$RunDirectory = Join-Path (Join-Path $env:USERPROFILE '.config') 'openai-api-server-via-codex\run'
 $PidFileName = 'server-127.0.0.1-18080.pid'
 $HealthUri = "http://$BridgeHost`:$BridgePort/healthz"
-$AuthJsonPath = 'C:\Users\hasee\.codex\auth.json'
+$AuthJsonPath = Join-Path (Join-Path $env:USERPROFILE '.codex') 'auth.json'
 $DesktopPath = [Environment]::GetFolderPath('Desktop')
 
 [int]$HealthTimeoutMilliseconds = 1500
-[int]$RefreshIntervalMilliseconds = 1000
+[int]$LightProbeIntervalMilliseconds = 4000
+[int]$DeepProbeIntervalMilliseconds = 45000
+[int]$UiTimerIntervalMilliseconds = 250
 [int]$StartTimeoutSeconds = 60
 [int]$StopGraceMilliseconds = 2000
 [int]$StopTimeoutSeconds = 12
+[int]$FallbackPassLimit = 8
+[int]$MaxDeepProcessRecords = 512
+[int]$CliOutputLimit = 8000
 
 $script:Config = [pscustomobject]@{
+    ControllerDirectory = $ControllerDirectory
+    ModelPath = $ModelPath
     UvxPath = $UvxPath
     BridgePackage = $BridgePackage
     BridgeVersion = $BridgeVersion
@@ -43,6 +63,7 @@ $script:Config = [pscustomobject]@{
     BridgePackageSpec = $BridgePackageSpec
     BridgeIdentityMarker = $BridgeIdentityMarker
     BridgeExecutableName = $BridgeExecutableName
+    BridgeSupervisorCommandMarker = $BridgeSupervisorCommandMarker
     BridgeHost = $BridgeHost
     BridgePort = $BridgePort
     RunDirectory = $RunDirectory
@@ -50,165 +71,171 @@ $script:Config = [pscustomobject]@{
     HealthUri = $HealthUri
     AuthJsonPath = $AuthJsonPath
     HealthTimeoutMilliseconds = $HealthTimeoutMilliseconds
-    RefreshIntervalMilliseconds = $RefreshIntervalMilliseconds
+    LightProbeIntervalMilliseconds = $LightProbeIntervalMilliseconds
+    DeepProbeIntervalMilliseconds = $DeepProbeIntervalMilliseconds
+    UiTimerIntervalMilliseconds = $UiTimerIntervalMilliseconds
     StartTimeoutSeconds = $StartTimeoutSeconds
     StopGraceMilliseconds = $StopGraceMilliseconds
     StopTimeoutSeconds = $StopTimeoutSeconds
+    FallbackPassLimit = $FallbackPassLimit
+    MaxDeepProcessRecords = $MaxDeepProcessRecords
+    CliOutputLimit = $CliOutputLimit
 }
 
-function Get-HealthOk {
+$script:HealthClient = $null
+$script:LastDeepObservation = $null
+
+function Initialize-WorkerResources {
+    if ($script:HealthClient) { return }
+    $script:HealthClient = [System.Net.Http.HttpClient]::new()
+    $script:HealthClient.Timeout = [TimeSpan]::FromMilliseconds($script:Config.HealthTimeoutMilliseconds)
+}
+
+function Dispose-WorkerResources {
+    if ($script:HealthClient) {
+        try { $script:HealthClient.Dispose() } catch { }
+        $script:HealthClient = $null
+    }
+}
+
+function Get-HealthProbe {
+    $cancellation = $null
+    $response = $null
     try {
-        $client = [System.Net.Http.HttpClient]::new()
+        Initialize-WorkerResources
         $cancellation = [System.Threading.CancellationTokenSource]::new($script:Config.HealthTimeoutMilliseconds)
-        try {
-            $response = $client.GetAsync($script:Config.HealthUri, $cancellation.Token).GetAwaiter().GetResult()
-            return ([int]$response.StatusCode -ge 200 -and [int]$response.StatusCode -lt 300)
-        } finally {
-            $cancellation.Dispose()
-            $client.Dispose()
+        $response = $script:HealthClient.GetAsync($script:Config.HealthUri, $cancellation.Token).GetAwaiter().GetResult()
+        $statusCode = [int]$response.StatusCode
+        return [pscustomobject]@{
+            Known = $true
+            Ok = $statusCode -ge 200 -and $statusCode -lt 300
+            StatusCode = $statusCode
+            Error = $null
         }
     } catch {
-        return $false
+        return [pscustomobject]@{
+            Known = $true
+            Ok = $false
+            StatusCode = $null
+            Error = $_.Exception.Message
+        }
+    } finally {
+        if ($response) { try { $response.Dispose() } catch { } }
+        if ($cancellation) { try { $cancellation.Dispose() } catch { } }
     }
 }
 
-function Get-PidFileValue {
+function Get-PidFileInfo {
+    $path = $script:Config.PidFilePath
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return [pscustomobject]@{ Present = $false; ReadSucceeded = $true; Pid = $null; Error = $null; Path = $path }
+    }
     try {
-        if (-not (Test-Path -LiteralPath $script:Config.PidFilePath -PathType Leaf)) { return $null }
-        $raw = (Get-Content -LiteralPath $script:Config.PidFilePath -Raw).Trim()
-        $processId = 0
-        if ([int]::TryParse($raw, [ref]$processId) -and $processId -gt 0) { return $processId }
-    } catch { }
-    return $null
-}
-
-function Get-ProcessRecords {
-    try {
-        return @(
-            Get-CimInstance Win32_Process |
-                Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine
-        )
+        $raw = (Get-Content -LiteralPath $path -Raw).Trim()
+        $filePid = 0
+        if ([int]::TryParse($raw, [ref]$filePid) -and $filePid -gt 0) {
+            return [pscustomobject]@{ Present = $true; ReadSucceeded = $true; Pid = $filePid; Error = $null; Path = $path }
+        }
+        return [pscustomobject]@{ Present = $true; ReadSucceeded = $true; Pid = $null; Error = 'PID file does not contain a positive integer.'; Path = $path }
     } catch {
-        return @()
+        return [pscustomobject]@{ Present = $true; ReadSucceeded = $false; Pid = $null; Error = $_.Exception.Message; Path = $path }
     }
 }
 
-function Get-ListenerRecords {
+function Get-ProcessRecordByPidFromOs {
+    param([int]$ProcessId)
+    if ($ProcessId -le 0) { return [pscustomobject]@{ Succeeded = $true; Record = $null; Error = $null } }
     try {
-        return @(
-            Get-NetTCPConnection -LocalPort $script:Config.BridgePort -State Listen |
+        $records = @(
+            Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction Stop |
+                Select-Object ProcessId,ParentProcessId,CreationDate,Name,ExecutablePath,CommandLine |
+                Select-Object -First 1
+        )
+        return [pscustomobject]@{ Succeeded = $true; Record = if ($records.Count -gt 0) { $records[0] } else { $null }; Error = $null }
+    } catch {
+        return [pscustomobject]@{ Succeeded = $false; Record = $null; Error = $_.Exception.Message }
+    }
+}
+
+function Get-ChildProcessRecordsFromOs {
+    param([int]$ParentProcessId)
+    try {
+        $records = @(
+            Get-CimInstance Win32_Process -Filter ("ParentProcessId = {0}" -f $ParentProcessId) -ErrorAction Stop |
+                Select-Object ProcessId,ParentProcessId,CreationDate,Name,ExecutablePath,CommandLine
+        )
+        return [pscustomobject]@{ Succeeded = $true; Records = $records; Error = $null }
+    } catch {
+        return [pscustomobject]@{ Succeeded = $false; Records = @(); Error = $_.Exception.Message }
+    }
+}
+
+function Get-ListenerProbe {
+    try {
+        $records = @(
+            Get-NetTCPConnection -LocalPort $script:Config.BridgePort -State Listen -ErrorAction Stop |
                 Select-Object LocalAddress,LocalPort,OwningProcess,State
         )
+        return [pscustomobject]@{ Succeeded = $true; Records = $records; Error = $null }
     } catch {
-        return @()
+        # Windows throws a CIM "no matching objects" error when the filtered
+        # listener set is empty. That is a valid stopped observation, not an
+        # incomplete probe; preserve real query failures as errors.
+        $message = [string]$_.Exception.Message
+        if ($message -match '(?i)no matching .*objects|NoMatching') {
+            return [pscustomobject]@{ Succeeded = $true; Records = @(); Error = $null }
+        }
+        return [pscustomobject]@{ Succeeded = $false; Records = @(); Error = $_.Exception.Message }
     }
 }
 
-function Get-RelatedRecords {
+function Get-DeepProcessRecords {
     param(
-        [object[]] $Records = @(),
-        [int[]] $AnchorPids = @()
+        [Parameter(Mandatory)] $PidInfo,
+        [object[]] $ListenerRecords = @()
     )
-
-    $byPid = @{}
-    foreach ($record in $Records) {
-        $byPid[[int]$record.ProcessId] = $record
+    $recordsByPid = @{}
+    $processObservationComplete = $true
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $candidatePids = [System.Collections.Generic.HashSet[int]]::new()
+    if ($PidInfo.Pid) { [void]$candidatePids.Add([int]$PidInfo.Pid) }
+    foreach ($listenerRecord in @($ListenerRecords)) {
+        $listenerPid = [int](Get-BridgeRecordValue -Record $listenerRecord -Name 'OwningProcess')
+        if ($listenerPid -gt 0) { [void]$candidatePids.Add($listenerPid) }
     }
-
-    $ids = [System.Collections.Generic.HashSet[int]]::new()
-    foreach ($anchorPid in $AnchorPids) {
-        if ($anchorPid -gt 0) { [void]$ids.Add($anchorPid) }
-    }
-
-    foreach ($anchorPid in $AnchorPids) {
-        $currentPid = $anchorPid
-        while ($currentPid -gt 0 -and $byPid.ContainsKey($currentPid)) {
-            $parentPid = [int]$byPid[$currentPid].ParentProcessId
-            if ($parentPid -le 0 -or $parentPid -eq $currentPid -or -not $ids.Add($parentPid)) { break }
-            $currentPid = $parentPid
+    foreach ($candidatePid in $candidatePids) {
+        $probe = Get-ProcessRecordByPidFromOs -ProcessId $candidatePid
+        if (-not $probe.Succeeded) {
+            $processObservationComplete = $false
+            $errors.Add("PID $candidatePid 查询失败：$($probe.Error)")
+            continue
         }
+        if ($probe.Record) { $recordsByPid[$candidatePid] = $probe.Record }
     }
-
-    $changed = $true
-    while ($changed) {
-        $changed = $false
-        foreach ($record in $Records) {
-            $processId = [int]$record.ProcessId
-            $parentProcessId = [int]$record.ParentProcessId
-            if ($ids.Contains($parentProcessId) -and $ids.Add($processId)) {
-                $changed = $true
+    $rootRecord = if ($PidInfo.Pid -and $recordsByPid.ContainsKey([int]$PidInfo.Pid)) { $recordsByPid[[int]$PidInfo.Pid] } else { $null }
+    $pendingParents = [System.Collections.Generic.Queue[int]]::new()
+    if ($rootRecord -and (Test-BridgeSupervisorIdentity -Record $rootRecord -Config $script:Config)) { $pendingParents.Enqueue([int]$PidInfo.Pid) }
+    while ($pendingParents.Count -gt 0) {
+        $parentProcessId = $pendingParents.Dequeue()
+        $childrenProbe = Get-ChildProcessRecordsFromOs -ParentProcessId $parentProcessId
+        if (-not $childrenProbe.Succeeded) {
+            $processObservationComplete = $false
+            $errors.Add("Parent PID $parentProcessId 的子进程查询失败：$($childrenProbe.Error)")
+            continue
+        }
+        foreach ($childRecord in @($childrenProbe.Records)) {
+            $childProcessId = [int](Get-BridgeRecordValue -Record $childRecord -Name 'ProcessId')
+            if ($childProcessId -le 0 -or $recordsByPid.ContainsKey($childProcessId)) { continue }
+            if ($recordsByPid.Count -ge $script:Config.MaxDeepProcessRecords) {
+                $processObservationComplete = $false
+                $errors.Add("ownership tree 超过 $($script:Config.MaxDeepProcessRecords) 个进程，停止扩展。")
+                break
             }
+            $recordsByPid[$childProcessId] = $childRecord
+            $pendingParents.Enqueue($childProcessId)
         }
     }
-
-    return @($Records | Where-Object { $ids.Contains([int]$_.ProcessId) })
-}
-
-function Test-BridgeIdentity {
-    param([Parameter(Mandatory)] $Record)
-
-    $name = [string]$Record.Name
-    $path = [string]$Record.ExecutablePath
-    $commandLine = [string]$Record.CommandLine
-    $identityPattern = '(?i)(^|[\s"/\\])' + [regex]::Escape($script:Config.BridgeIdentityMarker) + '(?:\.exe)?([\s"]|$)'
-
-    return (
-        $name -ieq $script:Config.BridgeExecutableName -or
-        $name -ieq $script:Config.BridgePackage -or
-        $path -match [regex]::Escape($script:Config.BridgeIdentityMarker) -or
-        $commandLine -match $identityPattern
-    )
-}
-
-function Get-BridgeTopology {
-    param(
-        [object[]] $Records = @(),
-        [object[]] $Listeners = @(),
-        [int[]] $AnchorPids = @()
-    )
-
-    $pidFilePid = Get-PidFileValue
-    $allBridgeRecords = @($Records | Where-Object { Test-BridgeIdentity $_ })
-    $allBridgePids = @($allBridgeRecords | ForEach-Object { [int]$_.ProcessId } | Sort-Object -Unique)
-
-    $anchors = @($AnchorPids + @($pidFilePid) | Where-Object { $_ -and [int]$_ -gt 0 } | ForEach-Object { [int]$_ } | Sort-Object -Unique)
-    $relatedRecords = if ($anchors.Count -gt 0) {
-        @(Get-RelatedRecords -Records $Records -AnchorPids $anchors)
-    } else {
-        @()
-    }
-    $bridgeTreeRecords = @($relatedRecords | Where-Object { Test-BridgeIdentity $_ })
-    $bridgeTreePids = @($bridgeTreeRecords | ForEach-Object { [int]$_.ProcessId } | Sort-Object -Unique)
-    $listenerPids = @($Listeners | ForEach-Object { [int]$_.OwningProcess } | Sort-Object -Unique)
-    $unknownListenerPids = @($listenerPids | Where-Object { $allBridgePids -notcontains $_ })
-    $listenerOutsideTreePids = @($listenerPids | Where-Object { $bridgeTreePids -notcontains $_ })
-    $pidFileRecord = if ($pidFilePid) {
-        $Records | Where-Object { [int]$_.ProcessId -eq $pidFilePid } | Select-Object -First 1
-    } else {
-        $null
-    }
-
-    $pidFileIdentityVerified = $null -ne $pidFileRecord -and (Test-BridgeIdentity $pidFileRecord)
-    $canForceStop = $pidFileIdentityVerified -and
-        $bridgeTreePids.Count -gt 0 -and
-        $unknownListenerPids.Count -eq 0 -and
-        $listenerOutsideTreePids.Count -eq 0
-
-    [pscustomobject]@{
-        PidFilePid = $pidFilePid
-        PidFileRecord = $pidFileRecord
-        PidFileProcessExists = $null -ne $pidFileRecord
-        PidFileIdentityVerified = $pidFileIdentityVerified
-        AllBridgeRecords = $allBridgeRecords
-        AllBridgePids = $allBridgePids
-        RelatedRecords = $relatedRecords
-        BridgeTreeRecords = $bridgeTreeRecords
-        BridgeTreePids = $bridgeTreePids
-        ListenerPids = $listenerPids
-        UnknownListenerPids = $unknownListenerPids
-        ListenerOutsideTreePids = $listenerOutsideTreePids
-        CanForceStop = $canForceStop
-    }
+    [pscustomobject]@{ Records = @($recordsByPid.Values); Succeeded = $processObservationComplete; Errors = @($errors) }
 }
 
 function Find-LogPath {
@@ -216,495 +243,508 @@ function Find-LogPath {
     try {
         if (Test-Path -LiteralPath $exactPath -PathType Leaf) { return $exactPath }
         if (-not (Test-Path -LiteralPath $script:Config.RunDirectory -PathType Container)) { return $null }
-        $candidate = Get-ChildItem -LiteralPath $script:Config.RunDirectory -File -Filter 'server-127.0.0.1-18080*.log' |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
+        $candidate = Get-ChildItem -LiteralPath $script:Config.RunDirectory -File -Filter 'server-127.0.0.1-18080*.log' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
         if ($candidate) { return $candidate.FullName }
     } catch { }
     return $null
 }
 
-function Get-BridgeObservation {
-    $records = @(Get-ProcessRecords)
-    $listeners = @(Get-ListenerRecords)
-    $topology = Get-BridgeTopology -Records @($records) -Listeners @($listeners)
-    $healthOk = Get-HealthOk
-    $logPath = Find-LogPath
-
+function New-BridgeObservation {
+    param(
+        [Parameter(Mandatory)] $PidInfo,
+        [Parameter(Mandatory)] $HealthProbe,
+        [Parameter(Mandatory)] $Topology,
+        [Parameter(Mandatory)] [bool] $ObservationComplete,
+        [Parameter(Mandatory)] [string] $ProbeKind,
+        [string] $LogPath
+    )
+    $observedState = Get-ObservedBridgeState -Topology $Topology -HealthKnown $HealthProbe.Known -HealthOk $HealthProbe.Ok -ObservationComplete $ObservationComplete
     [pscustomobject]@{
         Timestamp = [DateTimeOffset]::Now
-        HealthOk = $healthOk
-        PidFilePresent = Test-Path -LiteralPath $script:Config.PidFilePath -PathType Leaf
-        PidFilePid = $topology.PidFilePid
-        PidFileProcessExists = $topology.PidFileProcessExists
-        PidFileIdentityVerified = $topology.PidFileIdentityVerified
-        ListenerPids = @($topology.ListenerPids)
-        UnknownListenerPids = @($topology.UnknownListenerPids)
-        ListenerOutsideTreePids = @($topology.ListenerOutsideTreePids)
-        AllBridgePids = @($topology.AllBridgePids)
-        BridgeTreePids = @($topology.BridgeTreePids)
-        BridgeTreeRecords = @($topology.BridgeTreeRecords)
-        CanForceStop = $topology.CanForceStop
-        LogPath = $logPath
+        ProbeKind = $ProbeKind
+        ObservedState = $observedState
+        HealthKnown = [bool]$HealthProbe.Known
+        HealthOk = [bool]$HealthProbe.Ok
+        HealthError = $HealthProbe.Error
+        PidFilePresent = [bool]$PidInfo.Present
+        PidFileReadSucceeded = [bool]$PidInfo.ReadSucceeded
+        PidFilePid = $Topology.PidFilePid
+        PidFileState = $Topology.PidFileState
+        PidFileProcessExists = $null -ne $Topology.PidFileRecord
+        ListenerPids = @($Topology.ListenerPids)
+        OwnedListenerPids = @($Topology.OwnedListenerPids)
+        ForeignListenerPids = @($Topology.ForeignListenerPids)
+        UnverifiedBridgeListenerPids = @($Topology.UnverifiedBridgeListenerPids)
+        UnknownForeignListenerPids = @($Topology.UnknownForeignListenerPids)
+        AllBridgePids = @($Topology.OwnedProcessPids)
+        BridgeTreePids = @($Topology.OwnedProcessPids)
+        OwnedProcessRecords = @($Topology.OwnedProcessRecords)
+        CanAttemptOfficialStop = [bool]$Topology.CanAttemptOfficialStop
+        CanForceStop = [bool]$Topology.CanForceStop
+        Topology = $Topology
+        OwnershipSnapshot = New-OwnershipSnapshot -Topology $Topology
+        ObservationComplete = $ObservationComplete
+        ProcessObservationComplete = [bool]$Topology.ProcessObservationComplete
+        ListenerObservationComplete = [bool]$Topology.ListenerObservationComplete
+        LogPath = if ($LogPath) { $LogPath } else { Find-LogPath }
         RunDirectoryExists = Test-Path -LiteralPath $script:Config.RunDirectory -PathType Container
     }
 }
 
+function Get-DeepObservation {
+    $pidInfo = Get-PidFileInfo
+    $listenerProbe = Get-ListenerProbe
+    $healthProbe = Get-HealthProbe
+    $processProbe = Get-DeepProcessRecords -PidInfo $pidInfo -ListenerRecords $listenerProbe.Records
+    $topology = Resolve-BridgeOwnership -ProcessRecords $processProbe.Records -PidFilePresent $pidInfo.Present -PidFilePid $pidInfo.Pid -ListenerRecords $listenerProbe.Records -Config $script:Config -ProcessObservationComplete $processProbe.Succeeded -ListenerObservationComplete $listenerProbe.Succeeded
+    $observationComplete = $pidInfo.ReadSucceeded -and $processProbe.Succeeded -and $listenerProbe.Succeeded
+    $observation = New-BridgeObservation -PidInfo $pidInfo -HealthProbe $healthProbe -Topology $topology -ObservationComplete $observationComplete -ProbeKind 'Deep'
+    $script:LastDeepObservation = $observation
+    return $observation
+}
+
+function Test-LightObservationStable {
+    param(
+        [Parameter(Mandatory)] $Cache,
+        [Parameter(Mandatory)] $PidInfo,
+        $PidRecord,
+        [object[]] $ListenerRecords = @(),
+        [object[]] $LightProcessRecords = @(),
+        [Parameter(Mandatory)] $HealthProbe
+    )
+    if ($Cache.ObservedState -notin @('Running','Stopped')) { return $false }
+    if (-not $HealthProbe.Known -or [bool]$HealthProbe.Ok -ne [bool]$Cache.HealthOk) { return $false }
+    if ([bool]$PidInfo.Present -ne [bool]$Cache.PidFilePresent) { return $false }
+    if ([int]($PidInfo.Pid ?? 0) -ne [int]($Cache.PidFilePid ?? 0)) { return $false }
+    $currentListenerPids = @($ListenerRecords | ForEach-Object { [int](Get-BridgeRecordValue -Record $_ -Name 'OwningProcess') } | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+    $cachedListenerPids = @($Cache.Topology.ListenerPids | Sort-Object -Unique)
+    if (($currentListenerPids -join ',') -ne ($cachedListenerPids -join ',')) { return $false }
+    if ($Cache.ObservedState -eq 'Stopped') { return -not $PidInfo.Present -and $currentListenerPids.Count -eq 0 -and -not $HealthProbe.Ok }
+    if (-not $PidRecord -or -not (Test-ProcessFingerprintMatch -Expected $Cache.Topology.OwnershipRootFingerprint -Actual $PidRecord)) { return $false }
+    foreach ($expectedListenerRecord in @($Cache.Topology.OwnedListenerRecords)) {
+        $listenerProcessId = [int](Get-BridgeRecordValue -Record $expectedListenerRecord -Name 'ProcessId')
+        $actualListenerRecord = Get-BridgeRecordByPid -Records $LightProcessRecords -ProcessId $listenerProcessId
+        if (-not $actualListenerRecord -or -not (Test-ProcessFingerprintMatch -Expected $expectedListenerRecord -Actual $actualListenerRecord)) { return $false }
+    }
+    return $true
+}
+
+function Get-LightObservation {
+    $cache = $script:LastDeepObservation
+    if (-not $cache) { return Get-DeepObservation }
+    if (([DateTimeOffset]::Now - [DateTimeOffset]$cache.Timestamp).TotalMilliseconds -ge $script:Config.DeepProbeIntervalMilliseconds) {
+        return Get-DeepObservation
+    }
+    $pidInfo = Get-PidFileInfo
+    $listenerProbe = Get-ListenerProbe
+    $healthProbe = Get-HealthProbe
+    if (-not $pidInfo.ReadSucceeded -or -not $listenerProbe.Succeeded) { return Get-DeepObservation }
+    $lightRecords = [System.Collections.Generic.List[object]]::new()
+    $pidRecord = $null
+    if ($pidInfo.Pid) {
+        $pidProbe = Get-ProcessRecordByPidFromOs -ProcessId ([int]$pidInfo.Pid)
+        if (-not $pidProbe.Succeeded) { return Get-DeepObservation }
+        $pidRecord = $pidProbe.Record
+        if ($pidRecord) { $lightRecords.Add($pidRecord) }
+    }
+    foreach ($listenerRecord in @($listenerProbe.Records)) {
+        $listenerProcessId = [int](Get-BridgeRecordValue -Record $listenerRecord -Name 'OwningProcess')
+        if ($listenerProcessId -le 0 -or ($lightRecords | Where-Object { [int](Get-BridgeRecordValue -Record $_ -Name 'ProcessId') -eq $listenerProcessId })) { continue }
+        $listenerOwnerProbe = Get-ProcessRecordByPidFromOs -ProcessId $listenerProcessId
+        if (-not $listenerOwnerProbe.Succeeded) { return Get-DeepObservation }
+        if ($listenerOwnerProbe.Record) { $lightRecords.Add($listenerOwnerProbe.Record) }
+    }
+    if (Test-LightObservationStable -Cache $cache -PidInfo $pidInfo -PidRecord $pidRecord -ListenerRecords $listenerProbe.Records -LightProcessRecords @($lightRecords) -HealthProbe $healthProbe) {
+        return New-BridgeObservation -PidInfo $pidInfo -HealthProbe $healthProbe -Topology $cache.Topology -ObservationComplete $true -ProbeKind 'Light' -LogPath $cache.LogPath
+    }
+    return Get-DeepObservation
+}
+
+function Get-BridgeObservation {
+    param([switch]$Deep)
+    if ($Deep) { return Get-DeepObservation }
+    return Get-LightObservation
+}
+
 function Test-RunningEvidence {
     param([Parameter(Mandatory)] $Observation)
-
-    return (
-        $Observation.HealthOk -and
-        $Observation.PidFileIdentityVerified -and
-        @($Observation.BridgeTreePids).Count -gt 0 -and
-        @($Observation.ListenerPids).Count -gt 0 -and
-        @($Observation.UnknownListenerPids).Count -eq 0 -and
-        @($Observation.ListenerOutsideTreePids).Count -eq 0
-    )
+    return $Observation.ObservedState -eq 'Running'
 }
 
-function Get-BridgeState {
-    param(
-        [Parameter(Mandatory)] $Observation,
-        [string] $OperationState = 'Idle'
-    )
-
-    switch ($OperationState) {
-        'Starting' { return '启动中' }
-        'Stopping' { return '停止中' }
-        'Restarting' { return '重启中' }
-    }
-
-    $hasUnknownListener = @($Observation.UnknownListenerPids).Count -gt 0
-    $hasListenerOutsideTree = @($Observation.ListenerOutsideTreePids).Count -gt 0
-    $hasBridgeProcess = @($Observation.AllBridgePids).Count -gt 0
-
-    if (Test-RunningEvidence -Observation $Observation) { return '已运行' }
-    if (-not $Observation.HealthOk -and
-        @($Observation.ListenerPids).Count -eq 0 -and
-        -not $hasBridgeProcess) {
-        return '已停止'
-    }
-    if ($hasUnknownListener -or $hasListenerOutsideTree -or $hasBridgeProcess) { return '异常' }
-    return '异常'
-}
-
-function Get-StatusTooltip {
-    param([string]$State)
-
-    switch ($State) {
-        '已运行' { return 'Codex Bridge — Running' }
-        '已停止' { return 'Codex Bridge — Stopped' }
-        '启动中' { return 'Codex Bridge — Starting' }
-        '停止中' { return 'Codex Bridge — Stopping' }
-        '重启中' { return 'Codex Bridge — Restarting' }
-        default { return 'Codex Bridge — Error' }
-    }
-}
-
-function New-HiddenProcess {
-    param([Parameter(Mandatory)] [string[]] $Arguments)
-
-    if (-not (Test-Path -LiteralPath $script:Config.UvxPath -PathType Leaf)) {
-        throw "找不到 uvx：$($script:Config.UvxPath)"
-    }
-
-    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $script:Config.UvxPath
-    $startInfo.WorkingDirectory = $script:Config.RunDirectory
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    foreach ($argument in $Arguments) {
-        [void]$startInfo.ArgumentList.Add($argument)
-    }
-    return [System.Diagnostics.Process]::Start($startInfo)
-}
-
-function Invoke-UvxCommand {
-    param(
-        [Parameter(Mandatory)] [string[]] $Arguments,
-        [int] $WaitMilliseconds = 15000
-    )
-
-    try {
-        $process = New-HiddenProcess -Arguments $Arguments
-        $process.WaitForExit($WaitMilliseconds)
-        $exited = $process.HasExited
-        $exitCode = if ($exited) { $process.ExitCode } else { $null }
-        $process.Dispose()
-        return [pscustomobject]@{
-            Started = $true
-            Exited = $exited
-            ExitCode = $exitCode
-            Error = $null
-        }
-    } catch {
-        return [pscustomobject]@{
-            Started = $false
-            Exited = $true
-            ExitCode = $null
-            Error = $_.Exception.Message
-        }
-    }
-}
-
-function Wait-ForStarted {
-    param([System.Diagnostics.Process]$StartProcess)
-
-    $deadline = [DateTime]::UtcNow.AddSeconds($script:Config.StartTimeoutSeconds)
-    $lastObservation = $null
-    while ([DateTime]::UtcNow -lt $deadline) {
-        $lastObservation = Get-BridgeObservation
-        if (Test-RunningEvidence -Observation $lastObservation) {
-            return [pscustomobject]@{
-                Success = $true
-                Observation = $lastObservation
-                Message = 'Codex Bridge 已启动'
-                ExitCode = if ($StartProcess -and $StartProcess.HasExited) { $StartProcess.ExitCode } else { $null }
-            }
-        }
-        Start-Sleep -Milliseconds 500
-    }
-
-    if (-not $lastObservation) { $lastObservation = Get-BridgeObservation }
-    [pscustomobject]@{
-        Success = $false
-        Observation = $lastObservation
-        Message = "Codex Bridge 启动超时。请打开日志：$($lastObservation.LogPath ?? (Join-Path $script:Config.RunDirectory 'server-127.0.0.1-18080.log'))"
-        ExitCode = if ($StartProcess -and $StartProcess.HasExited) { $StartProcess.ExitCode } else { $null }
-    }
-}
-
-function Wait-ForStopped {
-    param([int]$TimeoutSeconds = $script:Config.StopTimeoutSeconds)
-
-    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    $lastObservation = $null
-    while ([DateTime]::UtcNow -lt $deadline) {
-        $lastObservation = Get-BridgeObservation
-        if (-not $lastObservation.HealthOk -and
-            @($lastObservation.ListenerPids).Count -eq 0 -and
-            @($lastObservation.AllBridgePids).Count -eq 0) {
-            return [pscustomobject]@{ Success = $true; Observation = $lastObservation }
-        }
-        Start-Sleep -Milliseconds 500
-    }
-    if (-not $lastObservation) { $lastObservation = Get-BridgeObservation }
-    [pscustomobject]@{ Success = $false; Observation = $lastObservation }
-}
-
-function Get-ProcessDepth {
-    param(
-        [Parameter(Mandatory)] $Record,
-        [Parameter(Mandatory)] [hashtable] $ByPid
-    )
-
-    $depth = 0
-    $currentPid = [int]$Record.ProcessId
-    while ($ByPid.ContainsKey($currentPid)) {
-        $parentPid = [int]$ByPid[$currentPid].ParentProcessId
-        if ($parentPid -le 0 -or $parentPid -eq $currentPid -or -not $ByPid.ContainsKey($parentPid)) { break }
-        $depth++
-        $currentPid = $parentPid
-    }
-    return $depth
-}
-
-function Stop-VerifiedBridgeTree {
-    param([Parameter(Mandatory)] $InitialObservation)
-
-    $originalPid = $InitialObservation.PidFilePid
-    if (-not $originalPid -or -not $InitialObservation.PidFileIdentityVerified) {
-        return [pscustomobject]@{
-            Success = $false
-            FallbackUsed = $false
-            Refused = $true
-            Observation = $InitialObservation
-            Message = '无法确认 PID 文件对应的 bridge supervisor 身份，未执行强制终止。'
-        }
-    }
-
-    $anchorPids = [System.Collections.Generic.HashSet[int]]::new()
-    [void]$anchorPids.Add([int]$originalPid)
-    $killedPids = [System.Collections.Generic.List[int]]::new()
-
-    for ($pass = 0; $pass -lt 6; $pass++) {
-        $records = @(Get-ProcessRecords)
-        $listeners = @(Get-ListenerRecords)
-        $currentPid = Get-PidFileValue
-        if ($currentPid) { [void]$anchorPids.Add([int]$currentPid) }
-        $topology = Get-BridgeTopology -Records @($records) -Listeners @($listeners) -AnchorPids @($anchorPids)
-
-        if (@($topology.UnknownListenerPids).Count -gt 0 -or
-            @($topology.ListenerOutsideTreePids).Count -gt 0) {
-            $observation = Get-BridgeObservation
-            return [pscustomobject]@{
-                Success = $false
-                FallbackUsed = $true
-                Refused = $true
-                Observation = $observation
-                Message = '18080 仍被未能验证身份或进程树关系的进程占用，未执行强制终止。'
-            }
-        }
-
-        $targets = @($topology.BridgeTreeRecords)
-        if ($targets.Count -eq 0) { break }
-
-        $byPid = @{}
-        foreach ($record in $topology.RelatedRecords) { $byPid[[int]$record.ProcessId] = $record }
-        $orderedTargets = @($targets | Sort-Object @{Expression={ Get-ProcessDepth -Record $_ -ByPid $byPid }}, ProcessId)
-
-        foreach ($record in $orderedTargets) {
-            $processId = [int]$record.ProcessId
-            try {
-                $liveRecord = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction Stop
-                if ($liveRecord -and (Test-BridgeIdentity $liveRecord)) {
-                    Stop-Process -Id $processId -Force -ErrorAction Stop
-                    $killedPids.Add($processId)
-                }
-            } catch {
-                # A process may have exited between the verified snapshot and Kill.
-            }
-        }
-
-        Start-Sleep -Milliseconds 500
-        $afterPass = Get-BridgeObservation
-        if (-not $afterPass.HealthOk -and
-            @($afterPass.ListenerPids).Count -eq 0 -and
-            @($afterPass.AllBridgePids).Count -eq 0) {
-            return [pscustomobject]@{
-                Success = $true
-                FallbackUsed = $true
-                Refused = $false
-                Observation = $afterPass
-                KilledPids = @($killedPids)
-                Message = 'Codex Bridge 已停止'
-            }
-        }
-    }
-
-    $finalObservation = Get-BridgeObservation
-    $success = -not $finalObservation.HealthOk -and
-        @($finalObservation.ListenerPids).Count -eq 0 -and
-        @($finalObservation.AllBridgePids).Count -eq 0
-    [pscustomobject]@{
-        Success = $success
-        FallbackUsed = $true
-        Refused = -not $success
-        Observation = $finalObservation
-        KilledPids = @($killedPids)
-        Message = if ($success) { 'Codex Bridge 已停止' } else { '无法在安全验证进程树后完成停止，未继续终止未知进程。' }
-    }
+function Test-StoppedEvidence {
+    param([Parameter(Mandatory)] $Observation)
+    return $Observation.ObservedState -eq 'Stopped' -and -not $Observation.HealthOk -and @($Observation.ListenerPids).Count -eq 0 -and @($Observation.AllBridgePids).Count -eq 0
 }
 
 function Remove-StalePidFileIfSafe {
     param([Parameter(Mandatory)] $Observation)
-
-    if (-not $Observation.HealthOk -and
-        @($Observation.ListenerPids).Count -eq 0 -and
-        @($Observation.AllBridgePids).Count -eq 0 -and
-        -not $Observation.PidFileProcessExists -and
-        (Test-Path -LiteralPath $script:Config.PidFilePath -PathType Leaf)) {
-        try { Remove-Item -LiteralPath $script:Config.PidFilePath -Force } catch { }
-    }
+    $safeState = $Observation.PidFileState -in @('StaleMissingProcess','StaleReusedPid')
+    $safe = $safeState -and $Observation.HealthKnown -and -not $Observation.HealthOk -and @($Observation.ListenerPids).Count -eq 0 -and @($Observation.AllBridgePids).Count -eq 0 -and @($Observation.UnverifiedBridgeListenerPids).Count -eq 0 -and $Observation.ObservationComplete -and (Test-Path -LiteralPath $script:Config.PidFilePath -PathType Leaf)
+    if (-not $safe) { return $false }
+    try { Remove-Item -LiteralPath $script:Config.PidFilePath -Force -ErrorAction Stop; return $true } catch { return $false }
 }
 
-function Invoke-StartOperation {
-    $before = Get-BridgeObservation
-    if (Test-RunningEvidence -Observation $before) {
-        return [pscustomobject]@{ Success = $true; Operation = 'Start'; Observation = $before; Message = 'Codex Bridge 已经在运行' }
-    }
-    if (-not $before.HealthOk -and
-        @($before.ListenerPids).Count -eq 0 -and
-        @($before.AllBridgePids).Count -eq 0 -and
-        $before.PidFilePresent -and
-        -not $before.PidFileProcessExists) {
-        Remove-StalePidFileIfSafe -Observation $before
-        $before = Get-BridgeObservation
-    }
-    if (@($before.ListenerPids).Count -gt 0) {
-        return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = '18080 已被其他进程占用，未执行启动。' }
-    }
-    if (@($before.AllBridgePids).Count -gt 0 -or $before.PidFilePresent) {
-        return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = '检测到 bridge 进程或 PID 文件，但运行证据不完整，未重复启动。请先执行停止或查看日志。' }
-    }
-    if (-not (Test-Path -LiteralPath $script:Config.UvxPath -PathType Leaf)) {
-        return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = "找不到 uvx：$($script:Config.UvxPath)" }
-    }
-    if (-not (Test-Path -LiteralPath $script:Config.AuthJsonPath -PathType Leaf)) {
-        return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = "找不到 Codex OAuth 文件：$($script:Config.AuthJsonPath)" }
-    }
+function Limit-DiagnosticText {
+    param([string]$Text)
+    if ($null -eq $Text) { return '' }
+    if ($Text.Length -le $script:Config.CliOutputLimit) { return $Text }
+    return $Text.Substring(0, $script:Config.CliOutputLimit) + "`r`n...[truncated]"
+}
 
-    $startArguments = @(
-        '--from', $script:Config.BridgePackageSpec,
-        $script:Config.BridgeCommand,
-        'start', '--verbose'
-    )
+function New-HiddenProcess {
+    param([Parameter(Mandatory)] [string[]] $Arguments)
+    if (-not (Test-Path -LiteralPath $script:Config.UvxPath -PathType Leaf)) { throw "找不到 uvx：$($script:Config.UvxPath)" }
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $script:Config.UvxPath
+    $startInfo.WorkingDirectory = $script:Config.ControllerDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) { [void]$startInfo.ArgumentList.Add($argument) }
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    [pscustomobject]@{ Process = $process; StdOutTask = $process.StandardOutput.ReadToEndAsync(); StdErrTask = $process.StandardError.ReadToEndAsync(); StartedAt = [DateTimeOffset]::Now }
+}
+
+function Stop-ControllerOwnedInvocation {
+    param([Parameter(Mandatory)] $Invocation)
+    $process = $Invocation.Process
     try {
-        $startProcess = New-HiddenProcess -Arguments $startArguments
-    } catch {
-        return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = $_.Exception.Message }
-    }
+        if ($process.HasExited) { return $true }
+        try { $process.Kill($true) } catch { }
+        try { $process.WaitForExit(3000) } catch { }
+        return $process.HasExited
+    } catch { return $false }
+}
 
-    $waitResult = Wait-ForStarted -StartProcess $startProcess
-    if ($startProcess) { $startProcess.Dispose() }
-    [pscustomobject]@{
-        Success = $waitResult.Success
-        Operation = 'Start'
-        Observation = $waitResult.Observation
-        Message = $waitResult.Message
-        ExitCode = $waitResult.ExitCode
-        FallbackUsed = $false
+function Get-InvocationOutput {
+    param([Parameter(Mandatory)] $Invocation)
+    $stdout = ''; $stderr = ''
+    try { $stdout = Limit-DiagnosticText -Text $Invocation.StdOutTask.GetAwaiter().GetResult() } catch { }
+    try { $stderr = Limit-DiagnosticText -Text $Invocation.StdErrTask.GetAwaiter().GetResult() } catch { }
+    [pscustomobject]@{ StdOut = $stdout; StdErr = $stderr }
+}
+
+function Dispose-Invocation {
+    param($Invocation)
+    if ($Invocation -and $Invocation.Process) {
+        try {
+            if (-not $Invocation.Process.HasExited) { Stop-ControllerOwnedInvocation -Invocation $Invocation | Out-Null }
+        } catch { }
+        try { $Invocation.Process.Dispose() } catch { }
     }
 }
 
-function Invoke-StopOperation {
-    $before = Get-BridgeObservation
-    if (-not $before.HealthOk -and @($before.ListenerPids).Count -eq 0 -and @($before.AllBridgePids).Count -eq 0) {
-        Remove-StalePidFileIfSafe -Observation $before
-        return [pscustomobject]@{ Success = $true; Operation = 'Stop'; Observation = $before; Message = 'Codex Bridge 已停止'; FallbackUsed = $false }
-    }
+function Invoke-UvxCommand {
+    param([Parameter(Mandatory)] [string[]] $Arguments, [int] $WaitMilliseconds = 15000)
+    $invocation = $null
+    try {
+        $invocation = New-HiddenProcess -Arguments $Arguments
+        $exited = $invocation.Process.WaitForExit($WaitMilliseconds)
+        $timedOut = -not $exited
+        $terminated = $false
+        if (-not $exited) { $terminated = Stop-ControllerOwnedInvocation -Invocation $invocation; $exited = $terminated }
+        if (-not $exited) {
+            return [pscustomobject]@{ Started = $true; Exited = $false; TimedOut = $true; ExitCode = $null; Terminated = $false; StdOut = ''; StdErr = ''; Error = 'controller-owned CLI invocation timed out and could not be confirmed exited.' }
+        }
+        $output = Get-InvocationOutput -Invocation $invocation
+        [pscustomobject]@{ Started = $true; Exited = $true; TimedOut = $timedOut; ExitCode = $invocation.Process.ExitCode; Terminated = $terminated; StdOut = $output.StdOut; StdErr = $output.StdErr; Error = $null }
+    } catch {
+        [pscustomobject]@{ Started = $false; Exited = $true; TimedOut = $false; ExitCode = $null; Terminated = $false; StdOut = ''; StdErr = ''; Error = $_.Exception.Message }
+    } finally { Dispose-Invocation -Invocation $invocation }
+}
 
-    $stopArguments = @(
-        '--from', $script:Config.BridgePackageSpec,
-        $script:Config.BridgeCommand,
-        'stop'
-    )
-    $official = Invoke-UvxCommand -Arguments $stopArguments -WaitMilliseconds 15000
-    Start-Sleep -Milliseconds $script:Config.StopGraceMilliseconds
-    $afterOfficial = Get-BridgeObservation
-    if (-not $afterOfficial.HealthOk -and
-        @($afterOfficial.ListenerPids).Count -eq 0 -and
-        @($afterOfficial.AllBridgePids).Count -eq 0) {
-        Remove-StalePidFileIfSafe -Observation $afterOfficial
-        return [pscustomobject]@{
-            Success = $true
-            Operation = 'Stop'
-            Observation = Get-BridgeObservation
-            Message = 'Codex Bridge 已停止'
-            FallbackUsed = $false
-            OfficialExitCode = $official.ExitCode
+function Get-InvocationSummary {
+    param([Parameter(Mandatory)] $Invocation)
+    $exited = $false
+    try { $exited = $Invocation.Process.HasExited } catch { }
+    if (-not $exited) { return [pscustomobject]@{ Exited = $false; ExitCode = $null; StdOut = ''; StdErr = '' } }
+    $output = Get-InvocationOutput -Invocation $Invocation
+    [pscustomobject]@{ Exited = $true; ExitCode = $Invocation.Process.ExitCode; StdOut = $output.StdOut; StdErr = $output.StdErr }
+}
+
+function Wait-ForStarted {
+    param([Parameter(Mandatory)] $Invocation)
+    $deadline = [DateTime]::UtcNow.AddSeconds($script:Config.StartTimeoutSeconds)
+    $lastObservation = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $lastObservation = Get-BridgeObservation -Deep
+        if (Test-RunningEvidence -Observation $lastObservation) {
+            $summary = Get-InvocationSummary -Invocation $Invocation
+            return [pscustomobject]@{ Success = $true; Observation = $lastObservation; Message = 'Codex Bridge 已启动'; ExitCode = $summary.ExitCode; InvocationExited = $summary.Exited; StdOut = $summary.StdOut; StdErr = $summary.StdErr }
+        }
+        try {
+            if ($Invocation.Process.HasExited) {
+                $summary = Get-InvocationSummary -Invocation $Invocation
+                if ($summary.ExitCode -ne 0) { return [pscustomobject]@{ Success = $false; Observation = $lastObservation; Message = "启动命令失败（exit $($summary.ExitCode)）。$($summary.StdErr)"; ExitCode = $summary.ExitCode; InvocationExited = $true; StdOut = $summary.StdOut; StdErr = $summary.StdErr } }
+            }
+        } catch { }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $lastObservation) { $lastObservation = Get-BridgeObservation -Deep }
+    $terminated = Stop-ControllerOwnedInvocation -Invocation $Invocation
+    $summary = if ($terminated) { Get-InvocationSummary -Invocation $Invocation } else { [pscustomobject]@{ Exited = $false; ExitCode = $null; StdOut = ''; StdErr = '' } }
+    [pscustomobject]@{ Success = $false; Observation = $lastObservation; Message = if ($terminated) { "Codex Bridge 启动超时。请打开日志：$($lastObservation.LogPath ?? (Join-Path $script:Config.RunDirectory 'server-127.0.0.1-18080.log'))" } else { '启动命令超时且未能确认回收，未继续执行其他进程操作。' }; ExitCode = $summary.ExitCode; InvocationExited = $summary.Exited; StdOut = $summary.StdOut; StdErr = $summary.StdErr }
+}
+
+function Wait-ForStopped {
+    param([int]$TimeoutSeconds = $script:Config.StopTimeoutSeconds)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastObservation = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $lastObservation = Get-BridgeObservation -Deep
+        if ((Test-StoppedEvidence -Observation $lastObservation) -and @($lastObservation.ForeignListenerPids).Count -eq 0) { return [pscustomobject]@{ Success = $true; Observation = $lastObservation } }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $lastObservation) { $lastObservation = Get-BridgeObservation -Deep }
+    [pscustomobject]@{ Success = $false; Observation = $lastObservation }
+}
+
+function Get-FingerprintDepth {
+    param([Parameter(Mandatory)] $Fingerprint, [Parameter(Mandatory)] [hashtable] $ByPid)
+    $depth = 0
+    $currentProcessId = [int]$Fingerprint.ProcessId
+    $seen = [System.Collections.Generic.HashSet[int]]::new()
+    while ($ByPid.ContainsKey($currentProcessId) -and $seen.Add($currentProcessId)) {
+        $parentProcessId = [int]$ByPid[$currentProcessId].ParentProcessId
+        if ($parentProcessId -le 0 -or $parentProcessId -eq $currentProcessId -or -not $ByPid.ContainsKey($parentProcessId)) { break }
+        $depth++
+        $currentProcessId = $parentProcessId
+    }
+    return $depth
+}
+
+function Get-FilteredBridgeIdentityRecordsFromOs {
+    try {
+        $escapedMarker = [string]$script:Config.BridgeIdentityMarker -replace "'", "''"
+        $escapedName = [string]$script:Config.BridgeExecutableName -replace "'", "''"
+        $filter = "Name = '$escapedName' OR CommandLine LIKE '%$escapedMarker%'"
+        return [pscustomobject]@{ Succeeded = $true; Records = @(Get-CimInstance Win32_Process -Filter $filter -ErrorAction Stop | Select-Object ProcessId,ParentProcessId,CreationDate,Name,ExecutablePath,CommandLine); Error = $null }
+    } catch { return [pscustomobject]@{ Succeeded = $false; Records = @(); Error = $_.Exception.Message } }
+}
+
+function Test-ListenerOwnersAllowed {
+    param([object[]] $ListenerRecords = @(), [int[]] $AllowedPids = @())
+    foreach ($listenerRecord in @($ListenerRecords)) {
+        $listenerProcessId = [int](Get-BridgeRecordValue -Record $listenerRecord -Name 'OwningProcess')
+        if ($AllowedPids -notcontains $listenerProcessId) { return $false }
+    }
+    return $true
+}
+
+function Stop-VerifiedBridgeTree {
+    param([Parameter(Mandatory)] $OwnershipSnapshot)
+    if (-not $OwnershipSnapshot -or -not $OwnershipSnapshot.CanForceStopAtCapture -or -not $OwnershipSnapshot.RootFingerprint -or @($OwnershipSnapshot.ForeignListenerPids).Count -gt 0) {
+        return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @(); Message = '停止前 ownership snapshot 不满足安全强制终止条件，未执行强制终止。' }
+    }
+    $killedPids = [System.Collections.Generic.List[int]]::new()
+    $verifiedFingerprintsByPid = @{}
+    foreach ($fingerprint in @($OwnershipSnapshot.ProcessFingerprints)) { $verifiedFingerprintsByPid[[int]$fingerprint.ProcessId] = $fingerprint }
+    $rootProcessId = [int]$OwnershipSnapshot.RootFingerprint.ProcessId
+
+    for ($pass = 0; $pass -lt $script:Config.FallbackPassLimit; $pass++) {
+        $listenerProbe = Get-ListenerProbe
+        if (-not $listenerProbe.Succeeded) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = "无法确认 18080 listener，未执行强制终止：$($listenerProbe.Error)" } }
+        $rootProbe = Get-ProcessRecordByPidFromOs -ProcessId $rootProcessId
+        if (-not $rootProbe.Succeeded) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = "无法重新验证 supervisor PID $rootProcessId，未执行强制终止：$($rootProbe.Error)" } }
+        $rootLive = $rootProbe.Record
+        $allowedRecords = [System.Collections.Generic.List[object]]::new()
+        $targetRecords = [System.Collections.Generic.List[object]]::new()
+        $rootStillVerified = $false
+
+        if ($rootLive) {
+            if (-not (Test-ProcessFingerprintMatch -Expected $OwnershipSnapshot.RootFingerprint -Actual $rootLive) -or -not (Test-BridgeSupervisorIdentity -Record $rootLive -Config $script:Config)) {
+                return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = "supervisor PID $rootProcessId 的 fingerprint 已变化，未执行强制终止。" }
+            }
+            $rootStillVerified = $true
+            $liveTree = Get-DeepProcessRecords -PidInfo ([pscustomobject]@{ Pid = $rootProcessId }) -ListenerRecords @()
+            if (-not $liveTree.Succeeded) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = '无法完整读取 verified supervisor 的当前 descendants，未执行强制终止。' } }
+            $allowedRecords.Add($rootLive)
+            foreach ($record in @($liveTree.Records)) {
+                if (-not (Test-BridgeIdentity -Record $record -Config $script:Config)) { continue }
+                $recordProcessId = [int](Get-BridgeRecordValue -Record $record -Name 'ProcessId')
+                if ($recordProcessId -eq $rootProcessId) { continue }
+                $fingerprint = New-ProcessFingerprint -Record $record
+                if (-not (Test-ProcessFingerprintComplete -Fingerprint $fingerprint)) {
+                    return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = "当前 verified bridge child PID $recordProcessId 的 fingerprint 不完整，未执行强制终止。" }
+                }
+                # A child observed under the still-verified supervisor is safe to
+                # carry forward even when it was respawned after the snapshot.
+                $verifiedFingerprintsByPid[$recordProcessId] = $fingerprint
+                $allowedRecords.Add($record)
+            }
+            $allowedPids = @($allowedRecords | ForEach-Object { [int](Get-BridgeRecordValue -Record $_ -Name 'ProcessId') } | Sort-Object -Unique)
+            if (-not (Test-ListenerOwnersAllowed -ListenerRecords $listenerProbe.Records -AllowedPids $allowedPids)) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = '18080 listener 不属于当前 verified ownership tree，未执行强制终止。' } }
+            # Kill the verified root first so it cannot respawn another child.
+            $targetRecords.Add($rootLive)
+        } else {
+            # Once the supervisor is gone, only fingerprints captured before or
+            # while that verified supervisor was live can prove child ownership.
+            foreach ($fingerprint in @($verifiedFingerprintsByPid.Values | Where-Object { [int]$_.ProcessId -ne $rootProcessId })) {
+                $liveProbe = Get-ProcessRecordByPidFromOs -ProcessId ([int]$fingerprint.ProcessId)
+                if (-not $liveProbe.Succeeded) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = "无法验证 snapshot child PID $($fingerprint.ProcessId)，未执行强制终止。" } }
+                if (-not $liveProbe.Record) { continue }
+                if (-not (Test-ProcessFingerprintMatch -Expected $fingerprint -Actual $liveProbe.Record) -or -not (Test-BridgeIdentity -Record $liveProbe.Record -Config $script:Config)) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = "snapshot child PID $($fingerprint.ProcessId) 的 fingerprint 已变化，未执行强制终止。" } }
+                $allowedRecords.Add($liveProbe.Record)
+            }
+            $allowedPids = @($allowedRecords | ForEach-Object { [int](Get-BridgeRecordValue -Record $_ -Name 'ProcessId') } | Sort-Object -Unique)
+            if (-not (Test-ListenerOwnersAllowed -ListenerRecords $listenerProbe.Records -AllowedPids $allowedPids)) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = 'supervisor 消失后，listener 不属于 snapshot 中仍可验证的 child，未执行强制终止。' } }
+            $byPid = @{}
+            foreach ($fingerprint in @($verifiedFingerprintsByPid.Values)) { $byPid[[int]$fingerprint.ProcessId] = $fingerprint }
+            foreach ($record in @($allowedRecords | Sort-Object @{Expression={ - (Get-FingerprintDepth -Fingerprint $verifiedFingerprintsByPid[[int](Get-BridgeRecordValue -Record $_ -Name 'ProcessId')] -ByPid $byPid) }})) { $targetRecords.Add($record) }
+        }
+
+        if ($rootStillVerified) {
+            $recheck = Get-ProcessRecordByPidFromOs -ProcessId $rootProcessId
+            if (-not $recheck.Succeeded) { continue }
+            if ($recheck.Record -and (Test-ProcessFingerprintMatch -Expected $OwnershipSnapshot.RootFingerprint -Actual $recheck.Record)) {
+                try { Stop-Process -Id $rootProcessId -Force -ErrorAction Stop; $killedPids.Add($rootProcessId) } catch { }
+            }
+        } else {
+            foreach ($targetRecord in @($targetRecords)) {
+                $targetProcessId = [int](Get-BridgeRecordValue -Record $targetRecord -Name 'ProcessId')
+                $expected = $verifiedFingerprintsByPid[$targetProcessId]
+                $recheck = Get-ProcessRecordByPidFromOs -ProcessId $targetProcessId
+                if (-not $recheck.Succeeded) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = "无法在终止前重新验证 PID $targetProcessId，未执行强制终止。" } }
+                if (-not $recheck.Record) { continue }
+                if (-not (Test-ProcessFingerprintMatch -Expected $expected -Actual $recheck.Record) -or -not (Test-BridgeIdentity -Record $recheck.Record -Config $script:Config)) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = "PID $targetProcessId 的 fingerprint 在终止前发生变化，未执行强制终止。" } }
+                try { Stop-Process -Id $targetProcessId -Force -ErrorAction Stop; $killedPids.Add($targetProcessId) } catch { }
+            }
+        }
+
+        Start-Sleep -Milliseconds 350
+        $afterPass = Get-BridgeObservation -Deep
+        if (-not $rootStillVerified) {
+            $filtered = Get-FilteredBridgeIdentityRecordsFromOs
+            if (-not $filtered.Succeeded) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = '无法确认是否出现未纳入 snapshot 的 bridge process，未继续强制终止。' } }
+            $knownPids = @($verifiedFingerprintsByPid.Keys | ForEach-Object { [int]$_ })
+            foreach ($candidate in @($filtered.Records)) {
+                $candidatePid = [int](Get-BridgeRecordValue -Record $candidate -Name 'ProcessId')
+                if ($knownPids -notcontains $candidatePid) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = $afterPass; KilledPids = @($killedPids); Message = "发现未纳入 verified ownership 的 bridge process PID $candidatePid，未执行强制终止。" } }
+            }
+        }
+
+        if ((Test-StoppedEvidence -Observation $afterPass) -and @($afterPass.ForeignListenerPids).Count -eq 0) {
+            Remove-StalePidFileIfSafe -Observation $afterPass | Out-Null
+            $final = Get-BridgeObservation -Deep
+            if ((Test-StoppedEvidence -Observation $final) -and -not $final.PidFilePresent) {
+                if ($rootStillVerified) { continue }
+                return [pscustomobject]@{ Success = $true; FallbackUsed = $true; Refused = $false; Observation = $final; KilledPids = @($killedPids); Message = 'Codex Bridge 已停止' }
+            }
         }
     }
 
-    # Keep the pre-stop verified topology as the safety anchor. The official
-    # stop may have removed the supervisor while leaving its verified child.
-    $fallback = Stop-VerifiedBridgeTree -InitialObservation $before
-    if ($fallback.Success) {
-        Remove-StalePidFileIfSafe -Observation $fallback.Observation
+    $finalObservation = Get-BridgeObservation -Deep
+    $success = (Test-StoppedEvidence -Observation $finalObservation) -and @($finalObservation.ForeignListenerPids).Count -eq 0 -and -not $finalObservation.PidFilePresent
+    [pscustomobject]@{ Success = $success; FallbackUsed = $true; Refused = -not $success; Observation = $finalObservation; KilledPids = @($killedPids); Message = if ($success) { 'Codex Bridge 已停止' } else { '无法在安全验证进程树后完成停止，未继续终止未知进程。' } }
+}
+
+function Invoke-StartOperation {
+    $before = Get-BridgeObservation -Deep
+    if (Test-RunningEvidence -Observation $before) { return [pscustomobject]@{ Success = $true; Operation = 'Start'; Observation = $before; Message = 'Codex Bridge 已经在运行'; FallbackUsed = $false } }
+    if ($before.ObservedState -eq 'Conflict' -or @($before.ForeignListenerPids).Count -gt 0) { return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = '18080 已被未归属到当前 bridge ownership tree 的进程占用，未执行启动。'; FallbackUsed = $false } }
+    if ($before.PidFileState -in @('StaleMissingProcess','StaleReusedPid')) { Remove-StalePidFileIfSafe -Observation $before | Out-Null; $before = Get-BridgeObservation -Deep }
+    if ($before.ObservedState -ne 'Stopped' -or $before.PidFilePresent -or @($before.AllBridgePids).Count -gt 0) { return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = '检测到 bridge 进程、PID 文件或不完整运行证据，未重复启动。请先执行停止或查看日志。'; FallbackUsed = $false } }
+    if (-not (Test-Path -LiteralPath $script:Config.UvxPath -PathType Leaf)) { return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = "找不到 uvx：$($script:Config.UvxPath)"; FallbackUsed = $false } }
+    if (-not (Test-Path -LiteralPath $script:Config.AuthJsonPath -PathType Leaf)) { return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = "找不到 Codex OAuth 文件：$($script:Config.AuthJsonPath)"; FallbackUsed = $false } }
+    $startArguments = @('--from', $script:Config.BridgePackageSpec, $script:Config.BridgeCommand, 'start', '--verbose')
+    $invocation = $null
+    try { $invocation = New-HiddenProcess -Arguments $startArguments } catch { return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = $_.Exception.Message; FallbackUsed = $false } }
+    try {
+        $waitResult = Wait-ForStarted -Invocation $invocation
+        [pscustomobject]@{ Success = $waitResult.Success; Operation = 'Start'; Observation = $waitResult.Observation; Message = $waitResult.Message; ExitCode = $waitResult.ExitCode; StdOut = $waitResult.StdOut; StdErr = $waitResult.StdErr; FallbackUsed = $false }
+    } finally { Dispose-Invocation -Invocation $invocation }
+}
+
+function Invoke-StopOperation {
+    $before = Get-BridgeObservation -Deep
+    if ((Test-StoppedEvidence -Observation $before) -and @($before.ForeignListenerPids).Count -eq 0) { Remove-StalePidFileIfSafe -Observation $before | Out-Null; return [pscustomobject]@{ Success = $true; Operation = 'Stop'; Observation = Get-BridgeObservation -Deep; Message = 'Codex Bridge 已停止'; FallbackUsed = $false } }
+    if (-not $before.CanAttemptOfficialStop) { return [pscustomobject]@{ Success = $false; Operation = 'Stop'; Observation = $before; Message = '没有足够证据确认当前 bridge daemon，未执行官方 stop 或强制终止。'; FallbackUsed = $false; Refused = $true } }
+    $snapshot = $before.OwnershipSnapshot
+    $stopArguments = @('--from', $script:Config.BridgePackageSpec, $script:Config.BridgeCommand, 'stop')
+    $official = Invoke-UvxCommand -Arguments $stopArguments -WaitMilliseconds 15000
+    if (-not $official.Exited) { return [pscustomobject]@{ Success = $false; Operation = 'Stop'; Observation = Get-BridgeObservation -Deep; Message = "官方 stop invocation 未能确认退出，未进入 bridge fallback。$($official.Error)"; FallbackUsed = $false; Refused = $true; OfficialExitCode = $official.ExitCode; StdOut = $official.StdOut; StdErr = $official.StdErr } }
+    Start-Sleep -Milliseconds $script:Config.StopGraceMilliseconds
+    $afterOfficial = Get-BridgeObservation -Deep
+    if ((Test-StoppedEvidence -Observation $afterOfficial) -and @($afterOfficial.ForeignListenerPids).Count -eq 0) {
+        Remove-StalePidFileIfSafe -Observation $afterOfficial | Out-Null
+        $final = Get-BridgeObservation -Deep
+        $success = (Test-StoppedEvidence -Observation $final) -and -not $final.PidFilePresent
+        return [pscustomobject]@{ Success = $success; Operation = 'Stop'; Observation = $final; Message = if ($success) { 'Codex Bridge 已停止' } else { 'Bridge 已无运行证据，但 PID 文件未能安全清理。' }; FallbackUsed = $false; OfficialExitCode = $official.ExitCode; StdOut = $official.StdOut; StdErr = $official.StdErr }
     }
-    [pscustomobject]@{
-        Success = $fallback.Success
-        Operation = 'Stop'
-        Observation = Get-BridgeObservation
-        Message = $fallback.Message
-        FallbackUsed = $true
-        Refused = $fallback.Refused
-        OfficialExitCode = $official.ExitCode
-        KilledPids = $fallback.KilledPids
-    }
+    if (-not $snapshot -or -not $snapshot.CanForceStopAtCapture) { return [pscustomobject]@{ Success = $false; Operation = 'Stop'; Observation = $afterOfficial; Message = '官方 stop 未完成停止，但停止前 ownership 不满足安全强制终止条件；未杀任何 bridge 进程。'; FallbackUsed = $true; Refused = $true; OfficialExitCode = $official.ExitCode; StdOut = $official.StdOut; StdErr = $official.StdErr } }
+    $fallback = Stop-VerifiedBridgeTree -OwnershipSnapshot $snapshot
+    [pscustomobject]@{ Success = $fallback.Success; Operation = 'Stop'; Observation = $fallback.Observation; Message = $fallback.Message; FallbackUsed = $true; Refused = $fallback.Refused; OfficialExitCode = $official.ExitCode; KilledPids = $fallback.KilledPids; StdOut = $official.StdOut; StdErr = $official.StdErr }
 }
 
 function Invoke-RestartOperation {
     $stopResult = Invoke-StopOperation
-    if (-not $stopResult.Success) {
-        $stopResult.Operation = 'Restart'
-        $stopResult.Message = "重启未执行启动阶段：$($stopResult.Message)"
-        return $stopResult
-    }
+    if (-not $stopResult.Success) { $stopResult.Operation = 'Restart'; $stopResult.Message = "重启未执行启动阶段：$($stopResult.Message)"; return $stopResult }
     $startResult = Invoke-StartOperation
     $startResult.Operation = 'Restart'
     $startResult.FallbackUsed = $stopResult.FallbackUsed
-    if ($startResult.Success) {
-        $startResult.Message = 'Codex Bridge 已重启'
-    }
+    if ($startResult.Success) { $startResult.Message = 'Codex Bridge 已重启' }
     return $startResult
 }
 
 function Invoke-WorkItem {
     param([Parameter(Mandatory)] $WorkItem)
-
     try {
         switch ($WorkItem.Kind) {
-            'Probe' {
-                $observation = Get-BridgeObservation
-                return [pscustomobject]@{ Success = $true; Operation = 'Probe'; Observation = $observation; Message = $null }
-            }
+            'Probe' { return [pscustomobject]@{ Success = $true; Operation = 'Probe'; Observation = Get-BridgeObservation; Message = $null } }
             'Start' { return Invoke-StartOperation }
             'Stop' { return Invoke-StopOperation }
             'Restart' { return Invoke-RestartOperation }
             default { throw "未知后台操作：$($WorkItem.Kind)" }
         }
     } catch {
-        $observation = Get-BridgeObservation
-        return [pscustomobject]@{
-            Success = $false
-            Operation = $WorkItem.Kind
-            Observation = $observation
-            Message = $_.Exception.Message
-        }
+        $observation = Get-BridgeObservation -Deep
+        return [pscustomobject]@{ Success = $false; Operation = $WorkItem.Kind; Observation = $observation; Message = $_.Exception.Message }
     }
 }
 
 $createdNewMutex = $false
 $mutex = [System.Threading.Mutex]::new($true, 'Local\CodexBridgeController', [ref]$createdNewMutex)
-if (-not $createdNewMutex) {
-    $mutex.Dispose()
-    exit 0
-}
+if (-not $createdNewMutex) { $mutex.Dispose(); exit 0 }
 
 $script:WorkerRunspace = $null
 $script:ActiveInvocation = $null
 
 try {
-    # The backend functions are loaded into one dedicated runspace. The UI runspace
-    # only queues work and polls invocation state; it never performs bridge I/O.
     $mainSource = Get-Content -LiteralPath $PSCommandPath -Raw
     $backendStartMarker = '# ---- Runtime configuration'
     $backendEndMarker = '$createdNewMutex = $false'
     $backendStart = $mainSource.IndexOf($backendStartMarker, [System.StringComparison]::Ordinal)
     $backendEnd = $mainSource.IndexOf($backendEndMarker, [System.StringComparison]::Ordinal)
-    if ($backendStart -lt 0 -or $backendEnd -le $backendStart) {
-        throw '无法定位后台函数区域。'
-    }
-
-    $workerBootstrap = "`$ErrorActionPreference = 'Stop'`r`n" + $mainSource.Substring($backendStart, $backendEnd - $backendStart)
+    if ($backendStart -lt 0 -or $backendEnd -le $backendStart) { throw '无法定位后台函数区域。' }
+    $modelSource = Get-Content -LiteralPath $ModelPath -Raw
+    $controllerLiteral = "'" + $ControllerDirectory.Replace("'", "''") + "'"
+    $workerBootstrap = "`$ErrorActionPreference = 'Stop'`r`n`$ControllerDirectory = $controllerLiteral`r`n" + $modelSource + "`r`n" + $mainSource.Substring($backendStart, $backendEnd - $backendStart)
     $script:WorkerRunspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
     $script:WorkerRunspace.Open()
-
     $bootstrapPowerShell = [System.Management.Automation.PowerShell]::Create()
     $bootstrapPowerShell.Runspace = $script:WorkerRunspace
     [void]$bootstrapPowerShell.AddScript($workerBootstrap)
     [void]$bootstrapPowerShell.Invoke()
-    if ($bootstrapPowerShell.HadErrors) {
-        $bootstrapError = ($bootstrapPowerShell.Streams.Error | Select-Object -First 1)
-        throw "后台 runspace 初始化失败：$bootstrapError"
-    }
+    if ($bootstrapPowerShell.HadErrors) { $bootstrapError = ($bootstrapPowerShell.Streams.Error | Select-Object -First 1); throw "后台 runspace 初始化失败：$bootstrapError" }
     $bootstrapPowerShell.Dispose()
 } catch {
-    if ($script:WorkerRunspace) {
-        try { $script:WorkerRunspace.Close() } catch { }
-        try { $script:WorkerRunspace.Dispose() } catch { }
-        $script:WorkerRunspace = $null
-    }
+    if ($script:WorkerRunspace) { try { $script:WorkerRunspace.Close() } catch { }; try { $script:WorkerRunspace.Dispose() } catch { }; $script:WorkerRunspace = $null }
     try { $mutex.ReleaseMutex() } catch { }
     $mutex.Dispose()
-    [void][System.Windows.Forms.MessageBox]::Show(
-        "无法初始化后台 worker：$($_.Exception.Message)",
-        'Codex Bridge',
-        [System.Windows.Forms.MessageBoxButtons]::OK,
-        [System.Windows.Forms.MessageBoxIcon]::Error
-    )
+    [void][System.Windows.Forms.MessageBox]::Show("无法初始化后台 worker：$($_.Exception.Message)",'Codex Bridge',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error)
     exit 1
 }
 
 $script:CurrentObservation = $null
-$script:CurrentState = '检查中'
-$script:OperationState = 'Idle'
+$script:CurrentObservedState = 'Unknown'
+$script:CurrentOperationState = 'Idle'
+$script:CurrentPresentation = Get-BridgePresentation -OperationState Idle -ObservedState Unknown
 $script:OperationInFlight = $false
 $script:ExitAfterStop = $false
 $script:Closing = $false
 $script:ProbeQueued = $false
+$script:NextProbeAt = [DateTimeOffset]::MinValue
 $script:OperationSequence = 0
 $script:WorkQueue = [System.Collections.Queue]::new()
 $script:ActiveWorkItem = $null
@@ -732,7 +772,6 @@ $restartMenu = [System.Windows.Forms.ToolStripMenuItem]::new('重启')
 $openLogMenu = [System.Windows.Forms.ToolStripMenuItem]::new('打开日志')
 $openRunDirectoryMenu = [System.Windows.Forms.ToolStripMenuItem]::new('打开运行目录')
 $exitMenu = [System.Windows.Forms.ToolStripMenuItem]::new('退出控制器')
-
 $null = $contextMenu.Items.Add($statusMenu)
 $null = $contextMenu.Items.Add([System.Windows.Forms.ToolStripSeparator]::new())
 $null = $contextMenu.Items.Add($startMenu)
@@ -746,59 +785,39 @@ $null = $contextMenu.Items.Add($exitMenu)
 $notifyIcon.ContextMenuStrip = $contextMenu
 
 function Update-MenuForState {
-    param([string]$State)
-
-    $statusMenu.Text = "状态：$State"
-    $startMenu.Enabled = $State -eq '已停止'
-    $stopMenu.Enabled = $State -eq '已运行' -or ($State -eq '异常' -and $script:CurrentObservation -and $script:CurrentObservation.CanForceStop)
-    $restartMenu.Enabled = $State -eq '已运行'
+    $presentation = Get-BridgePresentation -OperationState $script:CurrentOperationState -ObservedState $script:CurrentObservedState -CanAttemptOfficialStop ([bool]($script:CurrentObservation -and $script:CurrentObservation.CanAttemptOfficialStop))
+    $script:CurrentPresentation = $presentation
+    $statusMenu.Text = "状态：$($presentation.DisplayText)"
+    $startMenu.Enabled = $presentation.StartEnabled
+    $stopMenu.Enabled = $presentation.StopEnabled
+    $restartMenu.Enabled = $presentation.RestartEnabled
     $exitMenu.Enabled = -not $script:OperationInFlight
-    $notifyIcon.Text = (Get-StatusTooltip -State $State).Substring(0, [Math]::Min(63, (Get-StatusTooltip -State $State).Length))
+    $notifyIcon.Text = $presentation.Tooltip.Substring(0, [Math]::Min(63, $presentation.Tooltip.Length))
 }
 
 function Show-Notice {
-    param(
-        [string]$Title,
-        [string]$Message,
-        [System.Windows.Forms.ToolTipIcon]$Icon = [System.Windows.Forms.ToolTipIcon]::Info
-    )
-
-    if ($notifyIcon.Visible) {
-        $notifyIcon.ShowBalloonTip(3000, $Title, $Message, $Icon)
-    }
+    param([string]$Title,[string]$Message,[System.Windows.Forms.ToolTipIcon]$Icon = [System.Windows.Forms.ToolTipIcon]::Info)
+    if ($notifyIcon.Visible) { $notifyIcon.ShowBalloonTip(3000, $Title, $Message, $Icon) }
 }
 
 function Show-OperationError {
     param([string]$Message)
-
-    $logPath = if ($script:CurrentObservation -and $script:CurrentObservation.LogPath) {
-        $script:CurrentObservation.LogPath
-    } else {
-        Join-Path $script:Config.RunDirectory 'server-127.0.0.1-18080.log'
-    }
-    $fullMessage = "$Message`n`n日志：$logPath"
-    [void][System.Windows.Forms.MessageBox]::Show($form, $fullMessage, 'Codex Bridge', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    $logPath = if ($script:CurrentObservation -and $script:CurrentObservation.LogPath) { $script:CurrentObservation.LogPath } else { Join-Path $script:Config.RunDirectory 'server-127.0.0.1-18080.log' }
+    [void][System.Windows.Forms.MessageBox]::Show($form,"$Message`n`n日志：$logPath",'Codex Bridge',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error)
 }
 
 function Apply-Observation {
     param([Parameter(Mandatory)] $Observation)
-
-    $previousState = $script:CurrentState
+    $previousState = $script:CurrentObservedState
     $script:CurrentObservation = $Observation
-    $script:CurrentState = Get-BridgeState -Observation $Observation -OperationState $script:OperationState
-    Update-MenuForState -State $script:CurrentState
-
-    if ($previousState -eq '已运行' -and $script:CurrentState -eq '异常') {
-        Show-Notice -Title 'Codex Bridge' -Message 'Bridge 状态异常，请打开日志查看。' -Icon Warning
-    }
+    $script:CurrentObservedState = if ($Observation.ObservedState) { [string]$Observation.ObservedState } else { 'Unknown' }
+    Update-MenuForState
+    if ($previousState -eq 'Running' -and $script:CurrentObservedState -in @('Degraded','Conflict')) { Show-Notice -Title 'Codex Bridge' -Message 'Bridge 状态异常，请打开日志查看。' -Icon Warning }
 }
 
 function Remove-QueuedProbes {
     $newQueue = [System.Collections.Queue]::new()
-    while ($script:WorkQueue.Count -gt 0) {
-        $item = $script:WorkQueue.Dequeue()
-        if ($item.Kind -ne 'Probe') { $null = $newQueue.Enqueue($item) }
-    }
+    while ($script:WorkQueue.Count -gt 0) { $item = $script:WorkQueue.Dequeue(); if ($item.Kind -ne 'Probe') { $null = $newQueue.Enqueue($item) } }
     $script:ProbeQueued = $false
     $script:WorkQueue = $newQueue
 }
@@ -807,293 +826,142 @@ function Start-NextWorkItem {
     if ($script:ActiveInvocation -or $script:WorkQueue.Count -eq 0 -or $script:Closing) { return }
     $item = $script:WorkQueue.Dequeue()
     $script:ActiveWorkItem = $item
+    $workerPowerShell = $null
     try {
         $workerPowerShell = [System.Management.Automation.PowerShell]::Create()
         $workerPowerShell.Runspace = $script:WorkerRunspace
         [void]$workerPowerShell.AddCommand('Invoke-WorkItem').AddParameter('WorkItem', $item)
         $asyncResult = $workerPowerShell.BeginInvoke()
-        $script:ActiveInvocation = [pscustomobject]@{
-            PowerShell = $workerPowerShell
-            AsyncResult = $asyncResult
-            WorkItem = $item
-        }
+        $script:ActiveInvocation = [pscustomobject]@{ PowerShell = $workerPowerShell; AsyncResult = $asyncResult; WorkItem = $item }
     } catch {
-        if ($workerPowerShell) {
-            try { $workerPowerShell.Dispose() } catch { }
-        }
+        if ($workerPowerShell) { try { $workerPowerShell.Dispose() } catch { } }
         $script:ActiveWorkItem = $null
         if ($item.Kind -eq 'Probe') { $script:ProbeQueued = $false }
         $script:BackendFailureNotified = $true
-        $script:CurrentState = '异常'
-        Update-MenuForState -State $script:CurrentState
+        $script:CurrentObservedState = 'Unknown'
+        Update-MenuForState
         Show-Notice -Title 'Codex Bridge' -Message "后台任务无法启动：$($_.Exception.Message)" -Icon Error
     }
 }
 
 function Request-Probe {
+    param([switch]$Force)
     if ($script:Closing -or $script:OperationInFlight -or $script:ProbeQueued) { return }
     if ($script:ActiveInvocation -and $script:ActiveWorkItem -and $script:ActiveWorkItem.Kind -eq 'Probe') { return }
+    if (-not $Force -and [DateTimeOffset]::Now -lt $script:NextProbeAt) { return }
     $script:ProbeQueued = $true
+    $script:NextProbeAt = [DateTimeOffset]::Now.AddMilliseconds($script:Config.LightProbeIntervalMilliseconds)
     $null = $script:WorkQueue.Enqueue([pscustomobject]@{ Kind = 'Probe'; Sequence = 0 })
     Start-NextWorkItem
 }
 
 function Request-Operation {
     param([ValidateSet('Start','Stop','Restart')] [string]$Kind)
-
     if ($script:Closing -or $script:OperationInFlight) { return }
+    if ($Kind -eq 'Stop' -and $script:CurrentObservation -and -not $script:CurrentObservation.CanAttemptOfficialStop -and $script:CurrentObservedState -notin @('Running')) { return }
     Remove-QueuedProbes
     $script:OperationInFlight = $true
     $script:OperationSequence++
-    $script:OperationState = switch ($Kind) {
-        'Start' { 'Starting' }
-        'Stop' { 'Stopping' }
-        'Restart' { 'Restarting' }
-    }
-    Update-MenuForState -State $script:OperationState
+    $script:CurrentOperationState = switch ($Kind) { 'Start' { 'Starting' } 'Stop' { 'Stopping' } 'Restart' { 'Restarting' } }
+    Update-MenuForState
     $null = $script:WorkQueue.Enqueue([pscustomobject]@{ Kind = $Kind; Sequence = $script:OperationSequence })
     Start-NextWorkItem
 }
 
 function Show-ExitChoiceDialog {
     $dialog = [System.Windows.Forms.Form]::new()
-    $dialog.Text = '退出 Codex Bridge 控制器'
-    $dialog.StartPosition = 'CenterParent'
-    $dialog.FormBorderStyle = 'FixedDialog'
-    $dialog.MinimizeBox = $false
-    $dialog.MaximizeBox = $false
-    $dialog.ShowInTaskbar = $false
-    $dialog.ClientSize = [System.Drawing.Size]::new(430, 150)
-
-    $label = [System.Windows.Forms.Label]::new()
-    $label.Text = "Codex Bridge 仍在后台运行。`r`n请选择退出方式："
-    $label.AutoSize = $true
-    $label.Location = [System.Drawing.Point]::new(18, 18)
-    $dialog.Controls.Add($label)
-
-    $onlyExit = [System.Windows.Forms.Button]::new()
-    $onlyExit.Text = '仅退出控制器'
-    $onlyExit.Size = [System.Drawing.Size]::new(120, 32)
-    $onlyExit.Location = [System.Drawing.Point]::new(18, 92)
-    $onlyExit.DialogResult = [System.Windows.Forms.DialogResult]::Yes
-    $dialog.Controls.Add($onlyExit)
-
-    $stopAndExit = [System.Windows.Forms.Button]::new()
-    $stopAndExit.Text = '停止 Bridge 并退出'
-    $stopAndExit.Size = [System.Drawing.Size]::new(140, 32)
-    $stopAndExit.Location = [System.Drawing.Point]::new(150, 92)
-    $stopAndExit.DialogResult = [System.Windows.Forms.DialogResult]::No
-    $dialog.Controls.Add($stopAndExit)
-
-    $cancel = [System.Windows.Forms.Button]::new()
-    $cancel.Text = '取消'
-    $cancel.Size = [System.Drawing.Size]::new(80, 32)
-    $cancel.Location = [System.Drawing.Point]::new(302, 92)
-    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    $dialog.Controls.Add($cancel)
-    $dialog.AcceptButton = $onlyExit
-    $dialog.CancelButton = $cancel
-
-    $result = $dialog.ShowDialog($form)
-    $dialog.Dispose()
-    return $result
+    $dialog.Text = '退出 Codex Bridge 控制器'; $dialog.StartPosition = 'CenterParent'; $dialog.FormBorderStyle = 'FixedDialog'; $dialog.MinimizeBox = $false; $dialog.MaximizeBox = $false; $dialog.ShowInTaskbar = $false; $dialog.ClientSize = [System.Drawing.Size]::new(430,150)
+    $label = [System.Windows.Forms.Label]::new(); $label.Text = "Codex Bridge 仍在后台运行。`r`n请选择退出方式："; $label.AutoSize = $true; $label.Location = [System.Drawing.Point]::new(18,18); $dialog.Controls.Add($label)
+    $onlyExit = [System.Windows.Forms.Button]::new(); $onlyExit.Text = '仅退出控制器'; $onlyExit.Size = [System.Drawing.Size]::new(120,32); $onlyExit.Location = [System.Drawing.Point]::new(18,92); $onlyExit.DialogResult = [System.Windows.Forms.DialogResult]::Yes; $dialog.Controls.Add($onlyExit)
+    $stopAndExit = [System.Windows.Forms.Button]::new(); $stopAndExit.Text = '停止 Bridge 并退出'; $stopAndExit.Size = [System.Drawing.Size]::new(140,32); $stopAndExit.Location = [System.Drawing.Point]::new(150,92); $stopAndExit.DialogResult = [System.Windows.Forms.DialogResult]::No; $dialog.Controls.Add($stopAndExit)
+    $cancel = [System.Windows.Forms.Button]::new(); $cancel.Text = '取消'; $cancel.Size = [System.Drawing.Size]::new(80,32); $cancel.Location = [System.Drawing.Point]::new(302,92); $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel; $dialog.Controls.Add($cancel)
+    $dialog.AcceptButton = $onlyExit; $dialog.CancelButton = $cancel
+    $result = $dialog.ShowDialog($form); $dialog.Dispose(); return $result
 }
 
 function Close-Controller {
     if ($script:Closing) { return }
-    $script:Closing = $true
-    $timer.Stop()
-    $notifyIcon.Visible = $false
-    $form.Close()
+    $script:Closing = $true; $timer.Stop(); $notifyIcon.Visible = $false; $form.Close()
 }
 
 function Request-ControllerExit {
     if ($script:OperationInFlight) { return }
     $observation = $script:CurrentObservation
-    $bridgeStillPresent = $observation -and (
-        $observation.HealthOk -or
-        @($observation.ListenerPids).Count -gt 0 -or
-        @($observation.AllBridgePids).Count -gt 0
-    )
-    if (-not $bridgeStillPresent) {
-        Close-Controller
-        return
-    }
-
+    $bridgeStillPresent = $observation -and ($observation.HealthOk -or @($observation.ListenerPids).Count -gt 0 -or @($observation.AllBridgePids).Count -gt 0 -or $observation.CanAttemptOfficialStop)
+    if (-not $bridgeStillPresent) { Close-Controller; return }
     $choice = Show-ExitChoiceDialog
-    switch ($choice) {
-        ([System.Windows.Forms.DialogResult]::Yes) { Close-Controller }
-        ([System.Windows.Forms.DialogResult]::No) {
-            $script:ExitAfterStop = $true
-            Request-Operation -Kind Stop
-        }
-    }
+    switch ($choice) { ([System.Windows.Forms.DialogResult]::Yes) { Close-Controller } ([System.Windows.Forms.DialogResult]::No) { $script:ExitAfterStop = $true; Request-Operation -Kind Stop } }
 }
 
 function Open-Log {
-    $path = Find-LogPath
-    if (-not $path) {
-        [void][System.Windows.Forms.MessageBox]::Show($form, "日志不存在。`n`n运行目录：$($script:Config.RunDirectory)", 'Codex Bridge', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-        return
-    }
-    try {
-        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-        $startInfo.FileName = $path
-        $startInfo.UseShellExecute = $true
-        [void][System.Diagnostics.Process]::Start($startInfo)
-    } catch {
-        Show-OperationError -Message "无法打开日志：$($_.Exception.Message)"
-    }
+    $path = if ($script:CurrentObservation -and $script:CurrentObservation.LogPath) { $script:CurrentObservation.LogPath } else { Join-Path $script:Config.RunDirectory 'server-127.0.0.1-18080.log' }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { [void][System.Windows.Forms.MessageBox]::Show($form,"日志不存在。`n`n运行目录：$($script:Config.RunDirectory)",'Codex Bridge',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information); return }
+    try { $startInfo = [System.Diagnostics.ProcessStartInfo]::new(); $startInfo.FileName = $path; $startInfo.UseShellExecute = $true; [void][System.Diagnostics.Process]::Start($startInfo) } catch { Show-OperationError -Message "无法打开日志：$($_.Exception.Message)" }
 }
 
 function Open-RunDirectory {
-    if (-not (Test-Path -LiteralPath $script:Config.RunDirectory -PathType Container)) {
-        [void][System.Windows.Forms.MessageBox]::Show($form, "运行目录不存在：`n$($script:Config.RunDirectory)", 'Codex Bridge', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-        return
-    }
-    try {
-        Start-Process -FilePath 'explorer.exe' -ArgumentList @($script:Config.RunDirectory) -WindowStyle Hidden
-    } catch {
-        Show-OperationError -Message "无法打开运行目录：$($_.Exception.Message)"
-    }
+    if (-not (Test-Path -LiteralPath $script:Config.RunDirectory -PathType Container)) { [void][System.Windows.Forms.MessageBox]::Show($form,"运行目录不存在：`n$($script:Config.RunDirectory)",'Codex Bridge',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information); return }
+    try { Start-Process -FilePath 'explorer.exe' -ArgumentList @($script:Config.RunDirectory) -WindowStyle Hidden } catch { Show-OperationError -Message "无法打开运行目录：$($_.Exception.Message)" }
 }
 
 function Apply-WorkResult {
-    param(
-        [Parameter(Mandatory)] $Item,
-        $Result,
-        [string]$InvocationError
-    )
-
+    param([Parameter(Mandatory)] $Item,$Result,[string]$InvocationError)
     if ($Item.Kind -eq 'Probe') { $script:ProbeQueued = $false }
-
-    if (-not $Result) {
-        $Result = [pscustomobject]@{
-            Success = $false
-            Operation = $Item.Kind
-            Observation = $null
-            Message = if ($InvocationError) { $InvocationError } else { '后台操作没有返回结果。' }
-        }
-    }
-
+    if (-not $Result) { $Result = [pscustomobject]@{ Success = $false; Operation = $Item.Kind; Observation = $null; Message = if ($InvocationError) { $InvocationError } else { '后台操作没有返回结果。' } } }
     if ($Result.Observation) { Apply-Observation -Observation $Result.Observation }
-
     if ($Item.Kind -eq 'Probe') {
-        if ($Result.Success) {
-            $script:BackendFailureNotified = $false
-        } else {
-            $script:CurrentState = '异常'
-            Update-MenuForState -State $script:CurrentState
-            if (-not $script:BackendFailureNotified) {
-                $script:BackendFailureNotified = $true
-                Show-Notice -Title 'Codex Bridge' -Message "后台状态探测异常：$($Result.Message)" -Icon Error
-            }
-        }
+        if ($Result.Success) { $script:BackendFailureNotified = $false }
+        elseif (-not $script:BackendFailureNotified) { $script:BackendFailureNotified = $true; $script:CurrentObservedState = 'Unknown'; Update-MenuForState; Show-Notice -Title 'Codex Bridge' -Message "后台状态探测异常：$($Result.Message)" -Icon Error }
     } else {
-        $script:OperationInFlight = $false
-        $script:OperationState = 'Idle'
+        if ($Item.Sequence -ne $script:OperationSequence) { return }
+        $script:OperationInFlight = $false; $script:CurrentOperationState = 'Idle'
+        if ($Result.Observation) { Apply-Observation -Observation $Result.Observation }
+        Update-MenuForState
         if ($Result.Success) {
             if ($Item.Kind -eq 'Start') { Show-Notice -Title 'Codex Bridge' -Message "Codex Bridge 已启动`r`n$($script:Config.BridgeHost):$($script:Config.BridgePort)" }
             elseif ($Item.Kind -eq 'Stop') { Show-Notice -Title 'Codex Bridge' -Message 'Codex Bridge 已停止' }
             elseif ($Item.Kind -eq 'Restart') { Show-Notice -Title 'Codex Bridge' -Message "Codex Bridge 已重启`r`n$($script:Config.BridgeHost):$($script:Config.BridgePort)" }
-            if ($script:ExitAfterStop -and ($Item.Kind -eq 'Stop' -or $Item.Kind -eq 'Restart')) {
-                $script:ExitAfterStop = $false
-                Close-Controller
-                return
-            }
-        } else {
-            $script:ExitAfterStop = $false
-            Show-OperationError -Message $Result.Message
-        }
+            if ($script:ExitAfterStop -and $Item.Kind -eq 'Stop') { $script:ExitAfterStop = $false; Close-Controller; return }
+        } else { $script:ExitAfterStop = $false; Show-OperationError -Message $Result.Message }
     }
-
-    if (-not $script:Closing) {
-        Update-MenuForState -State $script:CurrentState
-        Request-Probe
-        Start-NextWorkItem
-    }
+    if (-not $script:Closing) { Update-MenuForState; Request-Probe -Force; Start-NextWorkItem }
 }
 
 function Complete-ActiveWorkItem {
     $active = $script:ActiveInvocation
     if (-not $active) { return }
-
     $state = $active.PowerShell.InvocationStateInfo.State
-    if ($state -notin @(
-            [System.Management.Automation.PSInvocationState]::Completed,
-            [System.Management.Automation.PSInvocationState]::Failed,
-            [System.Management.Automation.PSInvocationState]::Stopped
-        )) {
-        return
-    }
-
-    $item = $active.WorkItem
-    $result = $null
-    $invocationError = $null
+    if ($state -notin @([System.Management.Automation.PSInvocationState]::Completed,[System.Management.Automation.PSInvocationState]::Failed,[System.Management.Automation.PSInvocationState]::Stopped)) { return }
+    $item = $active.WorkItem; $result = $null; $invocationError = $null
     try {
-        $output = @($active.PowerShell.EndInvoke($active.AsyncResult))
-        if ($output.Count -gt 0) { $result = $output[$output.Count - 1] }
-        if ($state -ne [System.Management.Automation.PSInvocationState]::Completed) {
-            $streamError = $active.PowerShell.Streams.Error | Select-Object -First 1
-            $invocationError = if ($streamError) { $streamError.ToString() } else { "后台任务状态：$state" }
-            $result = $null
-        }
-    } catch {
-        $invocationError = $_.Exception.Message
-        $result = $null
-    } finally {
-        $script:ActiveInvocation = $null
-        $script:ActiveWorkItem = $null
-        try { $active.PowerShell.Dispose() } catch { }
-    }
-
+        $output = @($active.PowerShell.EndInvoke($active.AsyncResult)); if ($output.Count -gt 0) { $result = $output[$output.Count - 1] }
+        if ($state -ne [System.Management.Automation.PSInvocationState]::Completed) { $streamError = $active.PowerShell.Streams.Error | Select-Object -First 1; $invocationError = if ($streamError) { $streamError.ToString() } else { "后台任务状态：$state" }; $result = $null }
+    } catch { $invocationError = $_.Exception.Message; $result = $null }
+    finally { $script:ActiveInvocation = $null; $script:ActiveWorkItem = $null; try { $active.PowerShell.Dispose() } catch { } }
     Apply-WorkResult -Item $item -Result $result -InvocationError $invocationError
 }
 
 $timer = [System.Windows.Forms.Timer]::new()
-$timer.Interval = $script:Config.RefreshIntervalMilliseconds
-$timer.Add_Tick({
-    Complete-ActiveWorkItem
-    Request-Probe
-    Start-NextWorkItem
-})
-
+$timer.Interval = $script:Config.UiTimerIntervalMilliseconds
+$timer.Add_Tick({ Complete-ActiveWorkItem; Request-Probe; Start-NextWorkItem })
 $startMenu.Add_Click({ Request-Operation -Kind Start })
 $stopMenu.Add_Click({ Request-Operation -Kind Stop })
 $restartMenu.Add_Click({ Request-Operation -Kind Restart })
 $openLogMenu.Add_Click({ Open-Log })
 $openRunDirectoryMenu.Add_Click({ Open-RunDirectory })
 $exitMenu.Add_Click({ Request-ControllerExit })
-$notifyIcon.Add_MouseClick({
-    param($sender, $eventArgs)
-    if ($eventArgs.Button -eq [System.Windows.Forms.MouseButtons]::Left -and $script:CurrentState -ne '检查中') {
-        Show-Notice -Title 'Codex Bridge' -Message "状态：$($script:CurrentState)"
-    }
-})
+$notifyIcon.Add_MouseClick({ param($sender,$eventArgs); if ($eventArgs.Button -eq [System.Windows.Forms.MouseButtons]::Left -and $script:CurrentObservedState -ne 'Unknown') { Show-Notice -Title 'Codex Bridge' -Message "状态：$($script:CurrentPresentation.DisplayText)" } })
 
 $form.Add_FormClosed({
-    $notifyIcon.Visible = $false
-    $notifyIcon.Dispose()
-    $contextMenu.Dispose()
-    $timer.Dispose()
-    if ($script:ActiveInvocation) {
-        try { $script:ActiveInvocation.PowerShell.Stop() } catch { }
-        try { $script:ActiveInvocation.PowerShell.Dispose() } catch { }
-        $script:ActiveInvocation = $null
-        $script:ActiveWorkItem = $null
-    }
+    $notifyIcon.Visible = $false; $notifyIcon.Dispose(); $contextMenu.Dispose(); $timer.Dispose()
+    if ($script:ActiveInvocation) { try { $script:ActiveInvocation.PowerShell.Stop() } catch { }; try { $script:ActiveInvocation.PowerShell.Dispose() } catch { }; $script:ActiveInvocation = $null; $script:ActiveWorkItem = $null }
     if ($script:WorkerRunspace) {
-        try { $script:WorkerRunspace.Close() } catch { }
-        try { $script:WorkerRunspace.Dispose() } catch { }
-        $script:WorkerRunspace = $null
+        try { $cleanupPowerShell = [System.Management.Automation.PowerShell]::Create(); $cleanupPowerShell.Runspace = $script:WorkerRunspace; [void]$cleanupPowerShell.AddCommand('Dispose-WorkerResources'); [void]$cleanupPowerShell.Invoke(); $cleanupPowerShell.Dispose() } catch { }
+        try { $script:WorkerRunspace.Close() } catch { }; try { $script:WorkerRunspace.Dispose() } catch { }; $script:WorkerRunspace = $null
     }
-    $mutex.ReleaseMutex()
-    $mutex.Dispose()
+    try { $mutex.ReleaseMutex() } catch { }; $mutex.Dispose()
 })
 
-Update-MenuForState -State $script:CurrentState
-$form.Show()
-$form.Hide()
-$timer.Start()
-Request-Probe
+Update-MenuForState
+$form.Show(); $form.Hide(); $timer.Start(); Request-Probe -Force
 [System.Windows.Forms.Application]::Run($form)
