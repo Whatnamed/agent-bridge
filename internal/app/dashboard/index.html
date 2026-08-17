@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex Bridge Monitor</title>
+  <link rel="stylesheet" href="/dashboard/assets/style.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div><p class="eyebrow">LOCAL OBSERVABILITY</p><h1>Codex Bridge Monitor</h1><p class="muted">旁路诊断 · 不保存 prompt、输出或 reasoning 文本</p></div>
+      <div class="status-pill"><span id="status-dot"></span><span id="bridge-status">Loading</span></div>
+    </header>
+    <nav class="tabs" aria-label="Sections"><button class="tab active" data-tab="overview">Overview</button><button class="tab" data-tab="requests">Requests</button><button class="tab" data-tab="diagnostics">Diagnostics</button></nav>
+    <section id="overview" class="tab-panel active">
+      <div class="grid cards">
+        <article class="card quota-card"><div class="card-heading"><span>Account Usage</span><span id="quota-status" class="tag">pending</span></div><div id="quota-content" class="quota-grid"><div class="empty">正在读取官方额度快照…</div></div></article>
+        <article class="card"><div class="card-heading"><span>Bridge</span><span id="last-quota" class="muted">—</span></div><div class="metric-row"><span>Active requests</span><strong id="active-requests">0</strong></div><div class="metric-row"><span>Dropped telemetry</span><strong id="dropped">0</strong></div><div class="metric-row"><span>Writer errors</span><strong id="writer-errors">0</strong></div></article>
+      </div>
+      <div class="card"><div class="card-heading"><span>Selected range</span><button id="refresh-overview" class="small-button">Refresh</button></div><div id="summary-grid" class="summary-grid"></div></div>
+    </section>
+    <section id="requests" class="tab-panel">
+      <div class="card"><div class="toolbar"><select id="range"><option value="today">Today</option><option value="1h">1h</option><option value="6h">6h</option><option value="24h">24h</option><option value="7d">7d</option><option value="30d">30d</option></select><input id="model-filter" placeholder="Model"><select id="outcome-filter"><option value="">All status</option><option value="success">Success</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option></select><button id="refresh-requests" class="small-button">Refresh</button></div>
+        <div class="table-wrap"><table><thead><tr><th>Time</th><th>Model</th><th>Effort</th><th>Input</th><th>Cached</th><th>Output</th><th>Reasoning</th><th>TTFT</th><th>Total</th><th>Status</th></tr></thead><tbody id="request-table"><tr><td colspan="10" class="empty">No requests yet.</td></tr></tbody></table></div>
+      </div>
+    </section>
+    <section id="diagnostics" class="tab-panel"><div class="card"><div class="card-heading"><span>Request diagnostics</span><span class="muted">Select a request in Requests</span></div><div id="detail" class="detail-empty">暂无请求详情</div></div></section>
+  </main>
+  <script src="/dashboard/assets/app.js"></script>
+</body>
+</html>

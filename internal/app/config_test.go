@@ -20,6 +20,18 @@ max_stored_items = 25
 max_concurrent_requests = 4
 api_key = "local-key"
 
+[telemetry]
+enabled = false
+retention_days = 14
+event_memory_limit = 80
+queue_size = 32
+
+[dashboard]
+enabled = false
+
+[reasoning]
+summary_default = "auto"
+
 [codex]
 auth_json = "~/custom-auth.json"
 backend_base_url = "https://example.test/codex/"
@@ -43,6 +55,9 @@ drop_params = ["temperature", "top_p"]
 	}
 	if cfg.BackendURL != "https://example.test/codex" || len(cfg.DropParams) != 2 {
 		t.Fatalf("Codex config = %#v", cfg)
+	}
+	if cfg.TelemetryEnabled || cfg.TelemetryRetentionDays != 14 || cfg.TelemetryEventMemoryLimit != 80 || cfg.TelemetryQueueSize != 32 || cfg.DashboardEnabled || cfg.ReasoningSummaryDefault != "auto" {
+		t.Fatalf("monitor config = %#v", cfg)
 	}
 }
 

@@ -80,6 +80,12 @@ func addDaemonServerFlags(fs *flag.FlagSet, cfg *config) *float64 {
 	fs.Float64Var(&timeout, "timeout", timeout, "backend timeout seconds")
 	fs.IntVar(&cfg.MaxStored, "max-stored-items", cfg.MaxStored, "maximum in-memory stored items")
 	fs.IntVar(&cfg.Concurrency, "max-concurrent-requests", cfg.Concurrency, "maximum Codex requests")
+	fs.BoolVar(&cfg.TelemetryEnabled, "telemetry-enabled", cfg.TelemetryEnabled, "enable request telemetry")
+	fs.IntVar(&cfg.TelemetryRetentionDays, "telemetry-retention-days", cfg.TelemetryRetentionDays, "telemetry retention days")
+	fs.IntVar(&cfg.TelemetryEventMemoryLimit, "telemetry-event-memory-limit", cfg.TelemetryEventMemoryLimit, "in-memory event timeline limit")
+	fs.IntVar(&cfg.TelemetryQueueSize, "telemetry-queue-size", cfg.TelemetryQueueSize, "bounded telemetry writer queue size")
+	fs.BoolVar(&cfg.DashboardEnabled, "dashboard-enabled", cfg.DashboardEnabled, "enable the local dashboard")
+	fs.StringVar(&cfg.ReasoningSummaryDefault, "reasoning-summary-default", cfg.ReasoningSummaryDefault, "default reasoning summary: none or auto")
 	return &timeout
 }
 
@@ -189,7 +195,24 @@ func startDaemon(cfg config, paths daemonPaths) error {
 }
 
 func serverCommandArgs(command string, cfg config) []string {
-	args := []string{command, "--host", cfg.Host, "--port", strconv.Itoa(cfg.Port), "--backend-base-url", cfg.BackendURL, "--client-version", cfg.ClientVersion, "--auth-json", cfg.AuthJSON, "--timeout", formatSeconds(cfg.Timeout), "--max-stored-items", strconv.Itoa(cfg.MaxStored), "--max-concurrent-requests", strconv.Itoa(cfg.Concurrency), "--default-model", cfg.Model}
+	args := []string{
+		command,
+		"--host", cfg.Host,
+		"--port", strconv.Itoa(cfg.Port),
+		"--backend-base-url", cfg.BackendURL,
+		"--client-version", cfg.ClientVersion,
+		"--auth-json", cfg.AuthJSON,
+		"--timeout", formatSeconds(cfg.Timeout),
+		"--max-stored-items", strconv.Itoa(cfg.MaxStored),
+		"--max-concurrent-requests", strconv.Itoa(cfg.Concurrency),
+		"--default-model", cfg.Model,
+		"--telemetry-enabled", strconv.FormatBool(cfg.TelemetryEnabled),
+		"--telemetry-retention-days", strconv.Itoa(cfg.TelemetryRetentionDays),
+		"--telemetry-event-memory-limit", strconv.Itoa(cfg.TelemetryEventMemoryLimit),
+		"--telemetry-queue-size", strconv.Itoa(cfg.TelemetryQueueSize),
+		"--dashboard-enabled", strconv.FormatBool(cfg.DashboardEnabled),
+		"--reasoning-summary-default", cfg.ReasoningSummaryDefault,
+	}
 	if command == "daemon-run" {
 		args = append(args, "--stop-timeout", formatSeconds(cfg.StopTimeout))
 	}

@@ -26,6 +26,7 @@ type server struct {
 	responses *responseStore
 	chats     *chatStore
 	slots     chan struct{}
+	telemetry *telemetryStore
 }
 
 type codexBackend interface {
@@ -47,7 +48,14 @@ func serve(cfg config, version string) error {
 	if _, err := b.auth.borrow(); err != nil {
 		return preflightAuthError(err)
 	}
-	s := &server{cfg: cfg, backend: b, responses: newResponseStore(cfg.MaxStored), chats: newChatStore(cfg.MaxStored)}
+	s := &server{
+		cfg:       cfg,
+		backend:   b,
+		responses: newResponseStore(cfg.MaxStored),
+		chats:     newChatStore(cfg.MaxStored),
+		telemetry: newTelemetryStore(cfg, b),
+	}
+	defer s.telemetry.close()
 	if cfg.Concurrency > 0 {
 		s.slots = make(chan struct{}, cfg.Concurrency)
 	}
@@ -100,6 +108,13 @@ func serve(cfg config, version string) error {
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	capture := &responseCapture{ResponseWriter: w}
 	started := time.Now()
+	counter := &countingReadCloser{ReadCloser: r.Body}
+	r.Body = counter
+	var requestTelemetry *requestTelemetry
+	if endpoint := telemetryEndpoint(r); endpoint != "" {
+		requestTelemetry = s.telemetry.begin(r, endpoint)
+		r = r.WithContext(withTelemetry(r.Context(), requestTelemetry))
+	}
 	if s.cfg.Verbose {
 		log.Printf("request.start method=%s path=%s query=%s", r.Method, redactSensitive(r.URL.Path), redactSensitive(r.URL.RawQuery))
 	}
@@ -113,8 +128,32 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/healthz" || s.cfg.Verbose {
 			log.Printf("request.end method=%s path=%s status=%d bytes=%d duration_ms=%.1f", r.Method, redactSensitive(r.URL.Path), capture.statusCode(), capture.bytes, float64(time.Since(started).Microseconds())/1000)
 		}
+		s.telemetry.finish(requestTelemetry, r, capture, counter.BytesRead)
 	}()
 	s.serveHTTP(capture, r)
+}
+
+type countingReadCloser struct {
+	io.ReadCloser
+	BytesRead int64
+}
+
+func (r *countingReadCloser) Read(data []byte) (int, error) {
+	count, err := r.ReadCloser.Read(data)
+	r.BytesRead += int64(count)
+	return count, err
+}
+
+func telemetryEndpoint(r *http.Request) string {
+	if r.Method != http.MethodPost {
+		return ""
+	}
+	switch r.URL.Path {
+	case "/v1/responses", "/v1/chat/completions":
+		return r.URL.Path
+	default:
+		return ""
+	}
 }
 
 type responseCapture struct {
@@ -163,6 +202,10 @@ func (s *server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			methodNotAllowed(w)
 		}
+		return
+	}
+	if r.URL.Path == "/dashboard" || strings.HasPrefix(r.URL.Path, "/dashboard/") {
+		s.dashboard(w, r)
 		return
 	}
 	if r.URL.Path != "/v1" && !strings.HasPrefix(r.URL.Path, "/v1/") {
@@ -271,6 +314,9 @@ func (s *server) createResponse(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "Invalid JSON body.", "invalid_request_error", nil, nil)
 		return
 	}
+	if observer := telemetryFromContext(r.Context()); observer != nil {
+		observer.observeRequest(body, "/v1/responses")
+	}
 	prepared := prepareResponse(body, s.cfg.Model)
 	previous := stringValue(prepared["previous_response_id"])
 	if previous != "" {
@@ -293,10 +339,17 @@ func (s *server) createResponse(w http.ResponseWriter, r *http.Request) {
 	defer s.release()
 	response, err := s.backend.collect(r.Context(), downstream)
 	if err != nil {
+		if observer := telemetryFromContext(r.Context()); observer != nil {
+			observer.observeStreamError()
+		}
 		writeBackendError(w, err)
 		return
 	}
 	response = ensureResponse(response, prepared)
+	if observer := telemetryFromContext(r.Context()); observer != nil {
+		observer.observeFinalResponse(response)
+		observer.observeDownstreamEvent(map[string]any{"type": "response"})
+	}
 	if previous != "" {
 		response["previous_response_id"] = previous
 	}
@@ -329,6 +382,9 @@ func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, prepared
 					response["output"] = outputs
 				}
 				response = ensureResponse(response, prepared)
+				if observer := telemetryFromContext(r.Context()); observer != nil {
+					observer.observeFinalResponse(response)
+				}
 				if previous != "" {
 					response["previous_response_id"] = previous
 				}
@@ -342,12 +398,18 @@ func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, prepared
 		if event["sequence_number"] == nil {
 			event["sequence_number"] = seq
 		}
+		if observer := telemetryFromContext(r.Context()); observer != nil {
+			observer.observeDownstreamEvent(event)
+		}
 		seq++
 		writeSSE(w, event)
 		flusher.Flush()
 		return nil
 	})
 	if err != nil {
+		if observer := telemetryFromContext(r.Context()); observer != nil {
+			observer.observeStreamError()
+		}
 		writeSSE(w, map[string]any{"type": "error", "sequence_number": seq, "code": nil, "message": publicStreamError(err), "param": nil})
 	}
 	io.WriteString(w, "data: [DONE]\n\n")
@@ -517,6 +579,9 @@ func (s *server) chatCollection(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "Invalid JSON body.", "invalid_request_error", nil, nil)
 		return
 	}
+	if observer := telemetryFromContext(r.Context()); observer != nil {
+		observer.observeRequest(body, "/v1/chat/completions")
+	}
 	responsePayload := chatToResponse(body, s.cfg.Model)
 	legacy := body["functions"] != nil || body["function_call"] != nil
 	if boolValue(body["stream"]) {
@@ -529,10 +594,17 @@ func (s *server) chatCollection(w http.ResponseWriter, r *http.Request) {
 	defer s.release()
 	response, err := s.backend.collect(r.Context(), responsePayload)
 	if err != nil {
+		if observer := telemetryFromContext(r.Context()); observer != nil {
+			observer.observeStreamError()
+		}
 		writeBackendError(w, err)
 		return
 	}
 	response = ensureResponse(response, responsePayload)
+	if observer := telemetryFromContext(r.Context()); observer != nil {
+		observer.observeFinalResponse(response)
+		observer.observeDownstreamEvent(map[string]any{"type": "chat.completion"})
+	}
 	completion := responseToChat(response, stringValue(responsePayload["model"]), legacy, chatChoiceCount(body["n"]))
 	if metadata := mapAny(body["metadata"]); metadata != nil {
 		completion["metadata"] = cloneMap(metadata)
@@ -557,7 +629,13 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 	includeUsage := boolValue(mapAny(body["stream_options"])["include_usage"])
 	var outputs []any
 	emitted := map[int]string{}
-	emit := func(v map[string]any) { writeSSE(w, v); flusher.Flush() }
+	emit := func(v map[string]any) {
+		if observer := telemetryFromContext(r.Context()); observer != nil {
+			observer.observeDownstreamEvent(v)
+		}
+		writeSSE(w, v)
+		flusher.Flush()
+	}
 	role := func() {
 		if !state.RoleSent {
 			state.RoleSent = true
@@ -624,6 +702,9 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 					resp["output"] = outputs
 				}
 				resp = ensureResponse(resp, responsePayload)
+				if observer := telemetryFromContext(r.Context()); observer != nil {
+					observer.observeFinalResponse(resp)
+				}
 				state.update(resp)
 				role()
 				completion := responseToChat(resp, state.Model, legacy, state.ChoiceCount)
@@ -644,6 +725,9 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 		return nil
 	})
 	if err != nil {
+		if observer := telemetryFromContext(r.Context()); observer != nil {
+			observer.observeStreamError()
+		}
 		emit(map[string]any{"error": map[string]any{"message": publicStreamError(err), "type": "api_error", "param": nil, "code": nil}})
 	}
 	io.WriteString(w, "data: [DONE]\n\n")

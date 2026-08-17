@@ -161,6 +161,10 @@ ENV/
 env.bak/
 venv.bak/
 
+# Local Go builds and monitor runtime artifacts
+/bin/
+telemetry/
+
 # Spyder project settings
 .spyderproject
 .spyproject

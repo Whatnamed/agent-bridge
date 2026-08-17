@@ -14,32 +14,41 @@ import (
 )
 
 const (
-	defaultHost        = "127.0.0.1"
-	defaultPort        = 18080
-	defaultModel       = "gpt-5.6-luna"
-	defaultBackendURL  = "https://chatgpt.com/backend-api/codex"
-	defaultClient      = "1.0.0"
-	defaultMaxStored   = 1000
-	defaultConcurrency = 10
+	defaultHost                   = "127.0.0.1"
+	defaultPort                   = 18080
+	defaultModel                  = "gpt-5.6-luna"
+	defaultBackendURL             = "https://chatgpt.com/backend-api/codex"
+	defaultClient                 = "1.0.0"
+	defaultMaxStored              = 1000
+	defaultConcurrency            = 10
+	defaultTelemetryRetentionDays = 30
+	defaultTelemetryEventMemory   = 200
+	defaultTelemetryQueueSize     = 256
 )
 
 type config struct {
-	Host          string
-	Port          int
-	Model         string
-	BackendURL    string
-	ClientVersion string
-	AuthJSON      string
-	APIKey        string
-	Timeout       time.Duration
-	MaxStored     int
-	Concurrency   int
-	Verbose       bool
-	DropParams    []string
-	StateDir      string
-	PIDFile       string
-	LogFile       string
-	StopTimeout   time.Duration
+	Host                      string
+	Port                      int
+	Model                     string
+	BackendURL                string
+	ClientVersion             string
+	AuthJSON                  string
+	APIKey                    string
+	Timeout                   time.Duration
+	MaxStored                 int
+	Concurrency               int
+	Verbose                   bool
+	DropParams                []string
+	StateDir                  string
+	PIDFile                   string
+	LogFile                   string
+	StopTimeout               time.Duration
+	TelemetryEnabled          bool
+	TelemetryRetentionDays    int
+	TelemetryEventMemoryLimit int
+	TelemetryQueueSize        int
+	DashboardEnabled          bool
+	ReasoningSummaryDefault   string
 }
 
 func defaultConfig() config {
@@ -50,6 +59,9 @@ func defaultConfig() config {
 		BackendURL: defaultBackendURL, ClientVersion: defaultClient, AuthJSON: auth,
 		Timeout: 300 * time.Second, MaxStored: defaultMaxStored, Concurrency: defaultConcurrency,
 		StateDir: defaultStateDir(), StopTimeout: 10 * time.Second,
+		TelemetryEnabled: true, TelemetryRetentionDays: defaultTelemetryRetentionDays,
+		TelemetryEventMemoryLimit: defaultTelemetryEventMemory, TelemetryQueueSize: defaultTelemetryQueueSize,
+		DashboardEnabled: true, ReasoningSummaryDefault: "none",
 	}
 }
 
@@ -69,6 +81,12 @@ func (c *config) applyEnvironment() {
 	c.PIDFile = envString("OPENAI_VIA_CODEX_PID_FILE", c.PIDFile)
 	c.LogFile = envString("OPENAI_VIA_CODEX_LOG_FILE", c.LogFile)
 	c.StopTimeout = time.Duration(envFloat("OPENAI_VIA_CODEX_STOP_TIMEOUT", c.StopTimeout.Seconds()) * float64(time.Second))
+	c.TelemetryEnabled = envBool("OPENAI_VIA_CODEX_TELEMETRY_ENABLED", c.TelemetryEnabled)
+	c.TelemetryRetentionDays = envInt("OPENAI_VIA_CODEX_TELEMETRY_RETENTION_DAYS", c.TelemetryRetentionDays)
+	c.TelemetryEventMemoryLimit = envInt("OPENAI_VIA_CODEX_TELEMETRY_EVENT_MEMORY_LIMIT", c.TelemetryEventMemoryLimit)
+	c.TelemetryQueueSize = envInt("OPENAI_VIA_CODEX_TELEMETRY_QUEUE_SIZE", c.TelemetryQueueSize)
+	c.DashboardEnabled = envBool("OPENAI_VIA_CODEX_DASHBOARD_ENABLED", c.DashboardEnabled)
+	c.ReasoningSummaryDefault = strings.ToLower(envString("OPENAI_VIA_CODEX_REASONING_SUMMARY_DEFAULT", c.ReasoningSummaryDefault))
 }
 
 func Run(args []string, version string) error {
@@ -107,6 +125,12 @@ func Run(args []string, version string) error {
 	fs.IntVar(&cfg.MaxStored, "max-stored-items", cfg.MaxStored, "maximum in-memory stored items")
 	fs.IntVar(&cfg.Concurrency, "max-concurrent-requests", cfg.Concurrency, "maximum Codex requests")
 	fs.BoolVar(&cfg.Verbose, "verbose", cfg.Verbose, "verbose logging")
+	fs.BoolVar(&cfg.TelemetryEnabled, "telemetry-enabled", cfg.TelemetryEnabled, "enable request telemetry")
+	fs.IntVar(&cfg.TelemetryRetentionDays, "telemetry-retention-days", cfg.TelemetryRetentionDays, "telemetry retention days")
+	fs.IntVar(&cfg.TelemetryEventMemoryLimit, "telemetry-event-memory-limit", cfg.TelemetryEventMemoryLimit, "in-memory event timeline limit")
+	fs.IntVar(&cfg.TelemetryQueueSize, "telemetry-queue-size", cfg.TelemetryQueueSize, "bounded telemetry writer queue size")
+	fs.BoolVar(&cfg.DashboardEnabled, "dashboard-enabled", cfg.DashboardEnabled, "enable the local dashboard")
+	fs.StringVar(&cfg.ReasoningSummaryDefault, "reasoning-summary-default", cfg.ReasoningSummaryDefault, "default reasoning summary: none or auto")
 	stopTimeout := cfg.StopTimeout.Seconds()
 	if command == "daemon-run" {
 		fs.Float64Var(&stopTimeout, "stop-timeout", stopTimeout, "seconds to wait before force kill")
@@ -123,8 +147,14 @@ func Run(args []string, version string) error {
 	if command == "daemon-run" {
 		minimumPort = 1
 	}
-	if cfg.MaxStored < 0 || cfg.Concurrency < 0 || cfg.Port < minimumPort || cfg.Port > 65535 || timeout <= 0 || stopTimeout <= 0 {
-		return errors.New("port, timeout, max-stored-items, max-concurrent-requests, or stop-timeout is invalid")
+	cfg.ReasoningSummaryDefault = strings.ToLower(strings.TrimSpace(cfg.ReasoningSummaryDefault))
+	if cfg.ReasoningSummaryDefault == "" {
+		cfg.ReasoningSummaryDefault = "none"
+	}
+	if cfg.MaxStored < 0 || cfg.Concurrency < 0 || cfg.Port < minimumPort || cfg.Port > 65535 || timeout <= 0 || stopTimeout <= 0 ||
+		cfg.TelemetryRetentionDays < 1 || cfg.TelemetryEventMemoryLimit < 1 || cfg.TelemetryQueueSize < 1 ||
+		(cfg.ReasoningSummaryDefault != "none" && cfg.ReasoningSummaryDefault != "auto") {
+		return errors.New("port, timeout, stop-timeout, max-stored-items, max-concurrent-requests, telemetry settings, or reasoning summary default is invalid")
 	}
 	cfg.Timeout = time.Duration(timeout * float64(time.Second))
 	cfg.StopTimeout = time.Duration(stopTimeout * float64(time.Second))
@@ -199,6 +229,18 @@ verbose = false
 max_stored_items = %d
 max_concurrent_requests = %d
 
+[telemetry]
+enabled = true
+retention_days = %d
+event_memory_limit = %d
+queue_size = %d
+
+[dashboard]
+enabled = true
+
+[reasoning]
+summary_default = "none"
+
 [codex]
 auth_json = "~/.codex/auth.json"
 backend_base_url = %q
@@ -210,7 +252,7 @@ drop_params = []
 [daemon]
 state_dir = %q
 stop_timeout = 10.0
-`, defaultHost, defaultPort, defaultModel, defaultMaxStored, defaultConcurrency, defaultBackendURL, defaultClient, defaultStateDir())
+`, defaultHost, defaultPort, defaultModel, defaultMaxStored, defaultConcurrency, defaultTelemetryRetentionDays, defaultTelemetryEventMemory, defaultTelemetryQueueSize, defaultBackendURL, defaultClient, defaultStateDir())
 }
 
 func defaultStateDir() string {
@@ -265,6 +307,18 @@ type configFile struct {
 		MaxConcurrentRequests *int     `toml:"max_concurrent_requests"`
 		APIKey                *string  `toml:"api_key"`
 	} `toml:"server"`
+	Telemetry struct {
+		Enabled          *bool `toml:"enabled"`
+		RetentionDays    *int  `toml:"retention_days"`
+		EventMemoryLimit *int  `toml:"event_memory_limit"`
+		QueueSize        *int  `toml:"queue_size"`
+	} `toml:"telemetry"`
+	Dashboard struct {
+		Enabled *bool `toml:"enabled"`
+	} `toml:"dashboard"`
+	Reasoning struct {
+		SummaryDefault *string `toml:"summary_default"`
+	} `toml:"reasoning"`
 	Codex struct {
 		AuthJSON       *string `toml:"auth_json"`
 		BackendBaseURL *string `toml:"backend_base_url"`
@@ -329,6 +383,24 @@ func (file *configFile) apply(c *config) {
 	}
 	if file.Daemon.StopTimeout != nil {
 		c.StopTimeout = time.Duration(*file.Daemon.StopTimeout * float64(time.Second))
+	}
+	if file.Telemetry.Enabled != nil {
+		c.TelemetryEnabled = *file.Telemetry.Enabled
+	}
+	if file.Telemetry.RetentionDays != nil {
+		c.TelemetryRetentionDays = *file.Telemetry.RetentionDays
+	}
+	if file.Telemetry.EventMemoryLimit != nil {
+		c.TelemetryEventMemoryLimit = *file.Telemetry.EventMemoryLimit
+	}
+	if file.Telemetry.QueueSize != nil {
+		c.TelemetryQueueSize = *file.Telemetry.QueueSize
+	}
+	if file.Dashboard.Enabled != nil {
+		c.DashboardEnabled = *file.Dashboard.Enabled
+	}
+	if file.Reasoning.SummaryDefault != nil {
+		c.ReasoningSummaryDefault = strings.ToLower(*file.Reasoning.SummaryDefault)
 	}
 }
 

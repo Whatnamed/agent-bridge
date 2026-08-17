@@ -126,6 +126,11 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 	}
 	setDefault(text, "verbosity", "low")
 	prepared["text"] = text
+	if b.cfg.ReasoningSummaryDefault == "auto" {
+		if reasoning := mapAny(prepared["reasoning"]); reasoning != nil {
+			setDefault(reasoning, "summary", "auto")
+		}
+	}
 	include := sliceAny(prepared["include"])
 	found := false
 	for _, v := range include {
@@ -137,6 +142,9 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 		include = append(include, "reasoning.encrypted_content")
 	}
 	prepared["include"] = include
+	if observer := telemetryFromContext(ctx); observer != nil {
+		observer.observePrepared(prepared)
+	}
 	body, _ := json.Marshal(prepared)
 	resp, err := b.doAuthenticated(func(cred credentials) (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.cfg.BackendURL+"/responses", bytes.NewReader(body))
@@ -175,6 +183,9 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 			return nil
 		}
 		normalizeBackendEvent(event)
+		if observer := telemetryFromContext(ctx); observer != nil {
+			observer.observeUpstreamEvent(event)
+		}
 		events++
 		return fn(event)
 	}

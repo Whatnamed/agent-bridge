@@ -77,6 +77,53 @@ $ uv run --with openai python example.py
 > 10 ms. See the [benchmark and methodology](docs/performance.md); real model
 > latency is dominated by the upstream Codex service.
 
+## Local monitor branch
+
+This branch adds a local, read-only monitor to the Go runtime while preserving
+the v0.2.0 `/v1/responses` and `/v1/chat/completions` contract. The dashboard is
+embedded in the executable and is available at `http://127.0.0.1:18080/dashboard`
+when `dashboard.enabled` is true. It has Overview, Requests, and Diagnostics
+views, plus JSON endpoints under `/dashboard/api/`.
+
+Only real model workloads are recorded by default: `POST /v1/responses` and
+`POST /v1/chat/completions`. Health, models, and other compatibility routes are
+not request records. Telemetry is fail-open: a full writer queue, a persistence
+error, or an unavailable quota endpoint does not fail or delay the model
+request. The in-memory timeline is bounded to 200 metadata-only events per
+request; prompts, output text, reasoning text, tool arguments/results, raw
+headers, tokens, and auth contents are not stored.
+
+Request records are written asynchronously as mode `0600` JSONL files under
+`<state-dir>/telemetry/`, with 30-day retention. The quota snapshot is also
+read-only and refreshed at most once per minute when the dashboard Overview is
+opened. For the default ChatGPT `backend-api` route it calls `GET /wham/usage`;
+a non-`backend-api` Codex API base uses `GET /api/codex/usage`. No plan limit is
+guessed and no exact quota cost is attributed to an individual request.
+
+Reasoning summary remains protocol-compatible and disabled by default. The
+explicit opt-in is:
+
+```console
+$ openai-api-server-via-codex serve --reasoning-summary-default auto
+```
+
+The corresponding configuration keys are available in `[telemetry]`,
+`[dashboard]`, and `[reasoning]`, as well as the `OPENAI_VIA_CODEX_*`
+environment variables and CLI flags. Precedence remains CLI, environment,
+config file, then defaults, matching the existing runtime.
+
+For a repeatable local executable build used by the Windows tray review:
+
+```console
+$ go build -trimpath -buildvcs=false -ldflags "-X main.version=0.2.0-monitor.1" -o ./bin/openai-api-server-via-codex.exe ./cmd/openai-api-server-via-codex
+$ go version
+$ sha256sum ./bin/openai-api-server-via-codex.exe
+```
+
+The generated `bin/` directory and local telemetry directory are ignored by
+Git. See [docs/monitor.md](docs/monitor.md) for the route, schema, privacy,
+retention, and non-billed validation details.
+
 <details>
 <summary><strong>Use Docker instead</strong></summary>
 
