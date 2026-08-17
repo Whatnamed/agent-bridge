@@ -260,6 +260,28 @@ Describe 'Codex Bridge deterministic runtime arguments' {
         (Get-TestArgumentValue -Arguments $start -Flag '--port') | Should Be ([string]$script:RuntimeTestConfig.BridgePort)
     }
 
+    It 'uses the direct monitor binary without reintroducing the uvx package wrapper' {
+        $directConfig = [pscustomobject]@{
+            BridgeExecutablePath = 'E:\Codex\openai-api-server-via-codex-monitor\bin\openai-api-server-via-codex.exe'
+            BridgePackageSpec = 'openai-api-server-via-codex==0.2.0'
+            BridgeCommand = 'openai-api-server-via-codex'
+            BridgeHost = '127.0.0.1'
+            BridgePort = 18080
+            RunDirectory = 'C:\temp\codex-bridge-run'
+            PidFilePath = 'C:\temp\codex-bridge-run\server.pid'
+            LogFilePath = 'C:\temp\codex-bridge-run\server.log'
+            AuthJsonPath = 'C:\Users\hasee\.codex\auth.json'
+        }
+
+        $start = New-BridgeRuntimeArguments -Config $directConfig -Verb 'start' -IncludeAuthJson -IncludeVerbose
+
+        $start[0] | Should Be 'start'
+        (@($start | Where-Object { $_ -eq '--from' }).Count) | Should Be 0
+        (@($start | Where-Object { $_ -eq $directConfig.BridgeCommand }).Count) | Should Be 0
+        (Get-TestArgumentValue -Arguments $start -Flag '--host') | Should Be $directConfig.BridgeHost
+        (Get-TestArgumentValue -Arguments $start -Flag '--auth-json') | Should Be $directConfig.AuthJsonPath
+    }
+
     It 'keeps the configured PID and log paths under the configured run directory' {
         ([IO.Path]::GetDirectoryName($script:RuntimeTestConfig.PidFilePath)) | Should Be $script:RuntimeTestConfig.RunDirectory
         ([IO.Path]::GetDirectoryName($script:RuntimeTestConfig.LogFilePath)) | Should Be $script:RuntimeTestConfig.RunDirectory

@@ -22,10 +22,17 @@ function New-BridgeRuntimeArguments {
         [switch] $IncludeVerbose
     )
 
-    $arguments = @(
-        '--from', [string]$Config.BridgePackageSpec,
-        [string]$Config.BridgeCommand,
-        $Verb,
+    $usesDirectBinary = -not [string]::IsNullOrWhiteSpace([string]$Config.BridgeExecutablePath)
+    if ($usesDirectBinary) {
+        $arguments = @($Verb)
+    } else {
+        $arguments = @(
+            '--from', [string]$Config.BridgePackageSpec,
+            [string]$Config.BridgeCommand,
+            $Verb
+        )
+    }
+    $arguments += @(
         '--host', [string]$Config.BridgeHost,
         '--port', [string]$Config.BridgePort,
         '--state-dir', [string]$Config.RunDirectory,

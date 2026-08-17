@@ -17,18 +17,33 @@
 `CodexBridge.ps1` 顶部集中定义运行配置：
 
 - uvx：`E:\Dev\uv\uvx.exe`
-- bridge：`openai-api-server-via-codex==0.2.0`
+- review bridge binary：`E:\Codex\openai-api-server-via-codex-monitor\bin\openai-api-server-via-codex.exe`
+- package fallback：`openai-api-server-via-codex==0.2.0`（仅当 `$BridgeExecutablePath` 留空时使用）
 - host：`127.0.0.1`
 - port：`18080`
 - health：`http://127.0.0.1:18080/healthz`
+- dashboard：`http://127.0.0.1:18080/dashboard`
 - run directory：`$env:USERPROFILE\.config\openai-api-server-via-codex\run\`
 - PID file：`$env:USERPROFILE\.config\openai-api-server-via-codex\run\server-127.0.0.1-18080.pid`
 - log file：`$env:USERPROFILE\.config\openai-api-server-via-codex\run\server-127.0.0.1-18080.log`
 - auth path：`$env:USERPROFILE\.codex\auth.json`
 
-当前固定使用已验证的 `0.2.0`。将来升级只修改顶部的 `$BridgeVersion`，启动和停止逻辑会自动使用同一个版本配置。
+当前 review 分支优先使用已构建的 monitor binary；它来自独立的
+`feature/codex-monitor` 分支，不覆盖正在运行的 stable `uvx` 实例。若要
+回到已验证的发布包，只需把顶部 `$BridgeExecutablePath` 设为空，控制器
+就会使用 `$BridgeVersion` 组成的 `uvx --from ...==$BridgeVersion` 命令。
+将来升级发布包只修改 `$BridgeVersion` 一个配置点；切换本地 monitor
+构建则只修改 `$BridgeExecutablePath` 一个配置点。
 
 控制器通过统一的 runtime argument builder 为 `start`、`stop` 和 `status` 显式传入 host、port、state directory、PID file 和 log file；`start` 另外显式传入 auth path。外部 `config.toml`、环境变量或 bridge 默认值不会改变控制器认知的目标 instance。
+
+如果使用 review binary，请先在 `E:\Codex\openai-api-server-via-codex-monitor`
+构建它：
+
+```powershell
+go build -trimpath -buildvcs=false -ldflags "-X main.version=0.2.0-monitor.1" -o .\bin\openai-api-server-via-codex.exe .\cmd\openai-api-server-via-codex
+Get-FileHash .\bin\openai-api-server-via-codex.exe -Algorithm SHA256
+```
 
 ## 安装和启动
 
@@ -62,7 +77,13 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File E:\Codex\CodexBridge\InstallShortc
 
 ## 停止和安全 fallback
 
-停止总是先执行固定版本的官方命令：
+停止总是先执行与启动相同 runner 的官方命令。review binary 模式示例为：
+
+```text
+<BridgeExecutablePath> stop --host 127.0.0.1 --port 18080 --state-dir <RunDirectory> --pid-file <PidFilePath> --log-file <LogFilePath>
+```
+
+package fallback 模式才使用：
 
 ```text
 uvx --from openai-api-server-via-codex==0.2.0 openai-api-server-via-codex stop --host 127.0.0.1 --port 18080 --state-dir <RunDirectory> --pid-file <PidFilePath> --log-file <LogFilePath>
@@ -89,14 +110,15 @@ fallback 的候选 PID 先由纯 `Get-FallbackActionPlan` 根据 snapshot、当�
 
 - 日志：`$env:USERPROFILE\.config\openai-api-server-via-codex\run\server-127.0.0.1-18080.log`
 - 运行目录可从托盘菜单打开。
+- Bridge Running 时可从托盘菜单打开 `http://127.0.0.1:18080/dashboard` 数据面板；启动中、停止中、已停止或身份异常时该菜单禁用。
 - 控制器只检查 `auth.json` 是否存在，绝不读取、打印、复制或保存其内容。
 
 ## 测试
 
-纯模型测试不启动 bridge、不访问 `/v1/responses`，只覆盖 ownership、共同祖先隔离、PID reuse、fingerprint、respawn、foreign listener、其他端口实例、stale PID 和菜单状态：
+纯模型测试不启动 bridge、不访问 `/v1/responses`，只覆盖 ownership、共同祖先隔离、PID reuse、fingerprint、respawn、foreign listener、其他端口实例、stale PID、显式 runtime arguments 和菜单状态：
 
 ```powershell
-pwsh -NoProfile -NonInteractive -Command "Import-Module Pester -RequiredVersion 3.4.0; Invoke-Pester -Path E:\Codex\CodexBridge\tests\CodexBridge.Tests.ps1"
+pwsh -NoProfile -NonInteractive -Command "Import-Module Pester -RequiredVersion 3.4.0; Invoke-Pester -Path E:\Codex\CodexBridge-review\tests\CodexBridge.Tests.ps1"
 ```
 
 真实集成验证只使用 `/healthz`、listener、PID/进程观察和官方 start/stop，不发送计费的 `/v1/responses` 请求。

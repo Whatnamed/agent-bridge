@@ -23,6 +23,7 @@ if (-not (Test-Path -LiteralPath $ModelPath -PathType Leaf)) {
 
 # ---- Runtime configuration: change BridgeVersion only when upgrading the verified bridge. ----
 $UvxPath = 'E:\Dev\uv\uvx.exe'
+$BridgeExecutablePath = 'E:\Codex\openai-api-server-via-codex-monitor\bin\openai-api-server-via-codex.exe'
 $BridgePackage = 'openai-api-server-via-codex'
 $BridgeVersion = '0.2.0'
 $BridgeCommand = $BridgePackage
@@ -40,6 +41,7 @@ $RunDirectory = Join-Path (Join-Path $env:USERPROFILE '.config') 'openai-api-ser
 $PidFileName = "server-$BridgeHost-$BridgePort.pid"
 $LogFileName = "server-$BridgeHost-$BridgePort.log"
 $HealthUri = "http://$BridgeHost`:$BridgePort/healthz"
+$DashboardUri = "http://$BridgeHost`:$BridgePort/dashboard"
 $AuthJsonPath = Join-Path (Join-Path $env:USERPROFILE '.codex') 'auth.json'
 $DesktopPath = [Environment]::GetFolderPath('Desktop')
 
@@ -58,6 +60,7 @@ $script:Config = [pscustomobject]@{
     ControllerDirectory = $ControllerDirectory
     ModelPath = $ModelPath
     UvxPath = $UvxPath
+    BridgeExecutablePath = $BridgeExecutablePath
     BridgePackage = $BridgePackage
     BridgeVersion = $BridgeVersion
     BridgeCommand = $BridgeCommand
@@ -72,6 +75,7 @@ $script:Config = [pscustomobject]@{
     LogFileName = $LogFileName
     LogFilePath = (Join-Path $RunDirectory $LogFileName)
     HealthUri = $HealthUri
+    DashboardUri = $DashboardUri
     AuthJsonPath = $AuthJsonPath
     HealthTimeoutMilliseconds = $HealthTimeoutMilliseconds
     LightProbeIntervalMilliseconds = $LightProbeIntervalMilliseconds
@@ -392,11 +396,19 @@ function Limit-DiagnosticText {
     return $Text.Substring(0, $script:Config.CliOutputLimit) + "`r`n...[truncated]"
 }
 
+function Get-BridgeRunnerPath {
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:Config.BridgeExecutablePath)) {
+        return [string]$script:Config.BridgeExecutablePath
+    }
+    return [string]$script:Config.UvxPath
+}
+
 function New-HiddenProcess {
     param([Parameter(Mandatory)] [string[]] $Arguments)
-    if (-not (Test-Path -LiteralPath $script:Config.UvxPath -PathType Leaf)) { throw "找不到 uvx：$($script:Config.UvxPath)" }
+    $runnerPath = Get-BridgeRunnerPath
+    if (-not (Test-Path -LiteralPath $runnerPath -PathType Leaf)) { throw "找不到 Bridge runner：$runnerPath" }
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $script:Config.UvxPath
+    $startInfo.FileName = $runnerPath
     $startInfo.WorkingDirectory = $script:Config.ControllerDirectory
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
@@ -634,7 +646,8 @@ function Invoke-StartOperation {
     if ($before.ObservedState -eq 'Conflict' -or @($before.ForeignListenerPids).Count -gt 0) { return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = '18080 已被未归属到当前 bridge ownership tree 的进程占用，未执行启动。'; FallbackUsed = $false } }
     if ($before.PidFileState -in @('StaleMissingProcess','StaleReusedPid')) { Remove-StalePidFileIfSafe -Observation $before | Out-Null; $before = Get-BridgeObservation -Deep }
     if ($before.ObservedState -ne 'Stopped' -or $before.PidFilePresent -or @($before.AllBridgePids).Count -gt 0) { return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = '检测到 bridge 进程、PID 文件或不完整运行证据，未重复启动。请先执行停止或查看日志。'; FallbackUsed = $false } }
-    if (-not (Test-Path -LiteralPath $script:Config.UvxPath -PathType Leaf)) { return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = "找不到 uvx：$($script:Config.UvxPath)"; FallbackUsed = $false } }
+    $runnerPath = Get-BridgeRunnerPath
+    if (-not (Test-Path -LiteralPath $runnerPath -PathType Leaf)) { return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = "找不到 Bridge runner：$runnerPath"; FallbackUsed = $false } }
     if (-not (Test-Path -LiteralPath $script:Config.AuthJsonPath -PathType Leaf)) { return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = "找不到 Codex OAuth 文件：$($script:Config.AuthJsonPath)"; FallbackUsed = $false } }
     $startArguments = New-BridgeRuntimeArguments -Config $script:Config -Verb 'start' -IncludeAuthJson -IncludeVerbose
     $invocation = $null
@@ -770,6 +783,7 @@ $stopMenu = [System.Windows.Forms.ToolStripMenuItem]::new('停止')
 $restartMenu = [System.Windows.Forms.ToolStripMenuItem]::new('重启')
 $openLogMenu = [System.Windows.Forms.ToolStripMenuItem]::new('打开日志')
 $openRunDirectoryMenu = [System.Windows.Forms.ToolStripMenuItem]::new('打开运行目录')
+$openDashboardMenu = [System.Windows.Forms.ToolStripMenuItem]::new('打开数据面板')
 $exitMenu = [System.Windows.Forms.ToolStripMenuItem]::new('退出控制器')
 $null = $contextMenu.Items.Add($statusMenu)
 $null = $contextMenu.Items.Add([System.Windows.Forms.ToolStripSeparator]::new())
@@ -779,6 +793,7 @@ $null = $contextMenu.Items.Add($restartMenu)
 $null = $contextMenu.Items.Add([System.Windows.Forms.ToolStripSeparator]::new())
 $null = $contextMenu.Items.Add($openLogMenu)
 $null = $contextMenu.Items.Add($openRunDirectoryMenu)
+$null = $contextMenu.Items.Add($openDashboardMenu)
 $null = $contextMenu.Items.Add([System.Windows.Forms.ToolStripSeparator]::new())
 $null = $contextMenu.Items.Add($exitMenu)
 $notifyIcon.ContextMenuStrip = $contextMenu
@@ -790,6 +805,7 @@ function Update-MenuForState {
     $startMenu.Enabled = $presentation.StartEnabled
     $stopMenu.Enabled = $presentation.StopEnabled
     $restartMenu.Enabled = $presentation.RestartEnabled
+    $openDashboardMenu.Enabled = $script:CurrentObservedState -eq 'Running' -and -not $script:OperationInFlight
     $exitMenu.Enabled = -not $script:OperationInFlight
     $notifyIcon.Text = $presentation.Tooltip.Substring(0, [Math]::Min(63, $presentation.Tooltip.Length))
 }
@@ -903,6 +919,16 @@ function Open-RunDirectory {
     try { Start-Process -FilePath 'explorer.exe' -ArgumentList @($script:Config.RunDirectory) -WindowStyle Hidden } catch { Show-OperationError -Message "无法打开运行目录：$($_.Exception.Message)" }
 }
 
+function Open-Dashboard {
+    if ($script:CurrentObservedState -ne 'Running' -or $script:OperationInFlight) { return }
+    try {
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = [string]$script:Config.DashboardUri
+        $startInfo.UseShellExecute = $true
+        [void][System.Diagnostics.Process]::Start($startInfo)
+    } catch { Show-OperationError -Message "无法打开数据面板：$($_.Exception.Message)" }
+}
+
 function Apply-WorkResult {
     param([Parameter(Mandatory)] $Item,$Result,[string]$InvocationError)
     if ($Item.Kind -ne 'Probe' -and $Item.Sequence -ne $script:OperationSequence) { return }
@@ -947,6 +973,7 @@ $stopMenu.Add_Click({ Request-Operation -Kind Stop })
 $restartMenu.Add_Click({ Request-Operation -Kind Restart })
 $openLogMenu.Add_Click({ Open-Log })
 $openRunDirectoryMenu.Add_Click({ Open-RunDirectory })
+$openDashboardMenu.Add_Click({ Open-Dashboard })
 $exitMenu.Add_Click({ Request-ControllerExit })
 $notifyIcon.Add_MouseClick({ param($sender,$eventArgs); if ($eventArgs.Button -eq [System.Windows.Forms.MouseButtons]::Left -and $script:CurrentObservedState -ne 'Unknown') { Show-Notice -Title 'Codex Bridge' -Message "状态：$($script:CurrentPresentation.DisplayText)" } })
 
