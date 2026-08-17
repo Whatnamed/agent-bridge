@@ -1,0 +1,21 @@
+# Runtime artifacts
+*.log
+*.pid
+*.tmp
+*.bak
+*.out
+run/
+logs/
+work/
+
+# Local credentials and environment files
+auth.json
+*.auth.json
+.env
+.env.*
+!.env.example
+
+# Local OS/editor files
+Thumbs.db
+.DS_Store
+.vscode/
