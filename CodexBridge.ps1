@@ -12,6 +12,34 @@ if ([System.Threading.Thread]::CurrentThread.ApartmentState -ne [System.Threadin
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+
+public static class CodexBridgeWindowNative
+{
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern int GetWindowTextLength(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int command);
+}
+'@
 
 $ControllerDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ModelPath = Join-Path $ControllerDirectory 'lib\BridgeModel.ps1'
@@ -810,6 +838,7 @@ function Apply-Observation {
     $previousState = $script:CurrentObservedState
     $script:CurrentObservation = $Observation
     $script:CurrentObservedState = if ($Observation.ObservedState) { [string]$Observation.ObservedState } else { 'Unknown' }
+    Hide-VerifiedBridgeTerminalWindow -Observation $Observation
     Update-MenuForState
     if ($previousState -eq 'Running' -and $script:CurrentObservedState -in @('Degraded','Conflict')) { Show-Notice -Title 'Codex Bridge' -Message 'Bridge 状态异常，请打开日志查看。' -Icon Warning }
 }
@@ -819,6 +848,56 @@ function Remove-QueuedProbes {
     while ($script:WorkQueue.Count -gt 0) { $item = $script:WorkQueue.Dequeue(); if ($item.Kind -ne 'Probe') { $null = $newQueue.Enqueue($item) } }
     $script:ProbeQueued = $false
     $script:WorkQueue = $newQueue
+}
+
+function Hide-VerifiedBridgeTerminalWindow {
+    param([Parameter(Mandatory)] $Observation)
+
+    if ([string]$Observation.ObservedState -ne 'Running' -or [string]$Observation.TargetInstanceAffinity -ne 'Bound') {
+        return
+    }
+
+    $knownExecutablePaths = @(
+        $Observation.OwnedProcessRecords |
+            Where-Object { [string]$_.Name -ieq [string]$script:Config.BridgeExecutableName } |
+            ForEach-Object { [string]$_.ExecutablePath } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Sort-Object -Unique
+    )
+    if ($knownExecutablePaths.Count -eq 0) { return }
+
+    $windows = [System.Collections.Generic.List[object]]::new()
+    $callback = [CodexBridgeWindowNative+EnumWindowsProc]{
+        param($hWnd, $lParam)
+        if ([CodexBridgeWindowNative]::IsWindowVisible($hWnd)) {
+            $length = [CodexBridgeWindowNative]::GetWindowTextLength($hWnd)
+            if ($length -gt 0) {
+                $titleBuilder = [System.Text.StringBuilder]::new($length + 1)
+                [void][CodexBridgeWindowNative]::GetWindowText($hWnd, $titleBuilder, $titleBuilder.Capacity)
+                [uint32]$windowPid = 0
+                [void][CodexBridgeWindowNative]::GetWindowThreadProcessId($hWnd, [ref]$windowPid)
+                [void]$windows.Add([pscustomobject]@{ Handle = $hWnd; ProcessId = [int]$windowPid; Title = $titleBuilder.ToString() })
+            }
+        }
+        return $true
+    }
+
+    try { [void][CodexBridgeWindowNative]::EnumWindows($callback, [IntPtr]::Zero) } catch { return }
+
+    foreach ($window in @($windows)) {
+        $terminalProcess = $null
+        try {
+            $terminalProcess = [System.Diagnostics.Process]::GetProcessById([int]$window.ProcessId)
+            if (-not (Test-BridgeTerminalWindowMatch -TerminalProcessName $terminalProcess.ProcessName -WindowTitle $window.Title -KnownExecutablePaths $knownExecutablePaths)) {
+                continue
+            }
+            [void][CodexBridgeWindowNative]::ShowWindow($window.Handle, 0)
+        } catch {
+            # Window discovery/hiding is best-effort and must not affect bridge state.
+        } finally {
+            if ($terminalProcess) { $terminalProcess.Dispose() }
+        }
+    }
 }
 
 function Start-NextWorkItem {

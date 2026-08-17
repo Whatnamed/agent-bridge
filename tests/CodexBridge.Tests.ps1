@@ -267,3 +267,19 @@ Describe 'Codex Bridge deterministic runtime arguments' {
         ([IO.Path]::GetFileName($script:RuntimeTestConfig.LogFilePath)) | Should Be 'server-127.0.0.1-18080.log'
     }
 }
+
+Describe 'Codex Bridge terminal window ownership' {
+    It 'matches only a Windows Terminal window titled with a verified bridge executable path' {
+        $knownPath = 'C:\Users\hasee\AppData\Local\uv\cache\archive-v0\bridge\openai-api-server-via-codex.exe'
+
+        (Test-BridgeTerminalWindowMatch -TerminalProcessName 'WindowsTerminal' -WindowTitle $knownPath -KnownExecutablePaths @($knownPath)) | Should Be $true
+        (Test-BridgeTerminalWindowMatch -TerminalProcessName 'WindowsTerminal' -WindowTitle ($knownPath.ToUpperInvariant()) -KnownExecutablePaths @($knownPath)) | Should Be $true
+    }
+
+    It 'rejects unrelated windows and non-Windows-Terminal hosts' {
+        $knownPath = 'C:\Users\hasee\AppData\Local\uv\cache\archive-v0\bridge\openai-api-server-via-codex.exe'
+
+        (Test-BridgeTerminalWindowMatch -TerminalProcessName 'WindowsTerminal' -WindowTitle 'PowerShell' -KnownExecutablePaths @($knownPath)) | Should Be $false
+        (Test-BridgeTerminalWindowMatch -TerminalProcessName 'conhost' -WindowTitle $knownPath -KnownExecutablePaths @($knownPath)) | Should Be $false
+    }
+}
