@@ -268,18 +268,12 @@ Describe 'Codex Bridge deterministic runtime arguments' {
     }
 }
 
-Describe 'Codex Bridge terminal window ownership' {
-    It 'matches only a Windows Terminal window titled with a verified bridge executable path' {
-        $knownPath = 'C:\Users\hasee\AppData\Local\uv\cache\archive-v0\bridge\openai-api-server-via-codex.exe'
+Describe 'Codex Bridge launcher' {
+    It 'uses hidden non-blocking Run and WMI confirmation instead of Exec' {
+        $launcher = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\Launch.vbs') -Raw
 
-        (Test-BridgeTerminalWindowMatch -TerminalProcessName 'WindowsTerminal' -WindowTitle $knownPath -KnownExecutablePaths @($knownPath)) | Should Be $true
-        (Test-BridgeTerminalWindowMatch -TerminalProcessName 'WindowsTerminal' -WindowTitle ($knownPath.ToUpperInvariant()) -KnownExecutablePaths @($knownPath)) | Should Be $true
-    }
-
-    It 'rejects unrelated windows and non-Windows-Terminal hosts' {
-        $knownPath = 'C:\Users\hasee\AppData\Local\uv\cache\archive-v0\bridge\openai-api-server-via-codex.exe'
-
-        (Test-BridgeTerminalWindowMatch -TerminalProcessName 'WindowsTerminal' -WindowTitle 'PowerShell' -KnownExecutablePaths @($knownPath)) | Should Be $false
-        (Test-BridgeTerminalWindowMatch -TerminalProcessName 'conhost' -WindowTitle $knownPath -KnownExecutablePaths @($knownPath)) | Should Be $false
+        (@($launcher | Select-String -Pattern 'shellObject\.Run\(fullCommandLine, 0, False\)').Count) | Should Be 1
+        (@($launcher | Select-String -Pattern 'shellObject\.Exec|child\.Status').Count) | Should Be 0
+        (@($launcher | Select-String -Pattern 'ControllerIsRunning').Count) | Should BeGreaterThan 0
     }
 }

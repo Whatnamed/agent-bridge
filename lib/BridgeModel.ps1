@@ -37,26 +37,6 @@ function New-BridgeRuntimeArguments {
     return [string[]]$arguments
 }
 
-function Test-BridgeTerminalWindowMatch {
-    param(
-        [string] $TerminalProcessName,
-        [string] $WindowTitle,
-        [string[]] $KnownExecutablePaths = @()
-    )
-
-    if ([string]::IsNullOrWhiteSpace($WindowTitle) -or $TerminalProcessName -ine 'WindowsTerminal') {
-        return $false
-    }
-
-    foreach ($knownPath in @($KnownExecutablePaths)) {
-        if (-not [string]::IsNullOrWhiteSpace($knownPath) -and [string]::Equals($WindowTitle, $knownPath, [StringComparison]::OrdinalIgnoreCase)) {
-            return $true
-        }
-    }
-
-    return $false
-}
-
 function Get-BridgeCreationStamp {
     param($Value)
 

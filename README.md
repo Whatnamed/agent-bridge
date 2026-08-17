@@ -57,7 +57,6 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File E:\Codex\CodexBridge\InstallShortc
 - worker 使用持久 `HttpClient`，任务串行且 single-flight，不会堆积重复 probe。
 - 每个操作有序列号；旧结果不能覆盖新状态。
 - 目标 instance affinity 会区分 `Bound`、`HistoricalBound`、`Unbound` 和 `Conflict`。PID 文件只证明 supervisor 身份，不自动证明它就是 18080 instance；只有目标 listener owner 与已验证 supervisor tree 一致时才会进入 `Bound`。
-- 如果 bridge 自身创建了 Windows Terminal 控制台窗口，控制器只在 bridge 已验证为 `Bound` 时，按精确 executable path 隐藏对应窗口；不关闭 `WindowsTerminal.exe`、`conhost.exe`，也不影响其他终端窗口。
 
 内部 operation state（`Starting`、`Stopping`、`Restarting`）与 observed state（`Running`、`Stopped`、`Degraded`、`Conflict`、`Unknown`）分离。启动中、停止中和重启中会禁用启动/停止/重启；Running 禁用启动；Stopped 只启用启动；未知端口占用时不提供强制停止。
 

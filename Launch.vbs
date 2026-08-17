@@ -54,29 +54,26 @@ Function ExecutableToken(value)
 End Function
 
 Function TryLaunch(shellObject, fullCommandLine, targetScript)
-    Dim child, startError, attempt
+    Dim startError, runResult, attempt
     TryLaunch = False
     On Error Resume Next
-    Set child = shellObject.Exec(fullCommandLine)
+    runResult = shellObject.Run(fullCommandLine, 0, False)
     startError = Err.Number
     Err.Clear
     On Error GoTo 0
 
-    If startError <> 0 Or child Is Nothing Then Exit Function
+    If startError <> 0 Then Exit Function
 
-    ' Confirm the controller process rather than treating a still-running pwsh
-    ' launcher as success. This also lets the caller try the next PowerShell 7
-    ' location when an alias or installation is unusable.
-    For attempt = 1 To 20
+    ' Run(..., 0, False) returns immediately and provides no child status.
+    ' Confirm the actual controller process through WMI instead of treating
+    ' the launcher call itself as proof of successful initialization.
+    For attempt = 1 To 30
         If ControllerIsRunning(targetScript) Then
             TryLaunch = True
             Exit For
         End If
-        If child.Status <> 0 Then Exit For
         WScript.Sleep 100
     Next
-
-    Set child = Nothing
 End Function
 
 Function ControllerIsRunning(targetScript)
