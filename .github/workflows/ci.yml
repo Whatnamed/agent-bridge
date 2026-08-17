@@ -1,0 +1,37 @@
+name: Codex Bridge validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  powershell:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Pester 3
+        shell: pwsh
+        run: Install-Module Pester -RequiredVersion 3.4.0 -Scope CurrentUser -Force -AllowClobber
+
+      - name: Parse PowerShell sources
+        shell: pwsh
+        run: |
+          $errors = @()
+          foreach ($path in @('CodexBridge.ps1', 'InstallShortcut.ps1', 'tests/CodexBridge.Tests.ps1', 'lib/BridgeModel.ps1')) {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $path), [ref]$tokens, [ref]$parseErrors) | Out-Null
+            $errors += $parseErrors
+          }
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Error; exit 1 }
+
+      - name: Run Pester
+        shell: pwsh
+        run: |
+          Import-Module Pester -RequiredVersion 3.4.0
+          $result = Invoke-Pester -Script (Join-Path $PWD 'tests/CodexBridge.Tests.ps1') -PassThru
+          if ($result.FailedCount -gt 0) { exit 1 }
