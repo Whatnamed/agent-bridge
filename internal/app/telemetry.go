@@ -28,6 +28,7 @@ const (
 	quotaRequestTimeout   = 10 * time.Second
 	telemetryDateLayout   = "2006-01-02"
 	telemetryDateFileName = "2006-01-02.jsonl"
+	quotaFileName         = "quota.jsonl"
 )
 
 type telemetryContextKey struct{}
@@ -340,7 +341,7 @@ func (s *telemetryStore) appendJSONL(now time.Time, value any) {
 }
 
 func (s *telemetryStore) appendQuota(value map[string]any) {
-	name := filepath.Join(s.telemetryDir, "quota.jsonl")
+	name := filepath.Join(s.telemetryDir, quotaFileName)
 	file, err := os.OpenFile(name, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		s.writerErrors.Add(1)
@@ -366,7 +367,7 @@ func (s *telemetryStore) loadRecentRecords() {
 	sort.Strings(files)
 	for _, name := range files {
 		base := filepath.Base(name)
-		if base == "quota.jsonl" || len(base) != len(telemetryDateFileName) {
+		if base == quotaFileName || len(base) != len(telemetryDateFileName) {
 			continue
 		}
 		if _, err := time.Parse(telemetryDateLayout, strings.TrimSuffix(base, ".jsonl")); err != nil {
@@ -394,7 +395,7 @@ func (s *telemetryStore) loadRecentRecords() {
 }
 
 func (s *telemetryStore) loadQuotaSnapshot() {
-	name := filepath.Join(s.telemetryDir, "quota.jsonl")
+	name := filepath.Join(s.telemetryDir, quotaFileName)
 	file, err := os.Open(name)
 	if err != nil {
 		return
@@ -432,7 +433,7 @@ func (s *telemetryStore) cleanupRetention() {
 	}
 	for _, name := range files {
 		base := filepath.Base(name)
-		if base == "quota.jsonl" || len(base) != len(telemetryDateFileName) {
+		if base == quotaFileName || len(base) != len(telemetryDateFileName) {
 			continue
 		}
 		date, err := time.ParseInLocation(telemetryDateLayout, strings.TrimSuffix(base, ".jsonl"), time.Local)
@@ -451,6 +452,103 @@ func (s *telemetryStore) cleanupRetention() {
 			s.writerErrors.Add(1)
 		}
 	}
+	s.cleanupQuotaHistory(cutoff, root)
+}
+
+func (s *telemetryStore) cleanupQuotaHistory(cutoff time.Time, root string) {
+	name := filepath.Join(s.telemetryDir, quotaFileName)
+	absolute, err := filepath.Abs(name)
+	if err != nil {
+		return
+	}
+	relative, err := filepath.Rel(root, absolute)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) || filepath.Dir(relative) != "." || filepath.Base(relative) != quotaFileName {
+		return
+	}
+
+	input, err := os.Open(absolute)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			s.writerErrors.Add(1)
+		}
+		return
+	}
+	inputClosed := false
+	defer func() {
+		if !inputClosed {
+			_ = input.Close()
+		}
+	}()
+
+	temporary, err := os.CreateTemp(root, ".quota-retention-*.jsonl")
+	if err != nil {
+		s.writerErrors.Add(1)
+		return
+	}
+	temporaryName := temporary.Name()
+	keepTemporary := false
+	defer func() {
+		_ = temporary.Close()
+		if !keepTemporary {
+			_ = os.Remove(temporaryName)
+		}
+	}()
+	_ = temporary.Chmod(0600)
+
+	writer := bufio.NewWriterSize(temporary, 16*1024)
+	scanner := bufio.NewScanner(input)
+	scanner.Buffer(make([]byte, 64*1024), maxTelemetryLineBytes)
+	changed := false
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		keep := true
+		var snapshot map[string]any
+		if json.Unmarshal(line, &snapshot) == nil {
+			if fetchedAt, parseErr := time.Parse(time.RFC3339Nano, stringValue(snapshot["fetched_at"])); parseErr == nil && fetchedAt.Before(cutoff) {
+				keep = false
+				changed = true
+			}
+		}
+		if keep {
+			if _, err := writer.Write(line); err != nil {
+				s.writerErrors.Add(1)
+				return
+			}
+			if err := writer.WriteByte('\n'); err != nil {
+				s.writerErrors.Add(1)
+				return
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		s.writerErrors.Add(1)
+		return
+	}
+	if !changed {
+		return
+	}
+	if err := writer.Flush(); err != nil {
+		s.writerErrors.Add(1)
+		return
+	}
+	if err := input.Close(); err != nil {
+		s.writerErrors.Add(1)
+		return
+	}
+	inputClosed = true
+	if err := temporary.Close(); err != nil {
+		s.writerErrors.Add(1)
+		return
+	}
+	if err := os.Remove(absolute); err != nil {
+		s.writerErrors.Add(1)
+		return
+	}
+	if err := os.Rename(temporaryName, absolute); err != nil {
+		s.writerErrors.Add(1)
+		return
+	}
+	keepTemporary = true
 }
 
 func (s *telemetryStore) recentRecords() []*requestRecord {

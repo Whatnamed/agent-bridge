@@ -47,7 +47,7 @@ func TestTelemetryCapturesMetadataWithoutPersistingContent(t *testing.T) {
 	telemetry.observeUpstreamEvent(map[string]any{"type": "response.completed", "sequence_number": 4, "response": map[string]any{
 		"model": "gpt-5.6-luna",
 		"usage": map[string]any{
-			"input_tokens": 10, "input_tokens_details": map[string]any{"cached_tokens": 4},
+			"input_tokens": 10, "input_tokens_details": map[string]any{"cached_tokens": 4}, "cache_write_tokens": 2,
 			"output_tokens": 8, "output_tokens_details": map[string]any{"reasoning_tokens": 5}, "total_tokens": 18,
 		},
 	}})
@@ -71,7 +71,7 @@ func TestTelemetryCapturesMetadataWithoutPersistingContent(t *testing.T) {
 	if record.ReasoningItemCount != 1 || record.EncryptedReasoningItems != 1 || record.ReadableReasoningItems != 1 || record.TTFTMS == nil {
 		t.Fatalf("reasoning counters = %#v", record)
 	}
-	if record.InputTokens == nil || *record.InputTokens != 10 || record.CachedInputTokens == nil || *record.CachedInputTokens != 4 || record.ReasoningTokens == nil || *record.ReasoningTokens != 5 {
+	if record.InputTokens == nil || *record.InputTokens != 10 || record.CachedInputTokens == nil || *record.CachedInputTokens != 4 || record.CacheWriteTokens == nil || *record.CacheWriteTokens != 2 || record.ReasoningTokens == nil || *record.ReasoningTokens != 5 {
 		t.Fatalf("usage = %#v", record)
 	}
 	if len(record.Timeline) != 3 {
@@ -123,6 +123,42 @@ func TestTelemetryRetentionOnlyDeletesDateFilesInTelemetryDirectory(t *testing.T
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("unexpected deletion of %s: %v", path, err)
 		}
+	}
+}
+
+func TestTelemetryRetentionTrimsQuotaHistoryWithoutTouchingOutside(t *testing.T) {
+	root := t.TempDir()
+	telemetryDir := filepath.Join(root, "telemetry")
+	if err := os.MkdirAll(telemetryDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	oldFetchedAt := time.Now().UTC().AddDate(0, 0, -2)
+	recentFetchedAt := time.Now().UTC().Add(-time.Hour)
+	quota := strings.Join([]string{
+		`{"fetched_at":"` + oldFetchedAt.Format(time.RFC3339Nano) + `","marker":"old"}`,
+		`{"fetched_at":"` + recentFetchedAt.Format(time.RFC3339Nano) + `","marker":"recent"}`,
+	}, "\n") + "\n"
+	quotaPath := filepath.Join(telemetryDir, quotaFileName)
+	outside := filepath.Join(root, "do-not-delete.txt")
+	if err := os.WriteFile(quotaPath, []byte(quota), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outside, []byte("outside"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := &telemetryStore{cfg: config{TelemetryRetentionDays: 1}, telemetryDir: telemetryDir}
+	store.cleanupRetention()
+
+	data, err := os.ReadFile(quotaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"marker":"old"`) || !strings.Contains(string(data), `"marker":"recent"`) {
+		t.Fatalf("quota retention result = %s", data)
+	}
+	if outsideData, err := os.ReadFile(outside); err != nil || string(outsideData) != "outside" {
+		t.Fatalf("outside file changed: data=%q err=%v", outsideData, err)
 	}
 }
 
@@ -322,6 +358,30 @@ func TestDashboardDisabledReturnsNotFound(t *testing.T) {
 	}
 }
 
+func TestDashboardMarksOldQuotaSnapshotStale(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	store := newTelemetryStore(cfg, nil)
+	defer store.close()
+	store.quota.mu.Lock()
+	store.quota.snapshot = map[string]any{"primary": map[string]any{"used_percent": 12}}
+	store.quota.fetchedAt = time.Now().Add(-2 * quotaRefreshInterval)
+	store.quota.mu.Unlock()
+
+	response := httptest.NewRecorder()
+	(&server{cfg: cfg, telemetry: store}).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/dashboard/api/overview", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("overview status = %d: %s", response.Code, response.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if stringValue(payload["quota_status"]) != "stale" {
+		t.Fatalf("quota status = %#v", payload["quota_status"])
+	}
+}
+
 func TestTelemetryContextDoesNotChangeCancelledRequestSemantics(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.StateDir = t.TempDir()
@@ -410,6 +470,9 @@ func TestTelemetryTracksReasoningSummaryToolsAndDownstreamTTFT(t *testing.T) {
 	telemetry := store.begin(request, "/v1/responses")
 	telemetry.observeRequest(map[string]any{"model": "gpt-5.6-luna", "stream": true, "reasoning": map[string]any{"effort": "max"}, "parallel_tool_calls": true}, "/v1/responses")
 	telemetry.observePrepared(map[string]any{"model": "gpt-5.6-luna", "reasoning": map[string]any{"effort": "max"}, "include": []any{"reasoning.encrypted_content"}})
+	telemetry.mu.Lock()
+	telemetry.lastEvent = time.Now().Add(-1500 * time.Millisecond)
+	telemetry.mu.Unlock()
 	for _, id := range []string{"reasoning-one", "reasoning-two"} {
 		telemetry.observeUpstreamEvent(map[string]any{"type": "response.output_item.added", "item": map[string]any{"id": id, "type": "reasoning", "encrypted_content": "cipher-" + id, "summary": []any{map[string]any{"type": "summary_text"}}}})
 		telemetry.observeUpstreamEvent(map[string]any{"type": "response.output_item.done", "item": map[string]any{"id": id, "type": "reasoning", "encrypted_content": "cipher-" + id, "summary": []any{map[string]any{"type": "summary_text"}}}})
@@ -432,7 +495,7 @@ func TestTelemetryTracksReasoningSummaryToolsAndDownstreamTTFT(t *testing.T) {
 	if record.ToolCallCount != 1 || record.FunctionCallCount != 1 || record.UpstreamEventCount != 9 || record.DownstreamEventCount != 1 {
 		t.Fatalf("tool/event counters = %#v", record)
 	}
-	if record.TTFTMS == nil || record.FirstUpstreamEventMS == nil || record.FirstReasoningEventMS == nil || record.FirstToolCallMS == nil {
+	if record.TTFTMS == nil || record.FirstUpstreamEventMS == nil || record.FirstReasoningEventMS == nil || record.FirstToolCallMS == nil || record.LongestSSEGapMS < 1000 {
 		t.Fatalf("timing fields = %#v", record)
 	}
 	if record.InputTokens == nil || *record.InputTokens != 100 || record.CachedInputTokens == nil || *record.CachedInputTokens != 40 || record.OutputTokens == nil || *record.OutputTokens != 30 || record.ReasoningTokens == nil || *record.ReasoningTokens != 20 || record.TotalTokens == nil || *record.TotalTokens != 130 {
@@ -446,6 +509,33 @@ func TestTelemetryTracksReasoningSummaryToolsAndDownstreamTTFT(t *testing.T) {
 		if bytes.Contains(data, []byte(secret)) {
 			t.Fatalf("telemetry persisted %q: %s", secret, data)
 		}
+	}
+}
+
+func TestTelemetryTracksChatCompletionDownstreamTTFT(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	store := newTelemetryStore(cfg, nil)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.6-luna"}`))
+	telemetry := store.begin(request, "/v1/chat/completions")
+	telemetry.observeRequest(map[string]any{"model": "gpt-5.6-luna", "stream": true}, "/v1/chat/completions")
+	telemetry.observeDownstreamEvent(map[string]any{
+		"type":    "chat.completion.chunk",
+		"choices": []any{map[string]any{"delta": map[string]any{"role": "assistant"}}},
+	})
+	if telemetry.record.FirstOutputTextDeltaMS != nil {
+		t.Fatal("role-only chat chunk counted as output text")
+	}
+	telemetry.observeDownstreamEvent(map[string]any{
+		"type":    "chat.completion.chunk",
+		"choices": []any{map[string]any{"delta": map[string]any{"content": "visible text"}}},
+	})
+	capture := &responseCapture{ResponseWriter: httptest.NewRecorder()}
+	_, _ = capture.Write([]byte("visible text"))
+	store.finish(telemetry, request, capture, 42)
+	store.close()
+	if record := store.recentRecords()[0]; record.TTFTMS == nil {
+		t.Fatalf("chat completion TTFT = %#v", record)
 	}
 }
 
