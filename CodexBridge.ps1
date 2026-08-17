@@ -172,19 +172,15 @@ function Get-ChildProcessRecordsFromOs {
 
 function Get-ListenerProbe {
     try {
+        # Query the CIM class directly so an empty result is represented as an
+        # empty successful observation. Do not classify a localized exception
+        # message as the stopped state.
         $records = @(
-            Get-NetTCPConnection -LocalPort $script:Config.BridgePort -State Listen -ErrorAction Stop |
+            Get-CimInstance -Namespace 'Root/StandardCimv2' -ClassName 'MSFT_NetTCPConnection' -Filter ("LocalPort = {0} AND State = 2" -f $script:Config.BridgePort) -ErrorAction Stop |
                 Select-Object LocalAddress,LocalPort,OwningProcess,State
         )
         return [pscustomobject]@{ Succeeded = $true; Records = $records; Error = $null }
     } catch {
-        # Windows throws a CIM "no matching objects" error when the filtered
-        # listener set is empty. That is a valid stopped observation, not an
-        # incomplete probe; preserve real query failures as errors.
-        $message = [string]$_.Exception.Message
-        if ($message -match '(?i)no matching .*objects|NoMatching') {
-            return [pscustomobject]@{ Succeeded = $true; Records = @(); Error = $null }
-        }
         return [pscustomobject]@{ Succeeded = $false; Records = @(); Error = $_.Exception.Message }
     }
 }
@@ -279,6 +275,11 @@ function New-BridgeObservation {
         AllBridgePids = @($Topology.OwnedProcessPids)
         BridgeTreePids = @($Topology.OwnedProcessPids)
         OwnedProcessRecords = @($Topology.OwnedProcessRecords)
+        OwnedListenerRecords = @($Topology.OwnedListenerRecords)
+        OwnedListenerOwnerRecords = @($Topology.OwnedListenerOwnerRecords)
+        OwnedListenerOwnerFingerprints = @($Topology.OwnedListenerOwnerFingerprints)
+        TargetInstanceAffinity = [string]$Topology.TargetInstanceAffinity
+        TargetAffinityReason = [string]$Topology.TargetAffinityReason
         CanAttemptOfficialStop = [bool]$Topology.CanAttemptOfficialStop
         CanForceStop = [bool]$Topology.CanForceStop
         Topology = $Topology
@@ -296,7 +297,8 @@ function Get-DeepObservation {
     $listenerProbe = Get-ListenerProbe
     $healthProbe = Get-HealthProbe
     $processProbe = Get-DeepProcessRecords -PidInfo $pidInfo -ListenerRecords $listenerProbe.Records
-    $topology = Resolve-BridgeOwnership -ProcessRecords $processProbe.Records -PidFilePresent $pidInfo.Present -PidFilePid $pidInfo.Pid -ListenerRecords $listenerProbe.Records -Config $script:Config -ProcessObservationComplete $processProbe.Succeeded -ListenerObservationComplete $listenerProbe.Succeeded
+    $historicalAffinity = if ($script:LastDeepObservation) { $script:LastDeepObservation.Topology } else { $null }
+    $topology = Resolve-BridgeOwnership -ProcessRecords $processProbe.Records -PidFilePresent $pidInfo.Present -PidFilePid $pidInfo.Pid -ListenerRecords $listenerProbe.Records -Config $script:Config -ProcessObservationComplete $processProbe.Succeeded -ListenerObservationComplete $listenerProbe.Succeeded -HistoricalAffinity $historicalAffinity
     $observationComplete = $pidInfo.ReadSucceeded -and $processProbe.Succeeded -and $listenerProbe.Succeeded
     $observation = New-BridgeObservation -PidInfo $pidInfo -HealthProbe $healthProbe -Topology $topology -ObservationComplete $observationComplete -ProbeKind 'Deep'
     $script:LastDeepObservation = $observation
@@ -320,11 +322,14 @@ function Test-LightObservationStable {
     $cachedListenerPids = @($Cache.Topology.ListenerPids | Sort-Object -Unique)
     if (($currentListenerPids -join ',') -ne ($cachedListenerPids -join ',')) { return $false }
     if ($Cache.ObservedState -eq 'Stopped') { return -not $PidInfo.Present -and $currentListenerPids.Count -eq 0 -and -not $HealthProbe.Ok }
+    if ([string]$Cache.Topology.TargetInstanceAffinity -ne 'Bound') { return $false }
     if (-not $PidRecord -or -not (Test-ProcessFingerprintMatch -Expected $Cache.Topology.OwnershipRootFingerprint -Actual $PidRecord)) { return $false }
-    foreach ($expectedListenerRecord in @($Cache.Topology.OwnedListenerRecords)) {
-        $listenerProcessId = [int](Get-BridgeRecordValue -Record $expectedListenerRecord -Name 'ProcessId')
-        $actualListenerRecord = Get-BridgeRecordByPid -Records $LightProcessRecords -ProcessId $listenerProcessId
-        if (-not $actualListenerRecord -or -not (Test-ProcessFingerprintMatch -Expected $expectedListenerRecord -Actual $actualListenerRecord)) { return $false }
+    $expectedOwnerFingerprints = @($Cache.Topology.OwnedListenerOwnerFingerprints)
+    if ($expectedOwnerFingerprints.Count -ne @($Cache.Topology.OwnedListenerPids).Count) { return $false }
+    foreach ($expectedOwnerFingerprint in $expectedOwnerFingerprints) {
+        $listenerProcessId = [int](Get-BridgeRecordValue -Record $expectedOwnerFingerprint -Name 'ProcessId')
+        $actualOwnerRecord = Get-BridgeRecordByPid -Records $LightProcessRecords -ProcessId $listenerProcessId
+        if (-not $actualOwnerRecord -or -not (Test-ProcessFingerprintMatch -Expected $expectedOwnerFingerprint -Actual $actualOwnerRecord)) { return $false }
     }
     return $true
 }
@@ -417,6 +422,20 @@ function Stop-ControllerOwnedInvocation {
     } catch { return $false }
 }
 
+function Stop-ControllerOwnedWrapperOnly {
+    param([Parameter(Mandatory)] $Invocation)
+    $process = $Invocation.Process
+    try {
+        if ($process.HasExited) { return $true }
+        # This is intentionally a direct-process kill. It is only used after
+        # the bridge has reached Running, so the uvx wrapper must not take its
+        # newly-created bridge descendants with it.
+        $process.Kill()
+        try { $process.WaitForExit(3000) } catch { }
+        return $process.HasExited
+    } catch { return $false }
+}
+
 function Get-InvocationOutput {
     param([Parameter(Mandatory)] $Invocation)
     $stdout = ''; $stderr = ''
@@ -428,9 +447,6 @@ function Get-InvocationOutput {
 function Dispose-Invocation {
     param($Invocation)
     if ($Invocation -and $Invocation.Process) {
-        try {
-            if (-not $Invocation.Process.HasExited) { Stop-ControllerOwnedInvocation -Invocation $Invocation | Out-Null }
-        } catch { }
         try { $Invocation.Process.Dispose() } catch { }
     }
 }
@@ -487,6 +503,21 @@ function Wait-ForStarted {
     [pscustomobject]@{ Success = $false; Observation = $lastObservation; Message = if ($terminated) { "Codex Bridge 启动超时。请打开日志：$($lastObservation.LogPath ?? (Join-Path $script:Config.RunDirectory 'server-127.0.0.1-18080.log'))" } else { '启动命令超时且未能确认回收，未继续执行其他进程操作。' }; ExitCode = $summary.ExitCode; InvocationExited = $summary.Exited; StdOut = $summary.StdOut; StdErr = $summary.StdErr }
 }
 
+function Cleanup-StartedInvocation {
+    param([Parameter(Mandatory)] $Invocation)
+    $process = $Invocation.Process
+    try {
+        if ($process.HasExited) { return $true }
+        $deadline = [DateTime]::UtcNow.AddSeconds(1)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if ($process.WaitForExit(100)) { return $true }
+        }
+        # The bridge is already verified Running. Kill only the direct uvx
+        # wrapper if it did not exit naturally; never recursively kill here.
+        return Stop-ControllerOwnedWrapperOnly -Invocation $Invocation
+    } catch { return $false }
+}
+
 function Wait-ForStopped {
     param([int]$TimeoutSeconds = $script:Config.StopTimeoutSeconds)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
@@ -500,20 +531,6 @@ function Wait-ForStopped {
     [pscustomobject]@{ Success = $false; Observation = $lastObservation }
 }
 
-function Get-FingerprintDepth {
-    param([Parameter(Mandatory)] $Fingerprint, [Parameter(Mandatory)] [hashtable] $ByPid)
-    $depth = 0
-    $currentProcessId = [int]$Fingerprint.ProcessId
-    $seen = [System.Collections.Generic.HashSet[int]]::new()
-    while ($ByPid.ContainsKey($currentProcessId) -and $seen.Add($currentProcessId)) {
-        $parentProcessId = [int]$ByPid[$currentProcessId].ParentProcessId
-        if ($parentProcessId -le 0 -or $parentProcessId -eq $currentProcessId -or -not $ByPid.ContainsKey($parentProcessId)) { break }
-        $depth++
-        $currentProcessId = $parentProcessId
-    }
-    return $depth
-}
-
 function Get-FilteredBridgeIdentityRecordsFromOs {
     try {
         $escapedMarker = [string]$script:Config.BridgeIdentityMarker -replace "'", "''"
@@ -521,15 +538,6 @@ function Get-FilteredBridgeIdentityRecordsFromOs {
         $filter = "Name = '$escapedName' OR CommandLine LIKE '%$escapedMarker%'"
         return [pscustomobject]@{ Succeeded = $true; Records = @(Get-CimInstance Win32_Process -Filter $filter -ErrorAction Stop | Select-Object ProcessId,ParentProcessId,CreationDate,Name,ExecutablePath,CommandLine); Error = $null }
     } catch { return [pscustomobject]@{ Succeeded = $false; Records = @(); Error = $_.Exception.Message } }
-}
-
-function Test-ListenerOwnersAllowed {
-    param([object[]] $ListenerRecords = @(), [int[]] $AllowedPids = @())
-    foreach ($listenerRecord in @($ListenerRecords)) {
-        $listenerProcessId = [int](Get-BridgeRecordValue -Record $listenerRecord -Name 'OwningProcess')
-        if ($AllowedPids -notcontains $listenerProcessId) { return $false }
-    }
-    return $true
 }
 
 function Stop-VerifiedBridgeTree {
@@ -548,50 +556,35 @@ function Stop-VerifiedBridgeTree {
         $rootProbe = Get-ProcessRecordByPidFromOs -ProcessId $rootProcessId
         if (-not $rootProbe.Succeeded) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = "无法重新验证 supervisor PID $rootProcessId，未执行强制终止：$($rootProbe.Error)" } }
         $rootLive = $rootProbe.Record
-        $allowedRecords = [System.Collections.Generic.List[object]]::new()
         $targetRecords = [System.Collections.Generic.List[object]]::new()
         $rootStillVerified = $false
 
         if ($rootLive) {
-            if (-not (Test-ProcessFingerprintMatch -Expected $OwnershipSnapshot.RootFingerprint -Actual $rootLive) -or -not (Test-BridgeSupervisorIdentity -Record $rootLive -Config $script:Config)) {
-                return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = "supervisor PID $rootProcessId 的 fingerprint 已变化，未执行强制终止。" }
-            }
             $rootStillVerified = $true
             $liveTree = Get-DeepProcessRecords -PidInfo ([pscustomobject]@{ Pid = $rootProcessId }) -ListenerRecords @()
             if (-not $liveTree.Succeeded) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = '无法完整读取 verified supervisor 的当前 descendants，未执行强制终止。' } }
-            $allowedRecords.Add($rootLive)
-            foreach ($record in @($liveTree.Records)) {
-                if (-not (Test-BridgeIdentity -Record $record -Config $script:Config)) { continue }
-                $recordProcessId = [int](Get-BridgeRecordValue -Record $record -Name 'ProcessId')
-                if ($recordProcessId -eq $rootProcessId) { continue }
-                $fingerprint = New-ProcessFingerprint -Record $record
-                if (-not (Test-ProcessFingerprintComplete -Fingerprint $fingerprint)) {
-                    return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = "当前 verified bridge child PID $recordProcessId 的 fingerprint 不完整，未执行强制终止。" }
-                }
-                # A child observed under the still-verified supervisor is safe to
-                # carry forward even when it was respawned after the snapshot.
-                $verifiedFingerprintsByPid[$recordProcessId] = $fingerprint
-                $allowedRecords.Add($record)
+            $plan = Get-FallbackActionPlan -OwnershipSnapshot $OwnershipSnapshot -LiveRecords $liveTree.Records -SupervisorLive $true -ListenerRecords $listenerProbe.Records -Config $script:Config
+            if (-not $plan.Allowed) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = "fallback action plan 拒绝：$($plan.Reason)" } }
+            foreach ($fingerprint in @($plan.VerifiedFingerprints)) {
+                $verifiedFingerprintsByPid[[int]$fingerprint.ProcessId] = $fingerprint
             }
-            $allowedPids = @($allowedRecords | ForEach-Object { [int](Get-BridgeRecordValue -Record $_ -Name 'ProcessId') } | Sort-Object -Unique)
-            if (-not (Test-ListenerOwnersAllowed -ListenerRecords $listenerProbe.Records -AllowedPids $allowedPids)) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = '18080 listener 不属于当前 verified ownership tree，未执行强制终止。' } }
-            # Kill the verified root first so it cannot respawn another child.
-            $targetRecords.Add($rootLive)
+            foreach ($record in @($plan.TargetRecords)) { $targetRecords.Add($record) }
         } else {
             # Once the supervisor is gone, only fingerprints captured before or
             # while that verified supervisor was live can prove child ownership.
+            $liveChildRecords = [System.Collections.Generic.List[object]]::new()
             foreach ($fingerprint in @($verifiedFingerprintsByPid.Values | Where-Object { [int]$_.ProcessId -ne $rootProcessId })) {
                 $liveProbe = Get-ProcessRecordByPidFromOs -ProcessId ([int]$fingerprint.ProcessId)
                 if (-not $liveProbe.Succeeded) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = "无法验证 snapshot child PID $($fingerprint.ProcessId)，未执行强制终止。" } }
                 if (-not $liveProbe.Record) { continue }
-                if (-not (Test-ProcessFingerprintMatch -Expected $fingerprint -Actual $liveProbe.Record) -or -not (Test-BridgeIdentity -Record $liveProbe.Record -Config $script:Config)) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = "snapshot child PID $($fingerprint.ProcessId) 的 fingerprint 已变化，未执行强制终止。" } }
-                $allowedRecords.Add($liveProbe.Record)
+                $liveChildRecords.Add($liveProbe.Record)
             }
-            $allowedPids = @($allowedRecords | ForEach-Object { [int](Get-BridgeRecordValue -Record $_ -Name 'ProcessId') } | Sort-Object -Unique)
-            if (-not (Test-ListenerOwnersAllowed -ListenerRecords $listenerProbe.Records -AllowedPids $allowedPids)) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = 'supervisor 消失后，listener 不属于 snapshot 中仍可验证的 child，未执行强制终止。' } }
-            $byPid = @{}
-            foreach ($fingerprint in @($verifiedFingerprintsByPid.Values)) { $byPid[[int]$fingerprint.ProcessId] = $fingerprint }
-            foreach ($record in @($allowedRecords | Sort-Object @{Expression={ - (Get-FingerprintDepth -Fingerprint $verifiedFingerprintsByPid[[int](Get-BridgeRecordValue -Record $_ -Name 'ProcessId')] -ByPid $byPid) }})) { $targetRecords.Add($record) }
+            $plan = Get-FallbackActionPlan -OwnershipSnapshot $OwnershipSnapshot -LiveRecords @($liveChildRecords) -SupervisorLive $false -ListenerRecords $listenerProbe.Records -Config $script:Config
+            if (-not $plan.Allowed) { return [pscustomobject]@{ Success = $false; FallbackUsed = $true; Refused = $true; Observation = Get-BridgeObservation -Deep; KilledPids = @($killedPids); Message = "fallback action plan 拒绝：$($plan.Reason)" } }
+            foreach ($fingerprint in @($plan.VerifiedFingerprints)) {
+                $verifiedFingerprintsByPid[[int]$fingerprint.ProcessId] = $fingerprint
+            }
+            foreach ($record in @($plan.TargetRecords)) { $targetRecords.Add($record) }
         }
 
         if ($rootStillVerified) {
@@ -650,10 +643,20 @@ function Invoke-StartOperation {
     $startArguments = @('--from', $script:Config.BridgePackageSpec, $script:Config.BridgeCommand, 'start', '--verbose')
     $invocation = $null
     try { $invocation = New-HiddenProcess -Arguments $startArguments } catch { return [pscustomobject]@{ Success = $false; Operation = 'Start'; Observation = $before; Message = $_.Exception.Message; FallbackUsed = $false } }
+    $waitResult = $null
     try {
         $waitResult = Wait-ForStarted -Invocation $invocation
         [pscustomobject]@{ Success = $waitResult.Success; Operation = 'Start'; Observation = $waitResult.Observation; Message = $waitResult.Message; ExitCode = $waitResult.ExitCode; StdOut = $waitResult.StdOut; StdErr = $waitResult.StdErr; FallbackUsed = $false }
-    } finally { Dispose-Invocation -Invocation $invocation }
+    } finally {
+        if ($waitResult -and $waitResult.Success) {
+            Cleanup-StartedInvocation -Invocation $invocation | Out-Null
+        } else {
+            # A failed or exceptional start is the only path where the
+            # controller-owned invocation may be explicitly tree-aborted.
+            Stop-ControllerOwnedInvocation -Invocation $invocation | Out-Null
+        }
+        Dispose-Invocation -Invocation $invocation
+    }
 }
 
 function Invoke-StopOperation {
@@ -906,6 +909,7 @@ function Open-RunDirectory {
 
 function Apply-WorkResult {
     param([Parameter(Mandatory)] $Item,$Result,[string]$InvocationError)
+    if ($Item.Kind -ne 'Probe' -and $Item.Sequence -ne $script:OperationSequence) { return }
     if ($Item.Kind -eq 'Probe') { $script:ProbeQueued = $false }
     if (-not $Result) { $Result = [pscustomobject]@{ Success = $false; Operation = $Item.Kind; Observation = $null; Message = if ($InvocationError) { $InvocationError } else { '后台操作没有返回结果。' } } }
     if ($Result.Observation) { Apply-Observation -Observation $Result.Observation }
@@ -913,9 +917,7 @@ function Apply-WorkResult {
         if ($Result.Success) { $script:BackendFailureNotified = $false }
         elseif (-not $script:BackendFailureNotified) { $script:BackendFailureNotified = $true; $script:CurrentObservedState = 'Unknown'; Update-MenuForState; Show-Notice -Title 'Codex Bridge' -Message "后台状态探测异常：$($Result.Message)" -Icon Error }
     } else {
-        if ($Item.Sequence -ne $script:OperationSequence) { return }
         $script:OperationInFlight = $false; $script:CurrentOperationState = 'Idle'
-        if ($Result.Observation) { Apply-Observation -Observation $Result.Observation }
         Update-MenuForState
         if ($Result.Success) {
             if ($Item.Kind -eq 'Start') { Show-Notice -Title 'Codex Bridge' -Message "Codex Bridge 已启动`r`n$($script:Config.BridgeHost):$($script:Config.BridgePort)" }

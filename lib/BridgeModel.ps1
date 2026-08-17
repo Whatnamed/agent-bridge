@@ -3,7 +3,7 @@
 
 function Get-BridgeRecordValue {
     param(
-        [Parameter(Mandatory)] $Record,
+        $Record,
         [Parameter(Mandatory)] [string] $Name
     )
 
@@ -189,6 +189,144 @@ function New-OwnershipEdges {
     )
 }
 
+function Get-BridgeFingerprintDepth {
+    param(
+        [Parameter(Mandatory)] $Fingerprint,
+        [hashtable] $ByPid = @{}
+    )
+
+    $depth = 0
+    $currentProcessId = [int](Get-BridgeRecordValue -Record $Fingerprint -Name 'ProcessId')
+    $seen = [System.Collections.Generic.HashSet[int]]::new()
+    while ($ByPid.ContainsKey($currentProcessId) -and $seen.Add($currentProcessId)) {
+        $parentProcessId = [int](Get-BridgeRecordValue -Record $ByPid[$currentProcessId] -Name 'ParentProcessId')
+        if ($parentProcessId -le 0 -or $parentProcessId -eq $currentProcessId -or -not $ByPid.ContainsKey($parentProcessId)) { break }
+        $depth++
+        $currentProcessId = $parentProcessId
+    }
+    return $depth
+}
+
+function Get-FallbackActionPlan {
+    param(
+        [Parameter(Mandatory)] $OwnershipSnapshot,
+        [object[]] $LiveRecords = @(),
+        [bool] $SupervisorLive = $false,
+        [object[]] $ListenerRecords = @(),
+        [Parameter(Mandatory)] $Config
+    )
+
+    $emptyPlan = {
+        param([string]$Reason)
+        [pscustomobject]@{
+            Allowed = $false
+            Refused = $true
+            Reason = $Reason
+            RootPid = $null
+            SupervisorLive = $SupervisorLive
+            VerifiedRecords = @()
+            VerifiedFingerprints = @()
+            TargetRecords = @()
+            TargetPids = @()
+        }
+    }
+
+    if (-not $OwnershipSnapshot -or -not $OwnershipSnapshot.CanForceStopAtCapture -or
+        -not $OwnershipSnapshot.RootFingerprint -or
+        [string]$OwnershipSnapshot.TargetInstanceAffinity -notin @('Bound','HistoricalBound') -or
+        @($OwnershipSnapshot.ForeignListenerPids).Count -gt 0) {
+        return & $emptyPlan 'ownership snapshot 未确认属于目标 bridge instance。'
+    }
+
+    $rootPid = [int](Get-BridgeRecordValue -Record $OwnershipSnapshot.RootFingerprint -Name 'ProcessId')
+    if ($rootPid -le 0) { return & $emptyPlan 'ownership snapshot 缺少有效 supervisor PID。' }
+
+    $records = @($LiveRecords | Where-Object { $null -ne $_ })
+    $rootLive = Get-BridgeRecordByPid -Records $records -ProcessId $rootPid
+    if ($SupervisorLive -and -not $rootLive) { return & $emptyPlan "verified supervisor PID $rootPid 不在当前 live records 中。" }
+    if (-not $SupervisorLive -and $rootLive) { return & $emptyPlan "supervisor PID $rootPid 的 live 状态与 fallback action plan 不一致。" }
+
+    $verifiedRecords = [System.Collections.Generic.List[object]]::new()
+    $verifiedFingerprints = [System.Collections.Generic.List[object]]::new()
+    $allowedTreePids = [System.Collections.Generic.HashSet[int]]::new()
+
+    if ($SupervisorLive) {
+        if (-not (Test-ProcessFingerprintMatch -Expected $OwnershipSnapshot.RootFingerprint -Actual $rootLive) -or
+            -not (Test-BridgeSupervisorIdentity -Record $rootLive -Config $Config)) {
+            return & $emptyPlan "supervisor PID $rootPid 的身份或 fingerprint 未通过复核。"
+        }
+
+        $verifiedRecords.Add($rootLive)
+        [void]$allowedTreePids.Add($rootPid)
+        foreach ($record in @(Get-BridgeDescendantRecords -Records $records -RootPid $rootPid)) {
+            if (-not (Test-BridgeIdentity -Record $record -Config $Config)) { continue }
+            $fingerprint = New-ProcessFingerprint -Record $record
+            if (-not (Test-ProcessFingerprintComplete -Fingerprint $fingerprint)) {
+                return & $emptyPlan "当前 verified bridge child PID $([int](Get-BridgeRecordValue -Record $record -Name 'ProcessId')) 的 fingerprint 不完整。"
+            }
+            $verifiedRecords.Add($record)
+            $verifiedFingerprints.Add($fingerprint)
+            [void]$allowedTreePids.Add([int](Get-BridgeRecordValue -Record $record -Name 'ProcessId'))
+        }
+        $rootFingerprint = New-ProcessFingerprint -Record $rootLive
+        if (-not (Test-ProcessFingerprintComplete -Fingerprint $rootFingerprint)) {
+            return & $emptyPlan "supervisor PID $rootPid 的当前 fingerprint 不完整。"
+        }
+        $verifiedFingerprints.Insert(0, $rootFingerprint)
+        $targetRecords = @($rootLive)
+        $targetPids = @($rootPid)
+    } else {
+        $snapshotByPid = @{}
+        foreach ($fingerprint in @($OwnershipSnapshot.ProcessFingerprints)) {
+            $fingerprintPid = [int](Get-BridgeRecordValue -Record $fingerprint -Name 'ProcessId')
+            if ($fingerprintPid -gt 0) { $snapshotByPid[$fingerprintPid] = $fingerprint }
+        }
+
+        foreach ($record in $records) {
+            $recordPid = [int](Get-BridgeRecordValue -Record $record -Name 'ProcessId')
+            if (-not $snapshotByPid.ContainsKey($recordPid)) { continue }
+            $expected = $snapshotByPid[$recordPid]
+            if (-not (Test-ProcessFingerprintMatch -Expected $expected -Actual $record) -or
+                -not (Test-BridgeIdentity -Record $record -Config $Config)) {
+                return & $emptyPlan "snapshot child PID $recordPid 的身份或 fingerprint 已变化。"
+            }
+            $verifiedRecords.Add($record)
+            [void]$allowedTreePids.Add($recordPid)
+            $verifiedFingerprints.Add((New-ProcessFingerprint -Record $record))
+        }
+
+        $verifiedByPid = @{}
+        foreach ($fingerprint in @($OwnershipSnapshot.ProcessFingerprints)) {
+            $verifiedByPid[[int](Get-BridgeRecordValue -Record $fingerprint -Name 'ProcessId')] = $fingerprint
+        }
+        $targetRecords = @(
+            $verifiedRecords | Sort-Object @{ Expression = {
+                - (Get-BridgeFingerprintDepth -Fingerprint $verifiedByPid[[int](Get-BridgeRecordValue -Record $_ -Name 'ProcessId')] -ByPid $verifiedByPid)
+            } }
+        )
+        $targetPids = @($targetRecords | ForEach-Object { [int](Get-BridgeRecordValue -Record $_ -Name 'ProcessId') } | Sort-Object -Unique)
+    }
+
+    foreach ($listenerRecord in @($ListenerRecords | Where-Object { $null -ne $_ })) {
+        $listenerPid = [int](Get-BridgeRecordValue -Record $listenerRecord -Name 'OwningProcess')
+        if ($listenerPid -le 0 -or -not $allowedTreePids.Contains($listenerPid)) {
+            return & $emptyPlan "18080 listener PID $listenerPid 不属于当前 verified bridge ownership。"
+        }
+    }
+
+    [pscustomobject]@{
+        Allowed = $true
+        Refused = $false
+        Reason = $null
+        RootPid = $rootPid
+        SupervisorLive = $SupervisorLive
+        VerifiedRecords = @($verifiedRecords)
+        VerifiedFingerprints = @($verifiedFingerprints)
+        TargetRecords = @($targetRecords)
+        TargetPids = @($targetPids)
+    }
+}
+
 function Resolve-BridgeOwnership {
     param(
         [object[]] $ProcessRecords = @(),
@@ -197,7 +335,8 @@ function Resolve-BridgeOwnership {
         [object[]] $ListenerRecords = @(),
         [Parameter(Mandatory)] $Config,
         [bool] $ProcessObservationComplete = $true,
-        [bool] $ListenerObservationComplete = $true
+        [bool] $ListenerObservationComplete = $true,
+        [object] $HistoricalAffinity = $null
     )
 
     $records = @($ProcessRecords | Where-Object { $null -ne $_ } | Sort-Object @{Expression={ [int](Get-BridgeRecordValue -Record $_ -Name 'ProcessId') }} -Unique)
@@ -245,6 +384,14 @@ function Resolve-BridgeOwnership {
             if ($listenerOwner) { $listenerOwner }
         }
     )
+    $ownedListenerPids = @($ownedListenerRecords | ForEach-Object { [int](Get-BridgeRecordValue -Record $_ -Name 'OwningProcess') } | Sort-Object -Unique)
+    $ownedListenerOwnerRecords = @($listenerOwnerRecords | Where-Object {
+        $ownedListenerPids -contains [int](Get-BridgeRecordValue -Record $_ -Name 'ProcessId')
+    })
+    $ownedListenerOwnerFingerprints = @($ownedListenerOwnerRecords | ForEach-Object { New-ProcessFingerprint -Record $_ })
+    $ownedListenerOwnerFingerprintsComplete = $ownedListenerPids.Count -gt 0 -and
+        $ownedListenerOwnerRecords.Count -eq $ownedListenerPids.Count -and
+        @($ownedListenerOwnerFingerprints | Where-Object { -not (Test-ProcessFingerprintComplete -Fingerprint $_) }).Count -eq 0
     $unverifiedBridgeListenerPids = @(
         foreach ($listenerOwner in $listenerOwnerRecords) {
             $listenerOwnerPid = [int](Get-BridgeRecordValue -Record $listenerOwner -Name 'ProcessId')
@@ -254,6 +401,44 @@ function Resolve-BridgeOwnership {
         }
     ) | Sort-Object -Unique
     $unknownForeignListenerPids = @($foreignListenerPids | Where-Object { $unverifiedBridgeListenerPids -notcontains $_ })
+    $currentTargetBound = $rootVerified -and
+        $ownedListenerPids.Count -gt 0 -and
+        $ownedListenerOwnerFingerprintsComplete -and
+        @($ownedListenerOwnerRecords | Where-Object { Test-BridgeIdentity -Record $_ -Config $Config }).Count -eq $ownedListenerPids.Count
+
+    $historicalStatus = [string](Get-BridgeRecordValue -Record $HistoricalAffinity -Name 'TargetInstanceAffinity')
+    $historicalRootFingerprint = Get-BridgeRecordValue -Record $HistoricalAffinity -Name 'TargetAffinityRootFingerprint'
+    if (-not $historicalRootFingerprint) { $historicalRootFingerprint = Get-BridgeRecordValue -Record $HistoricalAffinity -Name 'RootFingerprint' }
+    $historicalPort = Get-BridgeRecordValue -Record $HistoricalAffinity -Name 'TargetAffinityPort'
+    $historicalPortMatches = $null -eq $historicalPort -or [int]$historicalPort -eq [int]$Config.BridgePort
+    $historicalOwnerPids = @(
+        Get-BridgeRecordValue -Record $HistoricalAffinity -Name 'TargetAffinityOwnerPids' |
+            ForEach-Object { [int]$_ } |
+            Where-Object { $_ -gt 0 }
+    )
+    $historicalTargetBound = $rootVerified -and
+        -not $currentTargetBound -and
+        $foreignListenerPids.Count -eq 0 -and
+        $historicalStatus -in @('Bound','HistoricalBound') -and
+        $historicalPortMatches -and
+        $historicalRootFingerprint -and
+        (Test-ProcessFingerprintMatch -Expected $historicalRootFingerprint -Actual $pidRecord)
+    $targetInstanceAffinity = if ($foreignListenerPids.Count -gt 0) {
+        'Conflict'
+    } elseif ($currentTargetBound) {
+        'Bound'
+    } elseif ($historicalTargetBound) {
+        'HistoricalBound'
+    } else {
+        'Unbound'
+    }
+    $targetAffinityOwnerPids = if ($targetInstanceAffinity -eq 'Bound') {
+        @($ownedListenerPids)
+    } elseif ($targetInstanceAffinity -eq 'HistoricalBound') {
+        @($historicalOwnerPids)
+    } else {
+        @()
+    }
     $hasIdentifiableBridgeEvidence =
         ($pidRecord -and (Test-BridgeIdentity -Record $pidRecord -Config $Config)) -or
         (@($listenerOwnerRecords | Where-Object { Test-BridgeIdentity -Record $_ -Config $Config }).Count -gt 0) -or
@@ -261,7 +446,10 @@ function Resolve-BridgeOwnership {
 
     $fingerprints = @($ownedRecords | ForEach-Object { New-ProcessFingerprint -Record $_ })
     $fingerprintsComplete = $fingerprints.Count -gt 0 -and @($fingerprints | Where-Object { -not (Test-ProcessFingerprintComplete -Fingerprint $_) }).Count -eq 0
+    $canAttemptOfficialStop = $hasIdentifiableBridgeEvidence -and
+        $targetInstanceAffinity -in @('Bound','HistoricalBound')
     $canForceStop = $rootVerified -and
+        $targetInstanceAffinity -in @('Bound','HistoricalBound') -and
         $ProcessObservationComplete -and
         $ListenerObservationComplete -and
         $fingerprintsComplete -and
@@ -283,17 +471,30 @@ function Resolve-BridgeOwnership {
         ListenerRecords = @($listenerRecordsNormalized)
         ListenerPids = @($listenerPids)
         OwnedListenerRecords = @($ownedListenerRecords)
-        OwnedListenerPids = @($ownedListenerRecords | ForEach-Object { [int](Get-BridgeRecordValue -Record $_ -Name 'OwningProcess') } | Sort-Object -Unique)
+        OwnedListenerPids = @($ownedListenerPids)
+        OwnedListenerOwnerRecords = @($ownedListenerOwnerRecords)
+        OwnedListenerOwnerFingerprints = @($ownedListenerOwnerFingerprints)
+        OwnedListenerOwnerFingerprintsComplete = [bool]$ownedListenerOwnerFingerprintsComplete
         ForeignListenerRecords = @($foreignListenerRecords)
         ForeignListenerPids = @($foreignListenerPids)
         UnverifiedBridgeListenerPids = @($unverifiedBridgeListenerPids)
         UnknownForeignListenerPids = @($unknownForeignListenerPids)
         ListenerOwnerRecords = @($listenerOwnerRecords)
+        TargetInstanceAffinity = $targetInstanceAffinity
+        TargetAffinityRootFingerprint = if ($rootVerified) { New-ProcessFingerprint -Record $pidRecord } else { $null }
+        TargetAffinityOwnerPids = @($targetAffinityOwnerPids)
+        TargetAffinityPort = [int]$Config.BridgePort
+        TargetAffinityReason = switch ($targetInstanceAffinity) {
+            'Bound' { '当前 18080 listener owner 属于已验证 supervisor tree。' }
+            'HistoricalBound' { '当前 supervisor fingerprint 与此前已绑定的目标 instance 相同，当前 listener 暂时不可见。' }
+            'Conflict' { '18080 存在不属于已验证 supervisor tree 的 listener。' }
+            default { 'PID file supervisor 未证明属于当前 18080 target instance。' }
+        }
         HasIdentifiableBridgeEvidence = [bool]$hasIdentifiableBridgeEvidence
         ProcessObservationComplete = $ProcessObservationComplete
         ListenerObservationComplete = $ListenerObservationComplete
         FingerprintsComplete = $fingerprintsComplete
-        CanAttemptOfficialStop = [bool]$hasIdentifiableBridgeEvidence
+        CanAttemptOfficialStop = [bool]$canAttemptOfficialStop
         CanForceStop = [bool]$canForceStop
     }
 }
@@ -314,6 +515,10 @@ function New-OwnershipSnapshot {
         ListenerPids = @($Topology.ListenerPids)
         OwnedListenerPids = @($Topology.OwnedListenerPids)
         ForeignListenerPids = @($Topology.ForeignListenerPids)
+        TargetInstanceAffinity = [string]$Topology.TargetInstanceAffinity
+        TargetAffinityRootFingerprint = $Topology.TargetAffinityRootFingerprint
+        TargetAffinityOwnerPids = @($Topology.TargetAffinityOwnerPids)
+        TargetAffinityPort = [int]$Topology.TargetAffinityPort
         CanForceStopAtCapture = [bool]$Topology.CanForceStop
     }
 }
@@ -330,8 +535,10 @@ function Get-ObservedBridgeState {
         -not $Topology.ProcessObservationComplete -or -not $Topology.ListenerObservationComplete) {
         return 'Unknown'
     }
-    if (@($Topology.ForeignListenerPids).Count -gt 0) { return 'Conflict' }
-    if ($HealthOk -and $Topology.RootVerified -and @($Topology.OwnedListenerPids).Count -gt 0) {
+    if (@($Topology.ForeignListenerPids).Count -gt 0 -or $Topology.TargetInstanceAffinity -eq 'Conflict') { return 'Conflict' }
+    if ($HealthOk -and $Topology.RootVerified -and
+        $Topology.TargetInstanceAffinity -eq 'Bound' -and
+        @($Topology.OwnedListenerPids).Count -gt 0) {
         return 'Running'
     }
     if (-not $HealthOk -and @($Topology.ListenerPids).Count -eq 0 -and

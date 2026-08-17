@@ -9,6 +9,7 @@
 - `Launch.vbs`：隐藏启动器。
 - `InstallShortcut.ps1`：为当前用户创建桌面快捷方式。
 - `tests\CodexBridge.Tests.ps1`：Pester 3.4 纯模型测试。
+- `.github\workflows\ci.yml`：Windows GitHub Actions 解析检查和 Pester 验证。
 - `README.md`：使用和安全边界说明。
 
 ## 配置
@@ -51,6 +52,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File E:\Codex\CodexBridge\InstallShortc
 - 进程树变化、操作期间、异常或约 45 秒周期到达时执行 deep probe。
 - worker 使用持久 `HttpClient`，任务串行且 single-flight，不会堆积重复 probe。
 - 每个操作有序列号；旧结果不能覆盖新状态。
+- 目标 instance affinity 会区分 `Bound`、`HistoricalBound`、`Unbound` 和 `Conflict`。PID 文件只证明 supervisor 身份，不自动证明它就是 18080 instance；只有目标 listener owner 与已验证 supervisor tree 一致时才会进入 `Bound`。
 
 内部 operation state（`Starting`、`Stopping`、`Restarting`）与 observed state（`Running`、`Stopped`、`Degraded`、`Conflict`、`Unknown`）分离。启动中、停止中和重启中会禁用启动/停止/重启；Running 禁用启动；Stopped 只启用启动；未知端口占用时不提供强制停止。
 
@@ -72,6 +74,8 @@ uvx --from openai-api-server-via-codex==0.2.0 openai-api-server-via-codex stop
 - PID、父 PID、CreationDate、Name、ExecutablePath、CommandLine fingerprint 与预期一致；
 - `18080` listener 属于同一已验证 tree；
 - 进程身份和观察结果完整，没有 foreign/unknown listener。
+
+fallback 的候选 PID 先由纯 `Get-FallbackActionPlan` 根据 snapshot、当前进程记录和 listener 记录计算，再由后台 worker 逐项重新 fingerprint；计划不通过时不会调用终止命令。
 
 若 supervisor 会重启 child，先终止已验证 supervisor，再重新扫描。仍然存活的 child 只有在此前或 supervisor 仍被验证期间捕获过完整 fingerprint 才能处理；出现未纳入 ownership 的 bridge process、foreign listener、PID reuse 或任何查询不完整时，停止 fallback 并提示，不杀未知进程。bridge fallback 不使用未经筛选的 `Kill(entireProcessTree: true)`；仅 controller-owned 的 CLI 超时回收可以使用 process-tree kill。
 

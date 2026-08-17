@@ -8,6 +8,7 @@ $script:TestConfig = [pscustomobject]@{
     BridgeExecutableName = 'openai-api-server-via-codex.exe'
     BridgeIdentityMarker = 'openai-api-server-via-codex'
     BridgeSupervisorCommandMarker = 'daemon-run'
+    BridgePort = 18080
 }
 
 function New-TestProcessRecord {
@@ -34,10 +35,11 @@ function Resolve-TestTopology {
     param(
         [object[]]$Records,
         [int]$PidFilePid = 100,
-        [object[]]$Listeners = @()
+        [object[]]$Listeners = @(),
+        [object]$HistoricalAffinity = $null
     )
 
-    Resolve-BridgeOwnership -ProcessRecords $Records -PidFilePresent $true -PidFilePid $PidFilePid -ListenerRecords $Listeners -Config $script:TestConfig -ProcessObservationComplete $true -ListenerObservationComplete $true
+    Resolve-BridgeOwnership -ProcessRecords $Records -PidFilePresent $true -PidFilePid $PidFilePid -ListenerRecords $Listeners -Config $script:TestConfig -ProcessObservationComplete $true -ListenerObservationComplete $true -HistoricalAffinity $HistoricalAffinity
 }
 
 Describe 'Codex Bridge ownership and state model' {
@@ -50,6 +52,8 @@ Describe 'Codex Bridge ownership and state model' {
         (@($topology.OwnedProcessPids) -contains 100) | Should Be $true
         (@($topology.OwnedProcessPids) -contains 200) | Should Be $true
         (@($topology.OwnedProcessPids) -contains 300) | Should Be $false
+        $topology.TargetInstanceAffinity | Should Be 'Bound'
+        $topology.OwnedListenerOwnerFingerprints[0].ProcessId | Should Be 200
         $topology.CanForceStop | Should Be $true
     }
 
@@ -72,6 +76,35 @@ Describe 'Codex Bridge ownership and state model' {
         $topology.PidFileState | Should Be 'StaleReusedPid'
         $topology.OwnedProcessPids.Count | Should Be 0
         $topology.CanForceStop | Should Be $false
+    }
+
+    It 'does not treat a valid daemon on another port as the target instance' {
+        $otherSupervisor = New-TestProcessRecord -ProcessId 100 -ParentProcessId 10 -CommandLine 'openai-api-server-via-codex daemon-run --port 19090'
+        $otherServer = New-TestProcessRecord -ProcessId 400 -ParentProcessId 100 -CommandLine 'openai-api-server-via-codex server --port 19090'
+        $topology = Resolve-TestTopology -Records @($otherSupervisor, $otherServer) -Listeners @()
+
+        $topology.PidFileState | Should Be 'Owned'
+        $topology.TargetInstanceAffinity | Should Be 'Unbound'
+        $topology.CanAttemptOfficialStop | Should Be $false
+        $topology.CanForceStop | Should Be $false
+        (Get-ObservedBridgeState -Topology $topology -HealthKnown $true -HealthOk $false) | Should Be 'Degraded'
+    }
+
+    It 'retains only a fingerprint-matched historical target affinity' {
+        $supervisor = New-TestProcessRecord -ProcessId 100 -ParentProcessId 10
+        $server = New-TestProcessRecord -ProcessId 200 -ParentProcessId 100 -CommandLine 'openai-api-server-via-codex server --port 18080'
+        $bound = Resolve-TestTopology -Records @($supervisor, $server) -Listeners @([pscustomobject]@{ OwningProcess = 200 })
+
+        $historical = Resolve-TestTopology -Records @($supervisor) -Listeners @() -HistoricalAffinity $bound
+        $historical.TargetInstanceAffinity | Should Be 'HistoricalBound'
+        $historical.CanAttemptOfficialStop | Should Be $true
+        $historical.CanForceStop | Should Be $true
+
+        $reusedSupervisor = New-TestProcessRecord -ProcessId 100 -ParentProcessId 10 -CreationDate '2026-08-17T01:00:00.0000000Z' -CommandLine 'openai-api-server-via-codex daemon-run --port 19090'
+        $reused = Resolve-TestTopology -Records @($reusedSupervisor) -Listeners @() -HistoricalAffinity $bound
+        $reused.TargetInstanceAffinity | Should Be 'Unbound'
+        $reused.CanAttemptOfficialStop | Should Be $false
+        $reused.CanForceStop | Should Be $false
     }
 
     It 'requires creation date and the complete fingerprint to match a snapshot child' {
@@ -129,13 +162,36 @@ Describe 'Codex Bridge ownership and state model' {
         $reused.PidFileState | Should Be 'StaleReusedPid'
     }
 
-    It 'allows official stop evidence without allowing force stop for an ambiguous PID file' {
+    It 'does not allow stop when the PID file points directly to a bridge child' {
         $actualServer = New-TestProcessRecord -ProcessId 100 -ParentProcessId 10 -CommandLine 'openai-api-server-via-codex server'
         $topology = Resolve-TestTopology -Records @($actualServer) -Listeners @([pscustomobject]@{ OwningProcess = 100 })
 
         $topology.PidFileState | Should Be 'Ambiguous'
-        $topology.CanAttemptOfficialStop | Should Be $true
+        $topology.TargetInstanceAffinity | Should Be 'Conflict'
+        $topology.CanAttemptOfficialStop | Should Be $false
         $topology.CanForceStop | Should Be $false
+    }
+
+    It 'builds a pure fallback action plan for verified supervisor and child phases' {
+        $supervisor = New-TestProcessRecord -ProcessId 100 -ParentProcessId 10
+        $server = New-TestProcessRecord -ProcessId 200 -ParentProcessId 100 -CommandLine 'openai-api-server-via-codex server'
+        $listeners = @([pscustomobject]@{ OwningProcess = 200 })
+        $topology = Resolve-TestTopology -Records @($supervisor, $server) -Listeners $listeners
+        $snapshot = New-OwnershipSnapshot -Topology $topology
+
+        $rootPlan = Get-FallbackActionPlan -OwnershipSnapshot $snapshot -LiveRecords @($supervisor, $server) -SupervisorLive $true -ListenerRecords $listeners -Config $script:TestConfig
+        $rootPlan.Allowed | Should Be $true
+        $rootPlan.TargetPids.Count | Should Be 1
+        $rootPlan.TargetPids[0] | Should Be 100
+
+        $childPlan = Get-FallbackActionPlan -OwnershipSnapshot $snapshot -LiveRecords @($server) -SupervisorLive $false -ListenerRecords $listeners -Config $script:TestConfig
+        $childPlan.Allowed | Should Be $true
+        $childPlan.TargetPids.Count | Should Be 1
+        $childPlan.TargetPids[0] | Should Be 200
+
+        $refusedPlan = Get-FallbackActionPlan -OwnershipSnapshot $snapshot -LiveRecords @($server) -SupervisorLive $false -ListenerRecords @([pscustomobject]@{ OwningProcess = 900 }) -Config $script:TestConfig
+        $refusedPlan.Allowed | Should Be $false
+        $refusedPlan.TargetPids.Count | Should Be 0
     }
 
     It 'maps operation and observed states to safe menu capabilities' {
