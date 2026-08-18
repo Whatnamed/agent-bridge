@@ -227,10 +227,31 @@ func accountID(tokens map[string]any) string {
 	return ""
 }
 func expandHome(path string) string {
+	path = expandWindowsEnvironment(path)
 	if path == "~" || strings.HasPrefix(path, "~/") {
 		if home, err := os.UserHomeDir(); err == nil {
 			return filepath.Join(home, strings.TrimPrefix(path, "~/"))
 		}
 	}
 	return path
+}
+
+func expandWindowsEnvironment(path string) string {
+	for {
+		start := strings.IndexByte(path, '%')
+		if start < 0 {
+			return path
+		}
+		relativeEnd := strings.IndexByte(path[start+1:], '%')
+		if relativeEnd < 0 {
+			return path
+		}
+		end := start + 1 + relativeEnd
+		name := path[start+1 : end]
+		value := os.Getenv(name)
+		if value == "" {
+			return path
+		}
+		path = path[:start] + value + path[end+1:]
+	}
 }

@@ -59,6 +59,12 @@ type requestRecord struct {
 	Stream            bool      `json:"stream"`
 
 	Model                         string         `json:"model"`
+	Provider                      string         `json:"provider,omitempty"`
+	RequestedModel                string         `json:"requested_model,omitempty"`
+	ActualUpstreamModel           string         `json:"actual_upstream_model,omitempty"`
+	ControlPlaneProject           string         `json:"control_plane_project,omitempty"`
+	ModelCatalogSize              int            `json:"model_catalog_size,omitempty"`
+	OAuthTokenExpiry              *time.Time     `json:"oauth_token_expiry,omitempty"`
 	RequestedReasoningEffort      *string        `json:"requested_reasoning_effort"`
 	RequestedReasoningSummary     *string        `json:"requested_reasoning_summary"`
 	TextVerbosity                 *string        `json:"text_verbosity"`
@@ -997,6 +1003,7 @@ func (t *requestTelemetry) observeRequest(body map[string]any, endpoint string) 
 	defer t.mu.Unlock()
 	t.record.Endpoint = endpoint
 	t.record.Model = stringValue(body["model"])
+	t.record.RequestedModel = t.record.Model
 	t.record.Stream = boolValue(body["stream"])
 	t.record.PreviousResponseIDPresent = strings.TrimSpace(stringValue(body["previous_response_id"])) != ""
 	incomingPromptCacheKey := strings.TrimSpace(stringValue(body["prompt_cache_key"]))
@@ -1073,6 +1080,32 @@ func (t *requestTelemetry) observePrepared(payload map[string]any) {
 			t.record.UpstreamEncryptedReasoningEnable = true
 			break
 		}
+	}
+}
+
+func (t *requestTelemetry) observeProvider(route providerRoute) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.record.Provider = safeToken(route.Provider)
+	if route.RequestedModel != "" {
+		t.record.RequestedModel = route.RequestedModel
+	}
+	if route.ActualUpstreamModel != "" {
+		t.record.ActualUpstreamModel = route.ActualUpstreamModel
+		t.record.Model = route.ActualUpstreamModel
+	}
+	if route.ControlPlaneProject != "" {
+		t.record.ControlPlaneProject = safeToken(route.ControlPlaneProject)
+	}
+	if route.CatalogSize > 0 {
+		t.record.ModelCatalogSize = route.CatalogSize
+	}
+	if !route.OAuthTokenExpiry.IsZero() {
+		expiry := route.OAuthTokenExpiry.UTC()
+		t.record.OAuthTokenExpiry = &expiry
 	}
 }
 

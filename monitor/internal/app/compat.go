@@ -122,9 +122,17 @@ func normalizeInputItem(value any) any {
 			return result
 		}
 	case "function_call":
-		return map[string]any{"type": "function_call", "call_id": valueOr(item["call_id"], item["id"]), "name": item["name"], "arguments": valueOr(item["arguments"], "{}")}
+		result := map[string]any{"type": "function_call", "call_id": valueOr(item["call_id"], item["id"]), "name": item["name"], "arguments": valueOr(item["arguments"], "{}")}
+		if signature := stringValue(valueOr(item["thought_signature"], item["thoughtSignature"])); signature != "" {
+			result["thought_signature"] = signature
+		}
+		return result
 	case "function_call_output":
-		return map[string]any{"type": "function_call_output", "call_id": valueOr(item["call_id"], "unknown"), "output": stringValue(item["output"])}
+		result := map[string]any{"type": "function_call_output", "call_id": valueOr(item["call_id"], "unknown"), "output": stringValue(item["output"])}
+		if name := stringValue(item["name"]); name != "" {
+			result["name"] = name
+		}
+		return result
 	}
 	return cloneMap(item)
 }
@@ -427,7 +435,11 @@ func responseContext(response map[string]any) []any {
 		item := mapAny(raw)
 		switch item["type"] {
 		case "function_call":
-			result = append(result, map[string]any{"type": "function_call", "call_id": valueOr(item["call_id"], item["id"]), "name": item["name"], "arguments": valueOr(item["arguments"], "{}")})
+			entry := map[string]any{"type": "function_call", "call_id": valueOr(item["call_id"], item["id"]), "name": item["name"], "arguments": valueOr(item["arguments"], "{}")}
+			if signature := stringValue(valueOr(item["thought_signature"], item["thoughtSignature"])); signature != "" {
+				entry["thought_signature"] = signature
+			}
+			result = append(result, entry)
 		case "message":
 			if text := messageText(item); text != "" {
 				result = append(result, map[string]any{"role": "assistant", "content": text})

@@ -127,6 +127,37 @@ The generated `bin/` directory and local telemetry directory are ignored by
 Git. See [docs/monitor.md](docs/monitor.md) for the route, schema, privacy,
 retention, and non-billed validation details.
 
+## Optional Direct OAuth Antigravity provider
+
+The Go monitor can route the explicitly verified user-facing model
+`gemini-3.7-flash-high` through the shared `../shared/antigravity` OAuth and
+CloudCode library. It remains opt-in so an existing Codex-only installation is
+unchanged:
+
+```toml
+[antigravity]
+enabled = true
+oauth_profile = "antigravity"
+# Omit credential_path to use the default:
+# %LOCALAPPDATA%/AgentBridge/antigravity/oauth_creds.json
+endpoint = "https://daily-cloudcode-pa.googleapis.com"
+catalog_ttl = 2700.0
+project_ttl = 1800.0
+```
+
+The production credential path is separate from the POC path. Create it only
+through an explicit browser OAuth + PKCE action, for example by passing
+`--credential-path` to the `agy-oauth-poc auth` command; the monitor never
+reads the installed AGY CLI Credential Manager and never prints token data.
+`loadCodeAssist` and `fetchAvailableModels` are control-plane calls cached by
+TTL. The generation hot path uses only `streamGenerateContent` and never
+silently maps an unknown model to a default or to another provider.
+
+The provider is implemented in this same monitor daemon and reuses the local
+OpenAI-compatible `/v1/responses`, `/v1/chat/completions`, and `/v1/models`
+routes. It does not start `agy.exe`, a second daemon, Node/CPA proxy, account
+pool, or another listener.
+
 <details>
 <summary><strong>Use Docker instead</strong></summary>
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
+	agyauth "github.com/whatnamed/agent-bridge/shared/antigravity/auth"
 )
 
 const (
@@ -18,6 +19,10 @@ const (
 	defaultPort                   = 18080
 	defaultModel                  = "gpt-5.6-luna"
 	defaultBackendURL             = "https://chatgpt.com/backend-api/codex"
+	defaultAntigravityEndpoint    = "https://daily-cloudcode-pa.googleapis.com"
+	defaultAntigravityProfile     = "antigravity"
+	defaultAntigravityCatalogTTL  = 45 * time.Minute
+	defaultAntigravityProjectTTL  = 30 * time.Minute
 	defaultClient                 = "1.0.0"
 	defaultMaxStored              = 1000
 	defaultConcurrency            = 10
@@ -49,6 +54,13 @@ type config struct {
 	TelemetryQueueSize        int
 	DashboardEnabled          bool
 	ReasoningSummaryDefault   string
+	AntigravityEnabled        bool
+	AntigravityOAuthProfile   string
+	AntigravityCredentialPath string
+	AntigravityEndpoint       string
+	AntigravityProject        string
+	AntigravityCatalogTTL     time.Duration
+	AntigravityProjectTTL     time.Duration
 }
 
 func defaultConfig() config {
@@ -62,6 +74,11 @@ func defaultConfig() config {
 		TelemetryEnabled: true, TelemetryRetentionDays: defaultTelemetryRetentionDays,
 		TelemetryEventMemoryLimit: defaultTelemetryEventMemory, TelemetryQueueSize: defaultTelemetryQueueSize,
 		DashboardEnabled: true, ReasoningSummaryDefault: "none",
+		AntigravityOAuthProfile:   defaultAntigravityProfile,
+		AntigravityCredentialPath: agyauth.DefaultCredentialPath(),
+		AntigravityEndpoint:       defaultAntigravityEndpoint,
+		AntigravityCatalogTTL:     defaultAntigravityCatalogTTL,
+		AntigravityProjectTTL:     defaultAntigravityProjectTTL,
 	}
 }
 
@@ -87,6 +104,13 @@ func (c *config) applyEnvironment() {
 	c.TelemetryQueueSize = envInt("OPENAI_VIA_CODEX_TELEMETRY_QUEUE_SIZE", c.TelemetryQueueSize)
 	c.DashboardEnabled = envBool("OPENAI_VIA_CODEX_DASHBOARD_ENABLED", c.DashboardEnabled)
 	c.ReasoningSummaryDefault = strings.ToLower(envString("OPENAI_VIA_CODEX_REASONING_SUMMARY_DEFAULT", c.ReasoningSummaryDefault))
+	c.AntigravityEnabled = envBool("OPENAI_VIA_CODEX_ANTIGRAVITY_ENABLED", c.AntigravityEnabled)
+	c.AntigravityOAuthProfile = strings.ToLower(strings.TrimSpace(envString("OPENAI_VIA_CODEX_ANTIGRAVITY_OAUTH_PROFILE", c.AntigravityOAuthProfile)))
+	c.AntigravityCredentialPath = envString("OPENAI_VIA_CODEX_ANTIGRAVITY_CREDENTIAL_PATH", c.AntigravityCredentialPath)
+	c.AntigravityEndpoint = strings.TrimRight(envString("OPENAI_VIA_CODEX_ANTIGRAVITY_ENDPOINT", c.AntigravityEndpoint), "/")
+	c.AntigravityProject = strings.TrimSpace(envString("OPENAI_VIA_CODEX_ANTIGRAVITY_PROJECT", c.AntigravityProject))
+	c.AntigravityCatalogTTL = time.Duration(envFloat("OPENAI_VIA_CODEX_ANTIGRAVITY_CATALOG_TTL", c.AntigravityCatalogTTL.Seconds()) * float64(time.Second))
+	c.AntigravityProjectTTL = time.Duration(envFloat("OPENAI_VIA_CODEX_ANTIGRAVITY_PROJECT_TTL", c.AntigravityProjectTTL.Seconds()) * float64(time.Second))
 }
 
 func Run(args []string, version string) error {
@@ -131,6 +155,15 @@ func Run(args []string, version string) error {
 	fs.IntVar(&cfg.TelemetryQueueSize, "telemetry-queue-size", cfg.TelemetryQueueSize, "bounded telemetry writer queue size")
 	fs.BoolVar(&cfg.DashboardEnabled, "dashboard-enabled", cfg.DashboardEnabled, "enable the local dashboard")
 	fs.StringVar(&cfg.ReasoningSummaryDefault, "reasoning-summary-default", cfg.ReasoningSummaryDefault, "default reasoning summary: none or auto")
+	fs.BoolVar(&cfg.AntigravityEnabled, "antigravity-enabled", cfg.AntigravityEnabled, "enable the Direct OAuth Antigravity provider")
+	fs.StringVar(&cfg.AntigravityOAuthProfile, "antigravity-oauth-profile", cfg.AntigravityOAuthProfile, "Antigravity OAuth profile: antigravity or custom")
+	fs.StringVar(&cfg.AntigravityCredentialPath, "antigravity-credential-path", cfg.AntigravityCredentialPath, "Antigravity OAuth credential path")
+	fs.StringVar(&cfg.AntigravityEndpoint, "antigravity-endpoint", cfg.AntigravityEndpoint, "Antigravity CloudCode endpoint")
+	fs.StringVar(&cfg.AntigravityProject, "antigravity-project", cfg.AntigravityProject, "explicit verified Cloud AI Companion project")
+	antigravityCatalogTTL := cfg.AntigravityCatalogTTL.Seconds()
+	antigravityProjectTTL := cfg.AntigravityProjectTTL.Seconds()
+	fs.Float64Var(&antigravityCatalogTTL, "antigravity-catalog-ttl", antigravityCatalogTTL, "Antigravity catalog cache TTL seconds")
+	fs.Float64Var(&antigravityProjectTTL, "antigravity-project-ttl", antigravityProjectTTL, "Antigravity project cache TTL seconds")
 	stopTimeout := cfg.StopTimeout.Seconds()
 	if command == "daemon-run" {
 		fs.Float64Var(&stopTimeout, "stop-timeout", stopTimeout, "seconds to wait before force kill")
@@ -164,6 +197,18 @@ func Run(args []string, version string) error {
 				cfg.DropParams = append(cfg.DropParams, value)
 			}
 		}
+	}
+	cfg.AntigravityOAuthProfile = strings.ToLower(strings.TrimSpace(cfg.AntigravityOAuthProfile))
+	cfg.AntigravityCredentialPath = expandHome(cfg.AntigravityCredentialPath)
+	cfg.AntigravityEndpoint = strings.TrimRight(strings.TrimSpace(cfg.AntigravityEndpoint), "/")
+	cfg.AntigravityProject = strings.TrimSpace(cfg.AntigravityProject)
+	cfg.AntigravityCatalogTTL = time.Duration(antigravityCatalogTTL * float64(time.Second))
+	cfg.AntigravityProjectTTL = time.Duration(antigravityProjectTTL * float64(time.Second))
+	if cfg.AntigravityOAuthProfile != "" && cfg.AntigravityOAuthProfile != "antigravity" && cfg.AntigravityOAuthProfile != "custom" {
+		return errors.New("antigravity OAuth profile must be antigravity or custom")
+	}
+	if cfg.AntigravityEnabled && (cfg.AntigravityCredentialPath == "" || cfg.AntigravityEndpoint == "" || antigravityCatalogTTL <= 0 || antigravityProjectTTL <= 0) {
+		return errors.New("Antigravity provider settings are invalid")
 	}
 	if command == "daemon-run" {
 		return runSupervised(cfg, version)
@@ -246,13 +291,22 @@ auth_json = "~/.codex/auth.json"
 backend_base_url = %q
 client_version = %q
 
+[antigravity]
+enabled = false
+oauth_profile = %q
+credential_path = %q
+endpoint = %q
+project = ""
+catalog_ttl = %.1f
+project_ttl = %.1f
+
 [compat]
 drop_params = []
 
 [daemon]
 state_dir = %q
 stop_timeout = 10.0
-`, defaultHost, defaultPort, defaultModel, defaultMaxStored, defaultConcurrency, defaultTelemetryRetentionDays, defaultTelemetryEventMemory, defaultTelemetryQueueSize, defaultBackendURL, defaultClient, defaultStateDir())
+	`, defaultHost, defaultPort, defaultModel, defaultMaxStored, defaultConcurrency, defaultTelemetryRetentionDays, defaultTelemetryEventMemory, defaultTelemetryQueueSize, defaultBackendURL, defaultClient, defaultAntigravityProfile, agyauth.DefaultCredentialPath(), defaultAntigravityEndpoint, defaultAntigravityCatalogTTL.Seconds(), defaultAntigravityProjectTTL.Seconds(), defaultStateDir())
 }
 
 func defaultStateDir() string {
@@ -324,6 +378,15 @@ type configFile struct {
 		BackendBaseURL *string `toml:"backend_base_url"`
 		ClientVersion  *string `toml:"client_version"`
 	} `toml:"codex"`
+	Antigravity struct {
+		Enabled        *bool    `toml:"enabled"`
+		OAuthProfile   *string  `toml:"oauth_profile"`
+		CredentialPath *string  `toml:"credential_path"`
+		Endpoint       *string  `toml:"endpoint"`
+		Project        *string  `toml:"project"`
+		CatalogTTL     *float64 `toml:"catalog_ttl"`
+		ProjectTTL     *float64 `toml:"project_ttl"`
+	} `toml:"antigravity"`
 	Compat struct {
 		DropParams []string `toml:"drop_params"`
 	} `toml:"compat"`
@@ -368,6 +431,27 @@ func (file *configFile) apply(c *config) {
 	}
 	if file.Codex.ClientVersion != nil {
 		c.ClientVersion = *file.Codex.ClientVersion
+	}
+	if file.Antigravity.Enabled != nil {
+		c.AntigravityEnabled = *file.Antigravity.Enabled
+	}
+	if file.Antigravity.OAuthProfile != nil {
+		c.AntigravityOAuthProfile = strings.ToLower(strings.TrimSpace(*file.Antigravity.OAuthProfile))
+	}
+	if file.Antigravity.CredentialPath != nil {
+		c.AntigravityCredentialPath = *file.Antigravity.CredentialPath
+	}
+	if file.Antigravity.Endpoint != nil {
+		c.AntigravityEndpoint = strings.TrimRight(*file.Antigravity.Endpoint, "/")
+	}
+	if file.Antigravity.Project != nil {
+		c.AntigravityProject = strings.TrimSpace(*file.Antigravity.Project)
+	}
+	if file.Antigravity.CatalogTTL != nil {
+		c.AntigravityCatalogTTL = time.Duration(*file.Antigravity.CatalogTTL * float64(time.Second))
+	}
+	if file.Antigravity.ProjectTTL != nil {
+		c.AntigravityProjectTTL = time.Duration(*file.Antigravity.ProjectTTL * float64(time.Second))
 	}
 	if file.Compat.DropParams != nil {
 		c.DropParams = append([]string(nil), file.Compat.DropParams...)
