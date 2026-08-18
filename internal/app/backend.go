@@ -45,7 +45,7 @@ func newBackend(cfg config) *backend {
 	}
 }
 
-func (b *backend) headers(cred credentials, stream bool, requestID string) http.Header {
+func (b *backend) headers(cred credentials, stream bool, identity requestIdentity) http.Header {
 	h := make(http.Header)
 	h.Set("Authorization", "Bearer "+cred.AccessToken)
 	h.Set("originator", "openai-api-server-via-codex")
@@ -58,9 +58,18 @@ func (b *backend) headers(cred credentials, stream bool, requestID string) http.
 		h.Set("Content-Type", "application/json")
 		h.Set("OpenAI-Beta", "responses=experimental")
 	}
-	if requestID != "" {
-		h.Set("session_id", requestID)
-		h.Set("x-client-request-id", requestID)
+	if identity.SessionID != "" {
+		h.Set("session-id", identity.SessionID)
+	}
+	if identity.ThreadID != "" {
+		h.Set("thread-id", identity.ThreadID)
+	}
+	clientRequestID := identity.ClientRequestID
+	if identity.ThreadID != "" {
+		clientRequestID = identity.ThreadID
+	}
+	if clientRequestID != "" {
+		h.Set("x-client-request-id", clientRequestID)
 	}
 	return h
 }
@@ -117,6 +126,13 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 		delete(prepared, name)
 	}
 	delete(prepared, "max_output_tokens")
+	identity := upstreamRequestIdentity(ctx, prepared)
+	if stringValue(prepared["prompt_cache_key"]) == "" && identity.PromptCacheKey != "" {
+		prepared["prompt_cache_key"] = identity.PromptCacheKey
+	}
+	if identity.ClientRequestID == "" {
+		identity.ClientRequestID = newID("req")
+	}
 	prepared["stream"], prepared["store"] = true, false
 	setDefault(prepared, "tool_choice", "auto")
 	setDefault(prepared, "parallel_tool_calls", true)
@@ -151,7 +167,10 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 		if err != nil {
 			return nil, err
 		}
-		req.Header = b.headers(cred, true, stringValue(prepared["prompt_cache_key"]))
+		req.Header = b.headers(cred, true, identity)
+		if observer := telemetryFromContext(ctx); observer != nil {
+			observer.observeUpstreamRequest(req.Header)
+		}
 		return req, nil
 	})
 	if err != nil {
@@ -316,7 +335,7 @@ func (b *backend) listModels(ctx context.Context) []string {
 		if err != nil {
 			return nil, err
 		}
-		req.Header = b.headers(cred, false, "")
+		req.Header = b.headers(cred, false, requestIdentity{})
 		return req, nil
 	})
 	if err != nil {
@@ -364,7 +383,7 @@ func (b *backend) proxyTo(ctx context.Context, method, baseURL, path, query stri
 		if err != nil {
 			return nil, err
 		}
-		req.Header = b.headers(cred, false, "")
+		req.Header = b.headers(cred, false, requestIdentity{})
 		for _, name := range []string{"Accept", "Content-Type", "Idempotency-Key", "OpenAI-Beta", "OpenAI-Organization", "OpenAI-Project", "OpenAI-Version"} {
 			if v := headers.Get(name); v != "" {
 				req.Header.Set(name, v)

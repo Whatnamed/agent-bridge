@@ -278,8 +278,12 @@ func TestBackendHeadersForwardPromptCacheKey(t *testing.T) {
 	if b.auth.refreshClient.Timeout != authRefreshTimeout {
 		t.Fatalf("refresh timeout = %s", b.auth.refreshClient.Timeout)
 	}
-	headers := b.headers(credentials{AccessToken: "token"}, true, "request-123")
-	if headers.Get("session_id") != "request-123" || headers.Get("x-client-request-id") != "request-123" {
+	headers := b.headers(credentials{AccessToken: "token"}, true, requestIdentity{
+		SessionID:       "session-123",
+		ThreadID:        "thread-123",
+		ClientRequestID: "request-123",
+	})
+	if headers.Get("session-id") != "session-123" || headers.Get("thread-id") != "thread-123" || headers.Get("x-client-request-id") != "thread-123" || headers.Get("session_id") != "" {
 		t.Fatalf("headers = %#v", headers)
 	}
 }

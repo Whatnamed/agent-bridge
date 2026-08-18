@@ -110,6 +110,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	counter := &countingReadCloser{ReadCloser: r.Body}
 	r.Body = counter
+	r = r.WithContext(withRequestIdentity(r.Context(), requestIdentityFromHeaders(r.Header)))
 	var requestTelemetry *requestTelemetry
 	if endpoint := telemetryEndpoint(r); endpoint != "" {
 		requestTelemetry = s.telemetry.begin(r, endpoint)

@@ -193,7 +193,7 @@ func TestGoHTTPContractResponsesLifecycleAndStreaming(t *testing.T) {
 	if !containsString(sliceAny(upstream.JSON["include"]), "reasoning.encrypted_content") {
 		t.Fatalf("upstream include = %#v", upstream.JSON["include"])
 	}
-	if upstream.Headers.Get("session_id") != "go-contract-request" || upstream.Headers.Get("x-client-request-id") != "go-contract-request" {
+	if upstream.Headers.Get("session_id") != "" || upstream.Headers.Get("session-id") != "" || upstream.Headers.Get("thread-id") != "" || upstream.Headers.Get("x-client-request-id") == "" {
 		t.Fatalf("upstream headers = %#v", upstream.Headers)
 	}
 	if upstream.Headers.Get("ChatGPT-Account-ID") != "acct_go_test" || upstream.Headers.Get("Authorization") == "Bearer "+contractAPIKey {
@@ -271,6 +271,47 @@ func TestGoHTTPContractResponsesLifecycleAndStreaming(t *testing.T) {
 		t.Fatalf("delete status = %d", response.StatusCode)
 	}
 	environment.json(t, http.MethodGet, "/v1/responses/"+createdID, nil, http.StatusNotFound)
+}
+
+func TestGoHTTPContractUsesZCodeSessionForPromptCacheAffinity(t *testing.T) {
+	environment := newContractEnvironment(t, nil)
+	payload, err := json.Marshal(map[string]any{
+		"model":  "gpt-5.6-luna",
+		"input":  "ZCODE-AFFINITY-CONTRACT",
+		"stream": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, environment.server.URL+"/v1/responses", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+contractAPIKey)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("x-session-id", "zcode-session-123")
+	request.Header.Set("x-request-id", "zcode-request-456")
+	request.Header.Set("x-query-id", "zcode-query-789")
+	response, err := environment.client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+
+	upstream := environment.upstream.LastResponseRequest(t)
+	if upstream.JSON["prompt_cache_key"] != "zcode-session-123" {
+		t.Fatalf("prompt_cache_key = %#v", upstream.JSON["prompt_cache_key"])
+	}
+	if upstream.Headers.Get("session-id") != "zcode-session-123" || upstream.Headers.Get("session_id") != "" {
+		t.Fatalf("session headers = %#v", upstream.Headers)
+	}
+	if upstream.Headers.Get("thread-id") != "" || upstream.Headers.Get("x-client-request-id") != "zcode-request-456" {
+		t.Fatalf("request headers = %#v", upstream.Headers)
+	}
 }
 
 func TestGoHTTPContractChatLifecycleToolsAndStreaming(t *testing.T) {

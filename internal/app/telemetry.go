@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"math"
@@ -22,16 +23,29 @@ import (
 )
 
 const (
-	maxTelemetryRecords   = 200
-	maxTelemetryLineBytes = 2 << 20
-	quotaRefreshInterval  = 60 * time.Second
-	quotaRequestTimeout   = 10 * time.Second
-	telemetryDateLayout   = "2006-01-02"
-	telemetryDateFileName = "2006-01-02.jsonl"
-	quotaFileName         = "quota.jsonl"
+	maxTelemetryRecords          = 200
+	maxTelemetryLineBytes        = 2 << 20
+	maxTelemetryFingerprintBytes = 16 << 10
+	quotaRefreshInterval         = 60 * time.Second
+	quotaRequestTimeout          = 10 * time.Second
+	telemetryDateLayout          = "2006-01-02"
+	telemetryDateFileName        = "2006-01-02.jsonl"
+	quotaFileName                = "quota.jsonl"
 )
 
 type telemetryContextKey struct{}
+type requestIdentityContextKey struct{}
+
+type requestIdentity struct {
+	SessionID        string
+	SessionSource    string
+	ThreadID         string
+	ClientRequestID  string
+	ClientRequestSrc string
+	ZCodeRequestID   string
+	ZCodeQueryID     string
+	PromptCacheKey   string
+}
 
 type requestRecord struct {
 	InternalRequestID string    `json:"internal_request_id"`
@@ -51,10 +65,32 @@ type requestRecord struct {
 	TextVerbosity             *string        `json:"text_verbosity"`
 	PreviousResponseIDPresent bool           `json:"previous_response_id_present"`
 	PromptCacheKeyPresent     bool           `json:"prompt_cache_key_present"`
+	PromptCacheKeyHash        string         `json:"prompt_cache_key_hash,omitempty"`
 	ToolCount                 int            `json:"tool_count"`
 	ToolTypes                 map[string]int `json:"tool_types"`
 	ParallelToolCalls         *bool          `json:"parallel_tool_calls"`
 	ClientType                string         `json:"client_type"`
+
+	IncomingSessionSource       string `json:"incoming_session_source,omitempty"`
+	IncomingSessionIDHash       string `json:"incoming_session_id_hash,omitempty"`
+	IncomingThreadIDHash        string `json:"incoming_thread_id_hash,omitempty"`
+	IncomingClientRequestIDHash string `json:"incoming_client_request_id_hash,omitempty"`
+	IncomingZCodeRequestIDHash  string `json:"incoming_zcode_request_id_hash,omitempty"`
+	IncomingZCodeQueryIDHash    string `json:"incoming_zcode_query_id_hash,omitempty"`
+
+	UpstreamSessionIDHash       string `json:"upstream_session_id_hash,omitempty"`
+	UpstreamLegacySessionIDHash string `json:"upstream_legacy_session_id_hash,omitempty"`
+	UpstreamThreadIDHash        string `json:"upstream_thread_id_hash,omitempty"`
+	UpstreamClientRequestIDHash string `json:"upstream_client_request_id_hash,omitempty"`
+
+	InputPrefixHash          string `json:"input_prefix_hash,omitempty"`
+	InstructionsHash         string `json:"instructions_hash,omitempty"`
+	ToolsHash                string `json:"tools_hash,omitempty"`
+	RequestShapeHash         string `json:"request_shape_hash,omitempty"`
+	PreparedInputPrefixHash  string `json:"prepared_input_prefix_hash,omitempty"`
+	PreparedInstructionsHash string `json:"prepared_instructions_hash,omitempty"`
+	PreparedToolsHash        string `json:"prepared_tools_hash,omitempty"`
+	PreparedRequestShapeHash string `json:"prepared_request_shape_hash,omitempty"`
 
 	InputTokens       *int64 `json:"input_tokens"`
 	CachedInputTokens *int64 `json:"cached_input_tokens"`
@@ -156,6 +192,214 @@ func withTelemetry(ctx context.Context, value *requestTelemetry) context.Context
 	return context.WithValue(ctx, telemetryContextKey{}, value)
 }
 
+func withRequestIdentity(ctx context.Context, value requestIdentity) context.Context {
+	return context.WithValue(ctx, requestIdentityContextKey{}, value)
+}
+
+func requestIdentityFromContext(ctx context.Context) requestIdentity {
+	if ctx == nil {
+		return requestIdentity{}
+	}
+	value, _ := ctx.Value(requestIdentityContextKey{}).(requestIdentity)
+	return value
+}
+
+func requestIdentityFromHeaders(headers http.Header) requestIdentity {
+	sessionID, sessionSource := firstHeader(headers,
+		"session-id",
+		"session_id",
+		"x-session-id",
+	)
+	threadID, _ := firstHeader(headers, "thread-id")
+	clientRequestID, clientRequestSource := firstHeader(headers, "x-client-request-id")
+	zcodeRequestID, _ := firstHeader(headers, "x-request-id")
+	zcodeQueryID, _ := firstHeader(headers, "x-query-id")
+	if threadID != "" {
+		clientRequestID = threadID
+		clientRequestSource = "thread-id"
+	} else if clientRequestID == "" {
+		switch {
+		case zcodeRequestID != "":
+			clientRequestID = zcodeRequestID
+			clientRequestSource = "x-request-id"
+		case zcodeQueryID != "":
+			clientRequestID = zcodeQueryID
+			clientRequestSource = "x-query-id"
+		}
+	}
+	return requestIdentity{
+		SessionID:        sessionID,
+		SessionSource:    sessionSource,
+		ThreadID:         threadID,
+		ClientRequestID:  clientRequestID,
+		ClientRequestSrc: clientRequestSource,
+		ZCodeRequestID:   zcodeRequestID,
+		ZCodeQueryID:     zcodeQueryID,
+	}
+}
+
+func firstHeader(headers http.Header, names ...string) (string, string) {
+	for _, name := range names {
+		for key, values := range headers {
+			if !strings.EqualFold(key, name) || len(values) == 0 {
+				continue
+			}
+			if value := strings.TrimSpace(values[0]); value != "" {
+				return value, name
+			}
+		}
+	}
+	return "", ""
+}
+
+func headerValue(headers http.Header, name string) string {
+	value, _ := firstHeader(headers, name)
+	return value
+}
+
+func safeJSONPrefixHash(value any) string {
+	if value == nil {
+		return ""
+	}
+	hasher := sha256.New()
+	remaining := maxTelemetryFingerprintBytes
+	truncated := false
+	fingerprintValue(hasher, value, &remaining, &truncated, 0)
+	if truncated {
+		_, _ = hasher.Write([]byte{0})
+	}
+	return hex.EncodeToString(hasher.Sum(nil))[:16]
+}
+
+func fingerprintValue(hasher hash.Hash, value any, remaining *int, truncated *bool, depth int) {
+	if *remaining <= 0 {
+		*truncated = true
+		return
+	}
+	if depth > 8 {
+		writeFingerprint(hasher, []byte("depth"), remaining, truncated)
+		return
+	}
+	switch typed := value.(type) {
+	case nil:
+		writeFingerprint(hasher, []byte("nil"), remaining, truncated)
+	case string:
+		writeFingerprint(hasher, []byte("string:"), remaining, truncated)
+		writeFingerprint(hasher, []byte(strconv.Itoa(len(typed))), remaining, truncated)
+		writeFingerprint(hasher, []byte{':'}, remaining, truncated)
+		writeFingerprintString(hasher, typed, remaining, truncated)
+	case bool:
+		writeFingerprint(hasher, []byte("bool:"+strconv.FormatBool(typed)), remaining, truncated)
+	case float64:
+		writeFingerprint(hasher, []byte("number:"+strconv.FormatFloat(typed, 'g', -1, 64)), remaining, truncated)
+	case json.Number:
+		writeFingerprint(hasher, []byte("number:"+string(typed)), remaining, truncated)
+	case []any:
+		writeFingerprint(hasher, []byte("array:"+strconv.Itoa(len(typed)+0)+"["), remaining, truncated)
+		for _, item := range typed {
+			if *remaining <= 0 {
+				*truncated = true
+				break
+			}
+			fingerprintValue(hasher, item, remaining, truncated, depth+1)
+		}
+		writeFingerprint(hasher, []byte{']'}, remaining, truncated)
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		writeFingerprint(hasher, []byte("object:"+strconv.Itoa(len(keys))+"{"), remaining, truncated)
+		for _, key := range keys {
+			if *remaining <= 0 {
+				*truncated = true
+				break
+			}
+			writeFingerprint(hasher, []byte(key+":"), remaining, truncated)
+			fingerprintValue(hasher, typed[key], remaining, truncated, depth+1)
+		}
+		writeFingerprint(hasher, []byte{'}'}, remaining, truncated)
+	default:
+		writeFingerprint(hasher, []byte(fmt.Sprintf("type:%T:%v", value, value)), remaining, truncated)
+	}
+}
+
+func writeFingerprint(hasher hash.Hash, data []byte, remaining *int, truncated *bool) {
+	if *remaining <= 0 {
+		*truncated = true
+		return
+	}
+	if len(data) > *remaining {
+		_, _ = hasher.Write(data[:*remaining])
+		*remaining = 0
+		*truncated = true
+		return
+	}
+	written, _ := hasher.Write(data)
+	*remaining -= written
+}
+
+func writeFingerprintString(hasher hash.Hash, value string, remaining *int, truncated *bool) {
+	const chunkSize = 4 << 10
+	if *remaining <= 0 {
+		*truncated = true
+		return
+	}
+	limit := len(value)
+	if limit > *remaining {
+		limit = *remaining
+	}
+	for offset := 0; offset < limit; {
+		end := offset + chunkSize
+		if end > limit {
+			end = limit
+		}
+		written, _ := hasher.Write([]byte(value[offset:end]))
+		*remaining -= written
+		offset += written
+	}
+	if limit < len(value) {
+		*truncated = true
+		*remaining = 0
+	}
+}
+
+func requestShapeHash(payload map[string]any) string {
+	if payload == nil {
+		return ""
+	}
+	shape := make(map[string]any, 11)
+	for _, name := range []string{
+		"model",
+		"instructions",
+		"tools",
+		"tool_choice",
+		"parallel_tool_calls",
+		"reasoning",
+		"store",
+		"stream",
+		"include",
+		"service_tier",
+		"prompt_cache_key",
+		"text",
+	} {
+		if value, ok := payload[name]; ok {
+			shape[name] = value
+		}
+	}
+	return safeJSONPrefixHash(shape)
+}
+
+func upstreamRequestIdentity(ctx context.Context, payload map[string]any) requestIdentity {
+	identity := requestIdentityFromContext(ctx)
+	identity.PromptCacheKey = strings.TrimSpace(stringValue(payload["prompt_cache_key"]))
+	if identity.PromptCacheKey == "" && identity.SessionID != "" {
+		identity.PromptCacheKey = identity.SessionID
+	}
+	return identity
+}
+
 func telemetryFromContext(ctx context.Context) *requestTelemetry {
 	if ctx == nil {
 		return nil
@@ -218,6 +462,13 @@ func (s *telemetryStore) begin(r *http.Request, endpoint string) *requestTelemet
 		ClientType:        detectClientType(r.Header),
 		ToolTypes:         map[string]int{},
 	}
+	identity := requestIdentityFromHeaders(r.Header)
+	record.IncomingSessionSource = identity.SessionSource
+	record.IncomingSessionIDHash = safeIDHash(identity.SessionID)
+	record.IncomingThreadIDHash = safeIDHash(identity.ThreadID)
+	record.IncomingClientRequestIDHash = safeIDHash(identity.ClientRequestID)
+	record.IncomingZCodeRequestIDHash = safeIDHash(identity.ZCodeRequestID)
+	record.IncomingZCodeQueryIDHash = safeIDHash(identity.ZCodeQueryID)
 	eventLimit := s.cfg.TelemetryEventMemoryLimit
 	if eventLimit < 1 {
 		eventLimit = 200
@@ -687,6 +938,11 @@ func (t *requestTelemetry) observeRequest(body map[string]any, endpoint string) 
 	t.record.Stream = boolValue(body["stream"])
 	t.record.PreviousResponseIDPresent = strings.TrimSpace(stringValue(body["previous_response_id"])) != ""
 	t.record.PromptCacheKeyPresent = strings.TrimSpace(stringValue(body["prompt_cache_key"])) != ""
+	t.record.PromptCacheKeyHash = safeIDHash(stringValue(body["prompt_cache_key"]))
+	t.record.InputPrefixHash = safeJSONPrefixHash(body["input"])
+	t.record.InstructionsHash = safeJSONPrefixHash(body["instructions"])
+	t.record.ToolsHash = safeJSONPrefixHash(body["tools"])
+	t.record.RequestShapeHash = requestShapeHash(body)
 	if value := stringValue(body["verbosity"]); value != "" {
 		t.record.TextVerbosity = stringPointer(value)
 	}
@@ -734,6 +990,14 @@ func (t *requestTelemetry) observePrepared(payload map[string]any) {
 	if value := stringValue(payload["model"]); value != "" {
 		t.record.Model = value
 	}
+	t.record.PreparedInputPrefixHash = safeJSONPrefixHash(payload["input"])
+	t.record.PreparedInstructionsHash = safeJSONPrefixHash(payload["instructions"])
+	t.record.PreparedToolsHash = safeJSONPrefixHash(payload["tools"])
+	t.record.PreparedRequestShapeHash = requestShapeHash(payload)
+	if value := stringValue(payload["prompt_cache_key"]); value != "" {
+		t.record.PromptCacheKeyPresent = true
+		t.record.PromptCacheKeyHash = safeIDHash(value)
+	}
 	if reasoning := mapAny(payload["reasoning"]); reasoning != nil {
 		if value := stringValue(reasoning["effort"]); value != "" {
 			t.record.UpstreamReasoningEffort = stringPointer(value)
@@ -748,6 +1012,18 @@ func (t *requestTelemetry) observePrepared(payload map[string]any) {
 			break
 		}
 	}
+}
+
+func (t *requestTelemetry) observeUpstreamRequest(headers http.Header) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.record.UpstreamSessionIDHash = safeIDHash(headerValue(headers, "session-id"))
+	t.record.UpstreamLegacySessionIDHash = safeIDHash(headerValue(headers, "session_id"))
+	t.record.UpstreamThreadIDHash = safeIDHash(headerValue(headers, "thread-id"))
+	t.record.UpstreamClientRequestIDHash = safeIDHash(headerValue(headers, "x-client-request-id"))
 }
 
 func (t *requestTelemetry) observeUpstreamEvent(event map[string]any) {
@@ -1133,7 +1409,7 @@ func (b *backend) fetchQuota(ctx context.Context) (map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		req.Header = b.headers(cred, false, "")
+		req.Header = b.headers(cred, false, requestIdentity{})
 		return req, nil
 	})
 	if err != nil {

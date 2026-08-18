@@ -91,6 +91,85 @@ func TestTelemetryCapturesMetadataWithoutPersistingContent(t *testing.T) {
 	}
 }
 
+func TestTelemetryRecordsAffinityAndShapeFingerprintsWithoutValues(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	store := newTelemetryStore(cfg, nil)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	request.Header.Set("x-session-id", "zcode-session-secret")
+	request.Header.Set("x-request-id", "zcode-request-secret")
+	request.Header.Set("x-query-id", "zcode-query-secret")
+	telemetry := store.begin(request, "/v1/responses")
+	telemetry.observeRequest(map[string]any{
+		"model":            "gpt-5.6-luna",
+		"input":            "PRIVATE INPUT PREFIX",
+		"instructions":     "PRIVATE INSTRUCTIONS",
+		"prompt_cache_key": "PRIVATE CACHE KEY",
+		"tools": []any{map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "private-tool",
+				"description": "private tool description",
+			},
+		}},
+	}, "/v1/responses")
+	telemetry.observePrepared(map[string]any{
+		"model":            "gpt-5.6-luna",
+		"input":            "PRIVATE PREPARED INPUT",
+		"instructions":     "PRIVATE PREPARED INSTRUCTIONS",
+		"prompt_cache_key": "PRIVATE CACHE KEY",
+		"tools":            []any{map[string]any{"type": "function"}},
+	})
+	telemetry.observeUpstreamRequest(http.Header{
+		"session-id":          []string{"zcode-session-secret"},
+		"x-client-request-id": []string{"zcode-request-secret"},
+	})
+	capture := &responseCapture{ResponseWriter: httptest.NewRecorder()}
+	_, _ = capture.Write([]byte("ok"))
+	store.finish(telemetry, request, capture, 2)
+	store.close()
+
+	record := store.recentRecords()[0]
+	if record.IncomingSessionIDHash != safeIDHash("zcode-session-secret") || record.IncomingZCodeRequestIDHash != safeIDHash("zcode-request-secret") || record.IncomingZCodeQueryIDHash != safeIDHash("zcode-query-secret") {
+		t.Fatalf("incoming identity fingerprints = %#v", record)
+	}
+	if record.UpstreamSessionIDHash != safeIDHash("zcode-session-secret") || record.UpstreamLegacySessionIDHash != "" || record.UpstreamClientRequestIDHash != safeIDHash("zcode-request-secret") {
+		t.Fatalf("upstream identity fingerprints = %#v", record)
+	}
+	for name, value := range map[string]string{
+		"prompt_cache_key":       record.PromptCacheKeyHash,
+		"input_prefix":           record.InputPrefixHash,
+		"instructions":           record.InstructionsHash,
+		"tools":                  record.ToolsHash,
+		"request_shape":          record.RequestShapeHash,
+		"prepared_input_prefix":  record.PreparedInputPrefixHash,
+		"prepared_instructions":  record.PreparedInstructionsHash,
+		"prepared_tools":         record.PreparedToolsHash,
+		"prepared_request_shape": record.PreparedRequestShapeHash,
+	} {
+		if value == "" {
+			t.Fatalf("missing %s fingerprint: %#v", name, record)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(store.telemetryDir, time.Now().Local().Format(telemetryDateLayout)+".jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{
+		"zcode-session-secret",
+		"zcode-request-secret",
+		"zcode-query-secret",
+		"PRIVATE INPUT PREFIX",
+		"PRIVATE INSTRUCTIONS",
+		"PRIVATE CACHE KEY",
+		"private-tool",
+	} {
+		if bytes.Contains(data, []byte(secret)) {
+			t.Fatalf("telemetry persisted %q: %s", secret, data)
+		}
+	}
+}
+
 func TestTelemetryQueueDropIsNonBlocking(t *testing.T) {
 	store := &telemetryStore{enabled: true, queue: make(chan telemetryWrite, 1)}
 	store.enqueue(telemetryWrite{quota: map[string]any{"available": true}})
@@ -652,5 +731,20 @@ func BenchmarkTelemetrySyntheticEvents(b *testing.B) {
 			}
 			b.StopTimer()
 		})
+	}
+}
+
+func BenchmarkTelemetryLargeInputFingerprints(b *testing.B) {
+	largeInput := strings.Repeat("large private input ", 20000)
+	payload := map[string]any{
+		"model":        "gpt-5.6-luna",
+		"input":        largeInput,
+		"instructions": "stable instructions",
+		"tools":        []any{map[string]any{"type": "function", "function": map[string]any{"name": "tool"}}},
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = safeJSONPrefixHash(payload["input"])
+		_ = requestShapeHash(payload)
 	}
 }
