@@ -23,7 +23,8 @@ if (-not (Test-Path -LiteralPath $ModelPath -PathType Leaf)) {
 
 # ---- Runtime configuration: change BridgeVersion only when upgrading the verified bridge. ----
 $UvxPath = 'E:\Dev\uv\uvx.exe'
-$BridgeExecutablePath = 'E:\Codex\openai-api-server-via-codex-monitor\bin\openai-api-server-via-codex.exe'
+$ProductDirectory = Split-Path -Parent $ControllerDirectory
+$BridgeExecutablePath = Join-Path $ProductDirectory 'monitor\bin\openai-api-server-via-codex.exe'
 $BridgePackage = 'openai-api-server-via-codex'
 $BridgeVersion = '0.2.0'
 $BridgeCommand = $BridgePackage

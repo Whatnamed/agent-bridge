@@ -270,7 +270,7 @@ Describe 'Codex Bridge deterministic runtime arguments' {
 
     It 'uses the direct monitor binary without reintroducing the uvx package wrapper' {
         $directConfig = [pscustomobject]@{
-            BridgeExecutablePath = 'E:\Codex\openai-api-server-via-codex-monitor\bin\openai-api-server-via-codex.exe'
+            BridgeExecutablePath = 'E:\Projects\agent-bridge\agent-bridge\monitor\bin\openai-api-server-via-codex.exe'
             BridgePackageSpec = 'openai-api-server-via-codex==0.2.0'
             BridgeCommand = 'openai-api-server-via-codex'
             BridgeHost = '127.0.0.1'

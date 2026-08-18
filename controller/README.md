@@ -17,7 +17,7 @@
 `CodexBridge.ps1` 顶部集中定义运行配置：
 
 - uvx：`E:\Dev\uv\uvx.exe`
-- review bridge binary：`E:\Codex\openai-api-server-via-codex-monitor\bin\openai-api-server-via-codex.exe`
+- review bridge binary：`E:\Projects\agent-bridge\agent-bridge\monitor\bin\openai-api-server-via-codex.exe`
 - package fallback：`openai-api-server-via-codex==0.2.0`（仅当 `$BridgeExecutablePath` 留空时使用）
 - host：`127.0.0.1`
 - port：`18080`
@@ -42,7 +42,7 @@
 
 控制器通过统一的 runtime argument builder 为 `start`、`stop` 和 `status` 显式传入 host、port、state directory、PID file 和 log file；`start` 另外显式传入 auth path。外部 `config.toml`、环境变量或 bridge 默认值不会改变控制器认知的目标 instance。
 
-如果使用 review binary，请先在 `E:\Codex\openai-api-server-via-codex-monitor`
+如果使用 review binary，请先在 `E:\Projects\agent-bridge\agent-bridge\monitor`
 构建它：
 
 ```powershell
@@ -55,7 +55,7 @@ Get-FileHash .\bin\openai-api-server-via-codex.exe -Algorithm SHA256
 在 PowerShell 7 中执行一次：
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File E:\Codex\CodexBridge\InstallShortcut.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File E:\Projects\agent-bridge\agent-bridge\controller\InstallShortcut.ps1
 ```
 
 桌面路径使用 `[Environment]::GetFolderPath('Desktop')` 动态取得。已有同名快捷方式只有在确认目标和参数都属于本控制器时才会更新；否则安装会拒绝覆盖。不创建管理员任务或开机启动。
@@ -123,7 +123,7 @@ fallback 的候选 PID 先由纯 `Get-FallbackActionPlan` 根据 snapshot、当�
 纯模型测试不启动 bridge、不访问 `/v1/responses`，只覆盖 ownership、共同祖先隔离、PID reuse、fingerprint、respawn、foreign listener、其他端口实例、stale PID、显式 runtime arguments 和菜单状态：
 
 ```powershell
-pwsh -NoProfile -NonInteractive -Command "Import-Module Pester -RequiredVersion 3.4.0; Invoke-Pester -Path E:\Codex\CodexBridge-review\tests\CodexBridge.Tests.ps1"
+pwsh -NoProfile -NonInteractive -Command "Import-Module Pester -RequiredVersion 3.4.0; Invoke-Pester -Path E:\Projects\agent-bridge\agent-bridge\controller\tests\CodexBridge.Tests.ps1"
 ```
 
 真实集成验证只使用 `/healthz`、listener、PID/进程观察和官方 start/stop，不发送计费的 `/v1/responses` 请求。
