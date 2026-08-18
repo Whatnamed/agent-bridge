@@ -10,14 +10,15 @@
   <main class="shell">
     <header class="topbar">
       <div><p class="eyebrow">LOCAL OBSERVABILITY</p><h1>Codex Bridge 监控</h1><p class="muted">本地旁路诊断 · 不保存 prompt、输出或 reasoning 文本</p></div>
-      <div class="status-pill"><span id="status-dot"></span><span id="bridge-status">检查中</span></div>
+      <div class="topbar-actions"><label class="source-control">来源<select id="source-filter" aria-label="来源"><option value="all">全部</option><option value="zcode">ZCode</option><option value="codex">Codex</option><option value="dsh">DSH</option><option value="unknown">Unknown</option></select></label><div class="status-pill"><span id="status-dot"></span><span id="bridge-status">检查中</span></div></div>
     </header>
-    <nav class="tabs" aria-label="主要区域"><button class="tab active" data-tab="overview">概览</button><button class="tab" data-tab="requests">请求</button><button class="tab" data-tab="diagnostics">诊断</button></nav>
+    <nav class="tabs" aria-label="主要区域"><button class="tab active" data-tab="overview">概览</button><button class="tab" data-tab="requests">请求</button></nav>
 
     <section id="overview" class="tab-panel active">
       <div class="grid cards">
         <article class="card quota-card"><div class="card-heading"><span>官方额度</span><span id="quota-status" class="tag">读取中</span></div><div id="quota-content" class="quota-grid"><div class="empty">正在读取官方额度快照…</div></div></article>
         <article class="card"><div class="card-heading"><span>Bridge</span><span id="last-quota" class="muted">—</span></div><div class="metric-row"><span>进行中的请求</span><strong id="active-requests">0</strong></div><div class="metric-row"><span>丢弃的 telemetry</span><strong id="dropped">0</strong></div><div class="metric-row"><span>写入错误</span><strong id="writer-errors">0</strong></div></article>
+        <article class="card"><div class="card-heading"><span>Codex 本地采集</span><span id="codex-collector-status" class="tag">未启用</span></div><div class="metric-row"><span>跟踪文件</span><strong id="codex-tracked-files">—</strong></div><div class="metric-row"><span>已导入 turns</span><strong id="codex-imported-turns">—</strong></div><div class="metric-row"><span>解析错误 / 忽略事件</span><strong id="codex-parse-unknown">—</strong></div><div class="metric-row"><span>最近同步 / lag</span><strong id="codex-last-sync">—</strong></div></article>
       </div>
       <div class="card"><div class="card-heading"><span id="selected-range-label">当前范围</span><button id="refresh-overview" class="small-button">刷新</button></div><div id="summary-grid" class="summary-grid"></div></div>
       <div class="card"><div class="card-heading"><span>运行时内存</span><span class="muted" title="Go runtime 指标；Windows Working Set 需在系统进程工具中查看">Go runtime</span></div><div class="summary-grid memory-grid"><div class="summary-item"><span>Heap Alloc</span><strong id="heap-alloc">—</strong></div><div class="summary-item"><span>Heap Inuse</span><strong id="heap-inuse">—</strong></div><div class="summary-item"><span>Heap Sys</span><strong id="heap-sys">—</strong></div><div class="summary-item"><span>Response Store</span><strong id="response-store-items">—</strong></div><div class="summary-item"><span>Chat Store</span><strong id="chat-store-items">—</strong></div><div class="summary-item"><span>Telemetry 最近记录</span><strong id="telemetry-records">—</strong></div><div class="summary-item"><span>GC 次数</span><strong id="num-gc">—</strong></div></div></div>
@@ -25,13 +26,14 @@
 
     <section id="requests" class="tab-panel">
       <div class="card"><div class="toolbar"><select id="range" aria-label="时间范围"><option value="today">今天</option><option value="1h">最近 1 小时</option><option value="6h">最近 6 小时</option><option value="24h">最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option></select><input id="model-filter" placeholder="模型" aria-label="模型"><select id="effort-filter" aria-label="请求推理强度"><option value="">全部强度</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="max">max</option></select><select id="outcome-filter" aria-label="请求状态"><option value="">全部状态</option><option value="success">成功</option><option value="failed">失败</option><option value="cancelled">已取消</option></select><select id="endpoint-filter" aria-label="接口"><option value="">全部接口</option><option value="/v1/responses">Responses</option><option value="/v1/chat/completions">Chat Completions</option></select><select id="sort-filter" aria-label="排序"><option value="newest">最新</option><option value="slowest">最慢</option><option value="highest_input">输入最多</option><option value="highest_reasoning">推理最多</option></select><button id="refresh-requests" class="small-button">刷新</button><span id="request-refresh-state" class="muted" role="status"></span></div>
-        <div class="table-wrap"><table><thead><tr><th>时间</th><th>模型</th><th>推理强度</th><th>输入 Token</th><th>缓存 Token</th><th>输出 Token</th><th>推理 Token</th><th>首响应</th><th>首字</th><th>总耗时</th><th>状态</th></tr></thead><tbody id="request-table"><tr><td colspan="11" class="empty">暂无请求。</td></tr></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>时间</th><th>来源</th><th>模型</th><th>推理强度</th><th>输入 / 缓存 Token</th><th>输出 / 推理 Token</th><th>首响应</th><th>首字</th><th>总耗时</th><th>状态</th></tr></thead><tbody id="request-table"><tr><td colspan="10" class="empty">暂无请求。</td></tr></tbody></table></div>
         <div class="pagination"><button id="request-prev" class="small-button" disabled>上一页</button><span id="request-page" class="muted">0 / 0</span><button id="request-next" class="small-button" disabled>下一页</button></div>
       </div>
     </section>
 
-    <section id="diagnostics" class="tab-panel"><div class="card"><div class="card-heading"><span>请求诊断</span><span class="muted">在请求列表中选择一条记录</span></div><div id="detail" class="detail-empty">暂无请求详情</div></div></section>
   </main>
+  <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+  <aside id="detail-drawer" class="detail-drawer" aria-hidden="true" aria-labelledby="detail-title"><div class="drawer-heading"><div><p class="eyebrow">RECORD DETAIL</p><h2 id="detail-title">记录详情</h2></div><button id="detail-close" class="small-button" aria-label="关闭详情">关闭</button></div><div id="detail" class="detail-empty">选择一条记录查看详情</div></aside>
   <script src="/dashboard/assets/app.js"></script>
 </body>
 </html>

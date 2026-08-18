@@ -100,7 +100,9 @@ func (s *server) dashboardOverview(w http.ResponseWriter, r *http.Request) {
 		"quota_status":            quotaStatus,
 		"quota":                   quota,
 		"range":                   dashboardRangeName(r.URL.Query()),
+		"source":                  dashboardSourceName(r.URL.Query()),
 		"stats":                   summarizeRecords(records),
+		"codex":                   s.telemetry.codexSnapshot(),
 		"memory":                  s.dashboardMemorySnapshot(),
 	})
 }
@@ -167,6 +169,11 @@ func (s *server) dashboardRecords(query url.Values) []*requestRecord {
 	// before/after the asynchronous writer flushes them to disk.
 	byID := make(map[string]*requestRecord)
 	for _, record := range s.telemetry.readHistoryRecords(since) {
+		if record != nil && record.InternalRequestID != "" {
+			byID[record.InternalRequestID] = record
+		}
+	}
+	for _, record := range s.telemetry.readCodexRecords(since) {
 		if record != nil && record.InternalRequestID != "" {
 			byID[record.InternalRequestID] = record
 		}
@@ -244,6 +251,7 @@ func localDayStart(value time.Time) time.Time {
 
 func filterTelemetryRecords(records []*requestRecord, query url.Values) []*requestRecord {
 	since := telemetrySince(query)
+	source := strings.TrimSpace(query.Get("source"))
 	model := strings.TrimSpace(query.Get("model"))
 	effort := strings.TrimSpace(query.Get("effort"))
 	outcome := strings.TrimSpace(query.Get("status"))
@@ -253,7 +261,13 @@ func filterTelemetryRecords(records []*requestRecord, query url.Values) []*reque
 	endpoint := strings.TrimSpace(query.Get("endpoint"))
 	result := make([]*requestRecord, 0, len(records))
 	for _, record := range records {
+		if record == nil {
+			continue
+		}
 		if !since.IsZero() && record.StartedAt.Before(since) {
+			continue
+		}
+		if source != "" && source != "all" && !telemetrySourceMatches(record, source) {
 			continue
 		}
 		if model != "" && record.Model != model {
@@ -291,47 +305,136 @@ func sortTelemetryRecords(records []*requestRecord, order string) {
 }
 
 func summarizeRecords(records []*requestRecord) map[string]any {
-	var success, input, cached, output, reasoning int64
+	var success int
+	var input, cached, output, reasoning int64
+	var inputAvailable, cachedAvailable, outputAvailable, reasoningAvailable int
 	var cacheHitRequests int
 	var requests int
 	var ttfts, durations []int64
+	sources := map[string]int{}
 	for _, record := range records {
+		if record == nil {
+			continue
+		}
 		requests++
 		if record.Outcome == "success" {
 			success++
 		}
-		input += recordNumber(record.InputTokens)
-		cached += recordNumber(record.CachedInputTokens)
+		sources[telemetrySourceName(record)]++
+		if record.InputTokens != nil {
+			input += *record.InputTokens
+			inputAvailable++
+		}
+		if record.CachedInputTokens != nil {
+			cached += *record.CachedInputTokens
+			cachedAvailable++
+		}
 		if record.CachedInputTokens != nil && *record.CachedInputTokens > 0 {
 			cacheHitRequests++
 		}
-		output += recordNumber(record.OutputTokens)
-		reasoning += recordNumber(record.ReasoningTokens)
+		if record.OutputTokens != nil {
+			output += *record.OutputTokens
+			outputAvailable++
+		}
+		if record.ReasoningTokens != nil {
+			reasoning += *record.ReasoningTokens
+			reasoningAvailable++
+		}
 		if record.TTFTMS != nil {
 			ttfts = append(ttfts, *record.TTFTMS)
 		}
-		durations = append(durations, record.RequestDurationMS)
+		if duration, ok := recordDuration(record); ok {
+			durations = append(durations, duration)
+		}
 	}
-	var successRate, requestCacheHit, tokenCacheRatio float64
+	var successRate, requestCacheHit, tokenCacheRatio any
 	if requests > 0 {
 		successRate = float64(success) * 100 / float64(requests)
 		requestCacheHit = float64(cacheHitRequests) * 100 / float64(requests)
 	}
-	if input > 0 {
+	if inputAvailable > 0 && cachedAvailable > 0 && input > 0 {
 		tokenCacheRatio = float64(cached) * 100 / float64(input)
+	}
+	var inputValue, cachedValue, outputValue, reasoningValue any
+	if inputAvailable > 0 {
+		inputValue = input
+	}
+	if cachedAvailable > 0 {
+		cachedValue = cached
+	}
+	if outputAvailable > 0 {
+		outputValue = output
+	}
+	if reasoningAvailable > 0 {
+		reasoningValue = reasoning
 	}
 	return map[string]any{
 		"requests": requests, "success_rate": successRate,
-		"input_tokens": input, "cached_input_tokens": cached,
+		"input_tokens": inputValue, "input_tokens_available": inputAvailable,
+		"cached_input_tokens": cachedValue, "cached_input_tokens_available": cachedAvailable,
 		"cache_hit_requests":        cacheHitRequests,
 		"request_cache_hit_percent": requestCacheHit,
 		"token_cache_ratio_percent": tokenCacheRatio,
 		// Keep the old field as a compatibility alias for existing local pages.
 		"cache_hit_percent": tokenCacheRatio,
-		"output_tokens":     output, "reasoning_tokens": reasoning,
+		"output_tokens":     outputValue, "output_tokens_available": outputAvailable,
+		"reasoning_tokens": reasoningValue, "reasoning_tokens_available": reasoningAvailable,
+		"sources":        sources,
 		"median_ttft_ms": medianInt64(ttfts), "p95_ttft_ms": percentileInt64(ttfts, 0.95),
 		"median_duration_ms": medianInt64(durations), "p95_duration_ms": percentileInt64(durations, 0.95),
 	}
+}
+
+func dashboardSourceName(query url.Values) string {
+	value := strings.ToLower(strings.TrimSpace(query.Get("source")))
+	switch value {
+	case "zcode":
+		return "ZCode"
+	case "codex":
+		return "Codex"
+	case "dsh":
+		return "DSH"
+	case "unknown":
+		return "Unknown"
+	default:
+		return "All"
+	}
+}
+
+func telemetrySourceName(record *requestRecord) string {
+	if record == nil {
+		return "Unknown"
+	}
+	normalizeSourceRecord(record)
+	if strings.EqualFold(record.Source, "codex") || strings.EqualFold(record.ClientType, "codex") {
+		return "Codex"
+	}
+	switch strings.ToLower(strings.TrimSpace(record.ClientType)) {
+	case "zcode":
+		return "ZCode"
+	case "dsh":
+		return "DSH"
+	default:
+		return "Unknown"
+	}
+}
+
+func telemetrySourceMatches(record *requestRecord, filter string) bool {
+	value := strings.ToLower(strings.TrimSpace(filter))
+	if value == "" || value == "all" {
+		return true
+	}
+	return strings.EqualFold(telemetrySourceName(record), value)
+}
+
+func recordDuration(record *requestRecord) (int64, bool) {
+	if record == nil {
+		return 0, false
+	}
+	if record.DurationAvailable || record.RequestDurationMS != 0 {
+		return record.RequestDurationMS, true
+	}
+	return 0, false
 }
 
 func recordNumber(value *int64) int64 {
