@@ -50,6 +50,35 @@ func TestAuthorizationURLUsesStateAndPKCEOfflineFlow(t *testing.T) {
 	}
 }
 
+func TestOAuthProfilesAreExplicitAndIsolated(t *testing.T) {
+	t.Setenv("AGY_POC_CLIENT_ID", "custom-client-id")
+	t.Setenv("AGY_POC_CLIENT_SECRET", "custom-client-secret")
+	antigravity, err := ConfigForProfile("antigravity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if antigravity.Profile != ProfileAntigravity || antigravity.ClientID == "" || antigravity.ClientSecret == "" {
+		t.Fatalf("antigravity profile is incomplete: profile=%q client_id_present=%t client_secret_present=%t", antigravity.Profile, antigravity.ClientID != "", antigravity.ClientSecret != "")
+	}
+	if len(antigravity.Scopes) != len(DefaultScopes) {
+		t.Fatalf("antigravity scopes = %d, want %d", len(antigravity.Scopes), len(DefaultScopes))
+	}
+
+	custom, err := ConfigForProfile("custom")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if custom.Profile != ProfileCustom || custom.ClientID != "custom-client-id" || custom.ClientSecret != "custom-client-secret" {
+		t.Fatalf("custom profile did not use its environment values: profile=%q client_id=%q secret_present=%t", custom.Profile, custom.ClientID, custom.ClientSecret != "")
+	}
+}
+
+func TestUnknownOAuthProfileFailsClosed(t *testing.T) {
+	if _, err := ConfigForProfile("guessing"); err == nil || !strings.Contains(err.Error(), "choose antigravity or custom") {
+		t.Fatalf("unknown profile error = %v", err)
+	}
+}
+
 func TestCallbackServerAcceptsLoopbackCallback(t *testing.T) {
 	port := freePort(t)
 	callback, err := ListenCallback(fmt.Sprintf("http://localhost:%d/oauth-callback", port))

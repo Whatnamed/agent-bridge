@@ -26,6 +26,22 @@ const (
 	DefaultRedirectURI           = "http://localhost:51121/oauth-callback"
 )
 
+type Profile string
+
+const (
+	ProfileAntigravity Profile = "antigravity"
+	ProfileCustom      Profile = "custom"
+	DefaultProfile     Profile = ProfileAntigravity
+)
+
+// These are the public desktop-client values used by the current Antigravity
+// direct-OAuth implementations. They are configuration, not user credentials:
+// the POC still creates and stores its own token set after a new PKCE flow.
+const (
+	antigravityClientID     = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+	antigravityClientSecret = "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"
+)
+
 var DefaultScopes = []string{
 	"https://www.googleapis.com/auth/cloud-platform",
 	"https://www.googleapis.com/auth/userinfo.email",
@@ -37,6 +53,7 @@ var DefaultScopes = []string{
 // Config is the independent OAuth client configuration for the POC.
 // ClientSecret is intentionally supplied at runtime and never persisted.
 type Config struct {
+	Profile               Profile
 	ClientID              string
 	ClientSecret          string
 	AuthorizationEndpoint string
@@ -46,14 +63,26 @@ type Config struct {
 	HTTPClient            *http.Client
 }
 
-func ConfigFromEnvironment() (Config, error) {
-	clientID := strings.TrimSpace(os.Getenv("AGY_POC_CLIENT_ID"))
-	clientSecret := os.Getenv("AGY_POC_CLIENT_SECRET")
-	if clientID == "" {
-		return Config{}, errors.New("AGY_POC_CLIENT_ID is not set; use a separate Google OAuth desktop client for this POC")
+// ConfigForProfile returns an explicit OAuth profile. The antigravity profile
+// intentionally does not inspect the installed AGY CLI or its credential store.
+func ConfigForProfile(profile string) (Config, error) {
+	switch Profile(strings.ToLower(strings.TrimSpace(profile))) {
+	case ProfileAntigravity:
+		return profileConfig(ProfileAntigravity, antigravityClientID, antigravityClientSecret), nil
+	case ProfileCustom:
+		clientID := strings.TrimSpace(os.Getenv("AGY_POC_CLIENT_ID"))
+		if clientID == "" {
+			return Config{}, errors.New("AGY_POC_CLIENT_ID is not set for the custom OAuth profile")
+		}
+		return profileConfig(ProfileCustom, clientID, os.Getenv("AGY_POC_CLIENT_SECRET")), nil
+	default:
+		return Config{}, fmt.Errorf("unknown OAuth profile %q; choose antigravity or custom", profile)
 	}
+}
 
+func profileConfig(profile Profile, clientID, clientSecret string) Config {
 	return Config{
+		Profile:               profile,
 		ClientID:              clientID,
 		ClientSecret:          clientSecret,
 		AuthorizationEndpoint: DefaultAuthorizationEndpoint,
@@ -61,7 +90,14 @@ func ConfigFromEnvironment() (Config, error) {
 		RedirectURI:           DefaultRedirectURI,
 		Scopes:                append([]string(nil), DefaultScopes...),
 		HTTPClient:            http.DefaultClient,
-	}, nil
+	}
+}
+
+// ConfigFromEnvironment is retained for package callers that explicitly want
+// the custom environment-backed profile. The CLI defaults to antigravity and
+// calls ConfigForProfile directly.
+func ConfigFromEnvironment() (Config, error) {
+	return ConfigForProfile(string(ProfileCustom))
 }
 
 func (c Config) withDefaults() Config {
