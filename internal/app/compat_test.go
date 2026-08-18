@@ -74,6 +74,45 @@ func TestResponseStoreRefreshesExistingEntryEvictionOrder(t *testing.T) {
 	}
 }
 
+func TestResponseStoreDerivesContextOnlyWhenRead(t *testing.T) {
+	responses := newResponseStore(2)
+	input := []any{map[string]any{"role": "user", "content": "question"}}
+	responses.remember("one", input, map[string]any{
+		"id": "one", "output": []any{map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "answer"}}}},
+	})
+
+	responses.mu.RLock()
+	entry := responses.values["one"]
+	responses.mu.RUnlock()
+	if entry == nil || entry.Context != nil {
+		t.Fatalf("store retained derived context: %#v", entry)
+	}
+	if len(entry.EffectiveInput) != 1 || len(entry.ResponseContext) != 1 {
+		t.Fatalf("canonical store fields = %#v", entry)
+	}
+	got := responses.get("one")
+	if len(got.Context) != 2 || len(got.EffectiveInput) != 1 {
+		t.Fatalf("derived context = %#v", got)
+	}
+}
+
+func BenchmarkResponseStoreRememberAndGet(b *testing.B) {
+	input := make([]any, 256)
+	for i := range input {
+		input[i] = map[string]any{"role": "user", "content": "benchmark input item with enough text to exercise cloning"}
+	}
+	response := map[string]any{
+		"id":     "benchmark",
+		"output": []any{map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "answer"}}}},
+	}
+	responses := newResponseStore(64)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		responses.remember("benchmark", input, response)
+		_ = responses.get("benchmark")
+	}
+}
+
 func TestPrepareResponseNormalizesReasoningAndDefaults(t *testing.T) {
 	got := prepareResponse(map[string]any{"input": []any{
 		map[string]any{"type": "reasoning", "summary": []any{}},

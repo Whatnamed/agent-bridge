@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -385,7 +386,7 @@ func TestDashboardServesAPIAndRejectsUnknownRequest(t *testing.T) {
 
 	page := httptest.NewRecorder()
 	server.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
-	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "Codex Bridge Monitor") {
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "Codex Bridge 监控") || !strings.Contains(page.Body.String(), `lang="zh-CN"`) {
 		t.Fatalf("dashboard page = %d %s", page.Code, page.Body.String())
 	}
 	list := httptest.NewRecorder()
@@ -441,6 +442,50 @@ func TestDashboardDisabledReturnsNotFound(t *testing.T) {
 	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("dashboard disabled status = %d", response.Code)
+	}
+}
+
+func TestDashboardSeparatesRequestCacheHitsFromTokenCacheRatio(t *testing.T) {
+	cached := int64(40)
+	zeroCached := int64(0)
+	inputOne := int64(100)
+	inputTwo := int64(100)
+	inputThree := int64(100)
+	stats := summarizeRecords([]*requestRecord{
+		{CachedInputTokens: &cached, InputTokens: &inputOne},
+		{CachedInputTokens: &zeroCached, InputTokens: &inputTwo},
+		{InputTokens: &inputThree},
+	})
+	if got := stats["cache_hit_requests"]; got != 1 {
+		t.Fatalf("cache hit requests = %#v", got)
+	}
+	if got := stats["request_cache_hit_percent"]; got != float64(100)/3 {
+		t.Fatalf("request cache hit percent = %#v", got)
+	}
+	if got := stats["token_cache_ratio_percent"]; got != float64(40)/3 {
+		t.Fatalf("token cache ratio = %#v", got)
+	}
+}
+
+func TestDashboardAssetsExposeChineseRefreshAndDiagnosticsContract(t *testing.T) {
+	page, err := dashboardFiles.ReadFile("dashboard/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := dashboardFiles.ReadFile("dashboard/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageText, appText := string(page), string(app)
+	for _, marker := range []string{`lang="zh-CN"`, "首响应", "首字", "总耗时", "缓存诊断"} {
+		if !strings.Contains(pageText+appText, marker) {
+			t.Fatalf("dashboard marker %q is missing", marker)
+		}
+	}
+	for _, marker := range []string{"request_cache_hit_percent", "token_cache_ratio_percent", "formatDuration", "visibilitychange", "5000"} {
+		if !strings.Contains(appText, marker) {
+			t.Fatalf("dashboard script marker %q is missing", marker)
+		}
 	}
 }
 
@@ -595,6 +640,80 @@ func TestTelemetryTracksReasoningSummaryToolsAndDownstreamTTFT(t *testing.T) {
 		if bytes.Contains(data, []byte(secret)) {
 			t.Fatalf("telemetry persisted %q: %s", secret, data)
 		}
+	}
+}
+
+func TestTelemetryReasoningCountersObserveSummaryAfterItem(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	store := newTelemetryStore(cfg, nil)
+	defer store.close()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"test"}`))
+	telemetry := store.begin(request, "/v1/responses")
+	telemetry.observeUpstreamEvent(map[string]any{
+		"type": "response.output_item.added",
+		"item": map[string]any{"id": "reasoning-late-summary", "type": "reasoning", "summary": []any{}},
+	})
+	telemetry.observeUpstreamEvent(map[string]any{
+		"type": "response.output_item.done",
+		"item": map[string]any{
+			"id": "reasoning-late-summary", "type": "reasoning",
+			"summary": []any{map[string]any{"type": "summary_text"}},
+			"content": []any{map[string]any{"type": "reasoning_text"}},
+		},
+	})
+	capture := &responseCapture{ResponseWriter: httptest.NewRecorder()}
+	store.finish(telemetry, request, capture, 2)
+	record := store.recentRecords()[0]
+	if record.ReasoningItemCount != 1 || record.ReadableReasoningItems != 1 || record.RawReasoningTextItems != 1 {
+		t.Fatalf("reasoning counters after later fields = %#v", record)
+	}
+}
+
+func TestDashboardQueriesHistoricalJSONLBeyondRecentWindow(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.StateDir = t.TempDir()
+	telemetryDir := filepath.Join(cfg.StateDir, "telemetry")
+	if err := os.MkdirAll(telemetryDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	var data bytes.Buffer
+	for i := 0; i < maxTelemetryRecords+5; i++ {
+		record := &requestRecord{
+			InternalRequestID: fmt.Sprintf("historical_%03d", i),
+			StartedAt:         now.Add(-time.Duration(i) * time.Second),
+			CompletedAt:       now.Add(-time.Duration(i) * time.Second),
+			Endpoint:          "/v1/responses", Outcome: "success", Model: "history-model",
+			RequestDurationMS: int64(i + 1),
+		}
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data.Write(encoded)
+		data.WriteByte('\n')
+	}
+	name := filepath.Join(telemetryDir, now.Local().Format(telemetryDateLayout)+".jsonl")
+	if err := os.WriteFile(name, data.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store := newTelemetryStore(cfg, nil)
+	defer store.close()
+	server := &server{cfg: cfg, telemetry: store}
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/dashboard/api/requests?range=30d&limit=1", nil))
+	var payload map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if total, ok := numberAsInt(payload["total"]); !ok || total != maxTelemetryRecords+5 {
+		t.Fatalf("historical total = %#v", payload["total"])
+	}
+	detail := httptest.NewRecorder()
+	server.ServeHTTP(detail, httptest.NewRequest(http.MethodGet, "/dashboard/api/requests/historical_000", nil))
+	if detail.Code != http.StatusOK {
+		t.Fatalf("historical detail status = %d: %s", detail.Code, detail.Body.String())
 	}
 }
 

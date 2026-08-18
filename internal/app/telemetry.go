@@ -140,15 +140,17 @@ type telemetryEvent struct {
 }
 
 type requestTelemetry struct {
-	store       *telemetryStore
-	record      *requestRecord
-	started     time.Time
-	mu          sync.Mutex
-	finished    bool
-	reasoningID map[string]struct{}
-	encryptedID map[string]struct{}
-	toolID      map[string]struct{}
-	lastEvent   time.Time
+	store               *telemetryStore
+	record              *requestRecord
+	started             time.Time
+	mu                  sync.Mutex
+	finished            bool
+	reasoningID         map[string]struct{}
+	readableReasoningID map[string]struct{}
+	rawReasoningID      map[string]struct{}
+	encryptedID         map[string]struct{}
+	toolID              map[string]struct{}
+	lastEvent           time.Time
 }
 
 type telemetryWrite struct {
@@ -164,6 +166,7 @@ type telemetryStore struct {
 	stop         chan struct{}
 	wg           sync.WaitGroup
 	recordsMu    sync.RWMutex
+	historyMu    sync.RWMutex
 	records      []*requestRecord
 	dropped      atomic.Uint64
 	writerErrors atomic.Uint64
@@ -464,12 +467,14 @@ func (s *telemetryStore) begin(r *http.Request, endpoint string) *requestTelemet
 		eventLimit = 200
 	}
 	t := &requestTelemetry{
-		store:       s,
-		record:      record,
-		started:     now,
-		reasoningID: map[string]struct{}{},
-		encryptedID: map[string]struct{}{},
-		toolID:      map[string]struct{}{},
+		store:               s,
+		record:              record,
+		started:             now,
+		reasoningID:         map[string]struct{}{},
+		readableReasoningID: map[string]struct{}{},
+		rawReasoningID:      map[string]struct{}{},
+		encryptedID:         map[string]struct{}{},
+		toolID:              map[string]struct{}{},
 	}
 	record.Timeline = make([]telemetryEvent, 0, eventLimit)
 	s.active.Add(1)
@@ -561,6 +566,8 @@ func (s *telemetryStore) writeItem(item telemetryWrite) {
 }
 
 func (s *telemetryStore) appendJSONL(now time.Time, value any) {
+	s.historyMu.Lock()
+	defer s.historyMu.Unlock()
 	name := filepath.Join(s.telemetryDir, now.Local().Format(telemetryDateLayout)+".jsonl")
 	file, err := os.OpenFile(name, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
@@ -601,19 +608,8 @@ func (s *telemetryStore) appendQuota(value map[string]any) {
 }
 
 func (s *telemetryStore) loadRecentRecords() {
-	files, err := filepath.Glob(filepath.Join(s.telemetryDir, "*.jsonl"))
-	if err != nil {
-		return
-	}
-	sort.Strings(files)
+	files := telemetryHistoryFiles(s.telemetryDir, time.Time{})
 	for _, name := range files {
-		base := filepath.Base(name)
-		if base == quotaFileName || len(base) != len(telemetryDateFileName) {
-			continue
-		}
-		if _, err := time.Parse(telemetryDateLayout, strings.TrimSuffix(base, ".jsonl")); err != nil {
-			continue
-		}
 		file, err := os.Open(name)
 		if err != nil {
 			continue
@@ -633,6 +629,66 @@ func (s *telemetryStore) loadRecentRecords() {
 		}
 		_ = file.Close()
 	}
+}
+
+func telemetryHistoryFiles(telemetryDir string, since time.Time) []string {
+	files, err := filepath.Glob(filepath.Join(telemetryDir, "*.jsonl"))
+	if err != nil {
+		return nil
+	}
+	sort.Strings(files)
+	result := make([]string, 0, len(files))
+	for _, name := range files {
+		base := filepath.Base(name)
+		if base == quotaFileName || len(base) != len(telemetryDateFileName) {
+			continue
+		}
+		date, err := time.ParseInLocation(telemetryDateLayout, strings.TrimSuffix(base, ".jsonl"), time.Local)
+		if err != nil {
+			continue
+		}
+		if !since.IsZero() && date.AddDate(0, 0, 1).Before(since) {
+			continue
+		}
+		result = append(result, name)
+	}
+	return result
+}
+
+// readHistoryRecords reads the append-only JSONL summaries without exposing
+// request payloads. The writer serializes appendJSONL under historyMu, so a
+// dashboard read cannot observe a partially written line from this process;
+// malformed lines are still ignored defensively for files left by an abrupt
+// process termination.
+func (s *telemetryStore) readHistoryRecords(since time.Time) []*requestRecord {
+	if s == nil || !s.enabled {
+		return nil
+	}
+	s.historyMu.RLock()
+	defer s.historyMu.RUnlock()
+	var records []*requestRecord
+	for _, name := range telemetryHistoryFiles(s.telemetryDir, since) {
+		file, err := os.Open(name)
+		if err != nil {
+			continue
+		}
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 64*1024), maxTelemetryLineBytes)
+		for scanner.Scan() {
+			var record requestRecord
+			if json.Unmarshal(scanner.Bytes(), &record) != nil || record.InternalRequestID == "" {
+				continue
+			}
+			if !since.IsZero() && record.StartedAt.Before(since) {
+				continue
+			}
+			record.Timeline = nil
+			recordCopy := record
+			records = append(records, &recordCopy)
+		}
+		_ = file.Close()
+	}
+	return records
 }
 
 func (s *telemetryStore) loadQuotaSnapshot() {
@@ -814,7 +870,23 @@ func (s *telemetryStore) findRecord(id string) *requestRecord {
 			return s.records[i]
 		}
 	}
+	history := s.readHistoryRecords(time.Time{})
+	for i := len(history) - 1; i >= 0; i-- {
+		record := history[i]
+		if record.InternalRequestID == id {
+			return record
+		}
+	}
 	return nil
+}
+
+func (s *telemetryStore) recentCount() int {
+	if s == nil {
+		return 0
+	}
+	s.recordsMu.RLock()
+	defer s.recordsMu.RUnlock()
+	return len(s.records)
 }
 
 func (s *telemetryStore) droppedCount() uint64 {
@@ -1098,15 +1170,21 @@ func (t *requestTelemetry) observeEvent(direction string, event map[string]any) 
 		if id == "" {
 			id = fmt.Sprintf("%s:%d", eventType, t.record.UpstreamEventCount)
 		}
-		if _, seen := t.reasoningID[id]; !seen {
-			t.reasoningID[id] = struct{}{}
-			if itemType == "reasoning" || strings.Contains(eventType, "reasoning.item") {
+		if itemType == "reasoning" || strings.Contains(eventType, "reasoning.item") {
+			if _, seen := t.reasoningID[id]; !seen {
+				t.reasoningID[id] = struct{}{}
 				t.record.ReasoningItemCount++
 			}
-			if len(sliceAny(item["summary"])) > 0 {
+		}
+		if len(sliceAny(item["summary"])) > 0 {
+			if _, seen := t.readableReasoningID[id]; !seen {
+				t.readableReasoningID[id] = struct{}{}
 				t.record.ReadableReasoningItems++
 			}
-			if item["content"] != nil || item["text"] != nil {
+		}
+		if item["content"] != nil || item["text"] != nil {
+			if _, seen := t.rawReasoningID[id]; !seen {
+				t.rawReasoningID[id] = struct{}{}
 				t.record.RawReasoningTextItems++
 			}
 		}

@@ -6,8 +6,12 @@ import (
 )
 
 type storedResponse struct {
-	EffectiveInput, Context []any
-	Response                map[string]any
+	// EffectiveInput is the canonical stored input. Context is derived when a
+	// response is read so a large previous-response chain is not retained twice.
+	EffectiveInput  []any
+	ResponseContext []any
+	Context         []any // derived on get; never retained in the store entry
+	Response        map[string]any
 }
 type responseStore struct {
 	mu     sync.RWMutex
@@ -26,7 +30,9 @@ func (s *responseStore) get(id string) *storedResponse {
 	if v == nil {
 		return nil
 	}
-	return &storedResponse{EffectiveInput: cloneSlice(v.EffectiveInput), Context: cloneSlice(v.Context), Response: cloneMap(v.Response)}
+	input := cloneSlice(v.EffectiveInput)
+	context := append(cloneSlice(v.EffectiveInput), cloneSlice(v.ResponseContext)...)
+	return &storedResponse{EffectiveInput: input, Context: context, Response: cloneMap(v.Response)}
 }
 func (s *responseStore) remember(id string, input []any, response map[string]any) {
 	if s.max == 0 {
@@ -44,11 +50,20 @@ func (s *responseStore) remember(id string, input []any, response map[string]any
 	}
 	s.order = append(s.order, id)
 	effective := cloneSlice(input)
-	s.values[id] = &storedResponse{EffectiveInput: effective, Context: append(cloneSlice(effective), responseContext(response)...), Response: cloneMap(response)}
+	s.values[id] = &storedResponse{EffectiveInput: effective, ResponseContext: responseContext(response), Response: cloneMap(response)}
 	for len(s.order) > s.max {
 		delete(s.values, s.order[0])
 		s.order = s.order[1:]
 	}
+}
+
+func (s *responseStore) count() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.values)
 }
 func (s *responseStore) delete(id string) bool {
 	s.mu.Lock()
@@ -152,6 +167,15 @@ func (s *chatStore) delete(id string) bool {
 		}
 	}
 	return true
+}
+
+func (s *chatStore) count() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.values)
 }
 func (s *chatStore) list(model string, metadata map[string]any, desc bool, after string, limit int) ([]map[string]any, bool) {
 	s.mu.RLock()

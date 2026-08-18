@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -71,7 +72,7 @@ func (s *server) dashboardOverview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.telemetry.refreshQuota()
-	records := filterTelemetryRecords(s.telemetry.recentRecords(), r.URL.Query())
+	records := s.dashboardRecords(r.URL.Query())
 	quota := s.telemetry.quotaSnapshot()
 	telemetryEnabled := s.telemetry != nil && s.telemetry.enabled
 	var lastQuota any
@@ -100,6 +101,7 @@ func (s *server) dashboardOverview(w http.ResponseWriter, r *http.Request) {
 		"quota":                   quota,
 		"range":                   dashboardRangeName(r.URL.Query()),
 		"stats":                   summarizeRecords(records),
+		"memory":                  s.dashboardMemorySnapshot(),
 	})
 }
 
@@ -109,7 +111,7 @@ func (s *server) dashboardRequests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	query := r.URL.Query()
-	records := filterTelemetryRecords(s.telemetry.recentRecords(), query)
+	records := s.dashboardRecords(query)
 	sortTelemetryRecords(records, query.Get("sort"))
 	total := len(records)
 	limit := positiveInt(query.Get("limit"))
@@ -153,6 +155,47 @@ func (s *server) dashboardRequestDetail(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeDashboardJSON(w, 200, recordForAPI(record, true))
+}
+
+func (s *server) dashboardRecords(query url.Values) []*requestRecord {
+	if s == nil || s.telemetry == nil {
+		return nil
+	}
+	since := telemetrySince(query)
+	// JSONL is the long-term source of truth. Overlay the bounded in-memory
+	// window so the latest records retain their event timeline metadata even
+	// before/after the asynchronous writer flushes them to disk.
+	byID := make(map[string]*requestRecord)
+	for _, record := range s.telemetry.readHistoryRecords(since) {
+		if record != nil && record.InternalRequestID != "" {
+			byID[record.InternalRequestID] = record
+		}
+	}
+	for _, record := range s.telemetry.recentRecords() {
+		if record != nil && record.InternalRequestID != "" {
+			byID[record.InternalRequestID] = record
+		}
+	}
+	records := make([]*requestRecord, 0, len(byID))
+	for _, record := range byID {
+		records = append(records, record)
+	}
+	return filterTelemetryRecords(records, query)
+}
+
+func (s *server) dashboardMemorySnapshot() map[string]any {
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	return map[string]any{
+		"heap_alloc_bytes":     stats.HeapAlloc,
+		"heap_inuse_bytes":     stats.HeapInuse,
+		"heap_sys_bytes":       stats.HeapSys,
+		"num_gc":               stats.NumGC,
+		"response_store_items": s.responses.count(),
+		"chat_store_items":     s.chats.count(),
+		"telemetry_records":    s.telemetry.recentCount(),
+		"active_requests":      s.telemetry.activeCount(),
+	}
 }
 
 func writeDashboardJSON(w http.ResponseWriter, status int, value any) {
@@ -249,6 +292,7 @@ func sortTelemetryRecords(records []*requestRecord, order string) {
 
 func summarizeRecords(records []*requestRecord) map[string]any {
 	var success, input, cached, output, reasoning int64
+	var cacheHitRequests int
 	var requests int
 	var ttfts, durations []int64
 	for _, record := range records {
@@ -258,6 +302,9 @@ func summarizeRecords(records []*requestRecord) map[string]any {
 		}
 		input += recordNumber(record.InputTokens)
 		cached += recordNumber(record.CachedInputTokens)
+		if record.CachedInputTokens != nil && *record.CachedInputTokens > 0 {
+			cacheHitRequests++
+		}
 		output += recordNumber(record.OutputTokens)
 		reasoning += recordNumber(record.ReasoningTokens)
 		if record.TTFTMS != nil {
@@ -265,17 +312,23 @@ func summarizeRecords(records []*requestRecord) map[string]any {
 		}
 		durations = append(durations, record.RequestDurationMS)
 	}
-	var successRate, cacheHit float64
+	var successRate, requestCacheHit, tokenCacheRatio float64
 	if requests > 0 {
 		successRate = float64(success) * 100 / float64(requests)
+		requestCacheHit = float64(cacheHitRequests) * 100 / float64(requests)
 	}
 	if input > 0 {
-		cacheHit = float64(cached) * 100 / float64(input)
+		tokenCacheRatio = float64(cached) * 100 / float64(input)
 	}
 	return map[string]any{
 		"requests": requests, "success_rate": successRate,
-		"input_tokens": input, "cached_input_tokens": cached, "cache_hit_percent": cacheHit,
-		"output_tokens": output, "reasoning_tokens": reasoning,
+		"input_tokens": input, "cached_input_tokens": cached,
+		"cache_hit_requests":        cacheHitRequests,
+		"request_cache_hit_percent": requestCacheHit,
+		"token_cache_ratio_percent": tokenCacheRatio,
+		// Keep the old field as a compatibility alias for existing local pages.
+		"cache_hit_percent": tokenCacheRatio,
+		"output_tokens":     output, "reasoning_tokens": reasoning,
 		"median_ttft_ms": medianInt64(ttfts), "p95_ttft_ms": percentileInt64(ttfts, 0.95),
 		"median_duration_ms": medianInt64(durations), "p95_duration_ms": percentileInt64(durations, 0.95),
 	}

@@ -42,8 +42,12 @@ directory. The writer queue is bounded by `telemetry.queue_size` (default 256).
 If it is full, the record is dropped and the drop counter is exposed in the
 dashboard; the API request is never blocked for telemetry.
 
-The server keeps only the most recent 200 records in memory for the dashboard.
-On restart, recent JSONL records are loaded back into that bounded view. Set
+The server keeps only the most recent 200 records and their bounded event
+timelines in memory. The Overview and Requests APIs read retained JSONL files
+for the selected time range and overlay that recent in-memory window, so a
+30-day query does not load 30 days of records into the browser DOM. Concurrent
+dashboard reads are serialized with the JSONL append writer; malformed partial
+lines from an interrupted older process are ignored. Set
 `OPENAI_VIA_CODEX_TELEMETRY_ENABLED=false` or
 `--telemetry-enabled=false` to disable collection and persistence.
 
@@ -71,7 +75,16 @@ Supported request filters include `range` (`1h`, `6h`, `24h`, `7d`, `30d`, or
 bounded pagination with 50 records per page. Detail responses include request
 and completion timestamps, HTTP/stream/client metadata, supplied usage fields,
 reasoning/tool/event counters, timing fields, and the bounded metadata
-timeline. Persistence deliberately excludes that timeline.
+timeline. Persistence deliberately excludes that timeline. The embedded UI is
+Chinese (`lang=zh-CN`), uses `ms` below one second and seconds with two decimal
+places at or above one second, and labels a missing first text delta as
+`无文本`. On the first Requests page with newest sorting, the list refreshes
+about every five seconds while the tab is visible; hidden tabs and later pages
+are not auto-refreshed or moved. Cache diagnostics expose only presence flags
+and hash prefixes. Request cache hit rate (requests with `cached_tokens > 0`)
+is shown separately from token cache ratio (`cached_tokens / input_tokens`).
+The dashboard also exposes Go Heap metrics and bounded store counts; these are
+runtime diagnostics, not a Windows Working Set measurement.
 
 When `dashboard.enabled=false`, all dashboard paths return `404`. Dashboard
 requests are not telemetry request records.
@@ -103,6 +116,26 @@ summary_default = "auto"
 ```
 
 This option is opt-in and does not persist the returned reasoning content.
+Telemetry counts reasoning items, readable summaries, raw reasoning text, and
+encrypted reasoning independently, so an item event that gains a summary in a
+later event is counted correctly without counting the item twice.
+
+## Deterministic tray runtime
+
+The Windows tray controller passes the managed host, port, state directory, PID
+file, log file, and (for start) auth path explicitly. Start also passes
+`--telemetry-enabled=true`, `--dashboard-enabled=true`, and
+`--reasoning-summary-default=none`; stop and status use only the flags their
+CLI accepts. The package version remains a single controller configuration
+point (`0.2.0`). External `config.toml`, environment variables, and bridge
+defaults therefore cannot silently redirect the controller to another local
+instance.
+
+The response compatibility store retains one canonical `EffectiveInput` per
+stored response and derives the previous-response context when read. This
+preserves `previous_response_id`, input-items, GET, and cancel behavior without
+retaining the same large input slice twice. The configured store bound is not
+changed by the monitor.
 
 ## Non-billed validation
 
