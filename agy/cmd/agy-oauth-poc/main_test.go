@@ -3,8 +3,8 @@ package main
 import (
 	"testing"
 
-	"github.com/whatnamed/agent-bridge/agy/internal/auth"
 	"github.com/whatnamed/agent-bridge/agy/internal/probe"
+	"github.com/whatnamed/agent-bridge/shared/antigravity/auth"
 )
 
 func TestParseProbeArgsToolTestUsesDeterministicPrompt(t *testing.T) {

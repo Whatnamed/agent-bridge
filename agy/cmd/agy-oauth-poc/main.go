@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/whatnamed/agent-bridge/agy/internal/auth"
-	"github.com/whatnamed/agent-bridge/agy/internal/cloudcode"
 	"github.com/whatnamed/agent-bridge/agy/internal/probe"
+	"github.com/whatnamed/agent-bridge/shared/antigravity/auth"
+	"github.com/whatnamed/agent-bridge/shared/antigravity/cloudcode"
 )
 
 func main() {
@@ -76,7 +76,7 @@ func runAuth(args []string) error {
 	verify := flags.Bool("verify", false, "call loadCodeAssist after saving; no generation request")
 	timeout := flags.Duration("timeout", 2*time.Minute, "OAuth callback timeout")
 	redirectURI := flags.String("redirect-uri", auth.DefaultRedirectURI, "loopback redirect URI registered for this OAuth client")
-	credentialPath := flags.String("credential-path", auth.DefaultCredentialPath(), "isolated POC credential path")
+	credentialPath := flags.String("credential-path", auth.DefaultPOCCredentialPath(), "isolated POC credential path")
 	oauthProfile := flags.String("oauth-profile", string(auth.DefaultProfile), "OAuth profile: antigravity or custom")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -158,7 +158,7 @@ func runAuth(args []string) error {
 func runAuthStatus(args []string) error {
 	flags := flag.NewFlagSet("auth-status", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	credentialPath := flags.String("credential-path", auth.DefaultCredentialPath(), "isolated POC credential path")
+	credentialPath := flags.String("credential-path", auth.DefaultPOCCredentialPath(), "isolated POC credential path")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -182,7 +182,7 @@ func runModels(args []string) error {
 	flags := flag.NewFlagSet("models", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	endpoint := flags.String("endpoint", cloudcode.DefaultEndpoint, "CloudCode endpoint")
-	credentialPath := flags.String("credential-path", auth.DefaultCredentialPath(), "isolated POC credential path")
+	credentialPath := flags.String("credential-path", auth.DefaultPOCCredentialPath(), "isolated POC credential path")
 	oauthProfile := flags.String("oauth-profile", string(auth.DefaultProfile), "OAuth profile: antigravity or custom")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -243,7 +243,7 @@ func parseProbeArgs(args []string) (probeCommandOptions, error) {
 	endpoint := flags.String("endpoint", cloudcode.DefaultEndpoint, "CloudCode endpoint")
 	toolTest := flags.Bool("tool-test", false, "enable only the safe get_test_value function-call round trip")
 	timeout := flags.Duration("timeout", 90*time.Second, "probe timeout")
-	credentialPath := flags.String("credential-path", auth.DefaultCredentialPath(), "isolated POC credential path")
+	credentialPath := flags.String("credential-path", auth.DefaultPOCCredentialPath(), "isolated POC credential path")
 	oauthProfile := flags.String("oauth-profile", string(auth.DefaultProfile), "OAuth profile: antigravity or custom")
 	if err := flags.Parse(args); err != nil {
 		return probeCommandOptions{}, err
@@ -303,7 +303,7 @@ func runProbe(args []string) (probe.Result, error) {
 func runLogout(args []string) error {
 	flags := flag.NewFlagSet("logout", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	credentialPath := flags.String("credential-path", auth.DefaultCredentialPath(), "isolated POC credential path")
+	credentialPath := flags.String("credential-path", auth.DefaultPOCCredentialPath(), "isolated POC credential path")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}

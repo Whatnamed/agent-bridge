@@ -374,6 +374,17 @@ func (c Credentials) AccessTokenUsable(now time.Time) bool {
 }
 
 func DefaultCredentialPath() string {
+	return filepath.Join(agentBridgeLocalDataDir(), "antigravity", "oauth_creds.json")
+}
+
+// DefaultPOCCredentialPath preserves the original isolated credential location
+// used by the OAuth POC. It is intentionally separate from the production
+// provider path so a production migration never overwrites the live POC file.
+func DefaultPOCCredentialPath() string {
+	return filepath.Join(agentBridgeLocalDataDir(), "agy-poc", "oauth_creds.json")
+}
+
+func agentBridgeLocalDataDir() string {
 	base := strings.TrimSpace(os.Getenv("LOCALAPPDATA"))
 	if base == "" {
 		if configDir, err := os.UserConfigDir(); err == nil {
@@ -385,20 +396,20 @@ func DefaultCredentialPath() string {
 			base = filepath.Join(home, ".config")
 		}
 	}
-	return filepath.Join(base, "AgentBridge", "agy-poc", "oauth_creds.json")
+	return filepath.Join(base, "AgentBridge")
 }
 
 func LoadCredentials(path string) (Credentials, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return Credentials{}, fmt.Errorf("read POC credentials: %w", err)
+		return Credentials{}, fmt.Errorf("read OAuth credentials: %w", err)
 	}
 	var credentials Credentials
 	if err := json.Unmarshal(data, &credentials); err != nil {
-		return Credentials{}, fmt.Errorf("decode POC credentials: %w", err)
+		return Credentials{}, fmt.Errorf("decode OAuth credentials: %w", err)
 	}
 	if credentials.AccessToken == "" && credentials.RefreshToken == "" {
-		return Credentials{}, errors.New("POC credentials do not contain usable OAuth material")
+		return Credentials{}, errors.New("OAuth credentials do not contain usable OAuth material")
 	}
 	return credentials, nil
 }
@@ -412,21 +423,21 @@ func SaveCredentials(path string, credentials Credentials) error {
 	}
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0700); err != nil {
-		return fmt.Errorf("create POC credential directory: %w", err)
+		return fmt.Errorf("create OAuth credential directory: %w", err)
 	}
 	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("refusing to replace a symlinked POC credential file")
+		return errors.New("refusing to replace a symlinked OAuth credential file")
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect POC credential file: %w", err)
+		return fmt.Errorf("inspect OAuth credential file: %w", err)
 	}
 
 	data, err := json.MarshalIndent(credentials, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encode POC credentials: %w", err)
+		return fmt.Errorf("encode OAuth credentials: %w", err)
 	}
 	temporary, err := os.CreateTemp(directory, ".oauth_creds-*.tmp")
 	if err != nil {
-		return fmt.Errorf("create temporary POC credential file: %w", err)
+		return fmt.Errorf("create temporary OAuth credential file: %w", err)
 	}
 	temporaryPath := temporary.Name()
 	defer func() {
@@ -434,19 +445,19 @@ func SaveCredentials(path string, credentials Credentials) error {
 		_ = os.Remove(temporaryPath)
 	}()
 	if err := temporary.Chmod(0600); err != nil {
-		return fmt.Errorf("restrict temporary POC credential file: %w", err)
+		return fmt.Errorf("restrict temporary OAuth credential file: %w", err)
 	}
 	if _, err := temporary.Write(data); err != nil {
-		return fmt.Errorf("write POC credentials: %w", err)
+		return fmt.Errorf("write OAuth credentials: %w", err)
 	}
 	if err := temporary.Sync(); err != nil {
-		return fmt.Errorf("flush POC credentials: %w", err)
+		return fmt.Errorf("flush OAuth credentials: %w", err)
 	}
 	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("close POC credentials: %w", err)
+		return fmt.Errorf("close OAuth credentials: %w", err)
 	}
 	if err := os.Rename(temporaryPath, path); err != nil {
-		return fmt.Errorf("commit POC credentials: %w", err)
+		return fmt.Errorf("commit OAuth credentials: %w", err)
 	}
 	_ = os.Chmod(path, 0600)
 	return nil
@@ -460,12 +471,12 @@ func DeleteCredentials(path string) error {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
-		return fmt.Errorf("inspect POC credential file: %w", err)
+		return fmt.Errorf("inspect OAuth credential file: %w", err)
 	} else if info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("refusing to delete a symlinked POC credential file")
+		return errors.New("refusing to delete a symlinked OAuth credential file")
 	}
 	if err := os.Remove(path); err != nil {
-		return fmt.Errorf("delete POC credentials: %w", err)
+		return fmt.Errorf("delete OAuth credentials: %w", err)
 	}
 	return nil
 }
@@ -481,6 +492,31 @@ type TokenManager struct {
 	Config     Config
 	HTTPClient *http.Client
 	mu         sync.Mutex
+}
+
+// CredentialStatus contains only non-secret OAuth metadata suitable for
+// diagnostics and telemetry. It deliberately omits both token values.
+type CredentialStatus struct {
+	HasAccessToken  bool
+	HasRefreshToken bool
+	Expiry          time.Time
+	ClientID        string
+}
+
+func (m *TokenManager) CredentialStatus() (CredentialStatus, error) {
+	if m == nil {
+		return CredentialStatus{}, errors.New("OAuth token manager is nil")
+	}
+	credentials, err := LoadCredentials(m.Path)
+	if err != nil {
+		return CredentialStatus{}, err
+	}
+	return CredentialStatus{
+		HasAccessToken:  strings.TrimSpace(credentials.AccessToken) != "",
+		HasRefreshToken: strings.TrimSpace(credentials.RefreshToken) != "",
+		Expiry:          credentials.Expiry(),
+		ClientID:        credentials.ClientID,
+	}, nil
 }
 
 func (m *TokenManager) AccessToken(ctx context.Context) (string, error) {
@@ -529,7 +565,7 @@ func (m *TokenManager) refreshLocked(ctx context.Context, credentials Credential
 	}
 	token, err := RefreshAccessToken(ctx, clientConfig, credentials.RefreshToken)
 	if err != nil {
-		return fmt.Errorf("refresh POC OAuth token: %w", err)
+		return fmt.Errorf("refresh OAuth token: %w", err)
 	}
 	if token.RefreshToken == "" {
 		token.RefreshToken = credentials.RefreshToken

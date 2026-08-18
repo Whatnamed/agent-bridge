@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/whatnamed/agent-bridge/agy/internal/cloudcode"
+	"github.com/whatnamed/agent-bridge/shared/antigravity/cloudcode"
 )
 
 const (
@@ -26,34 +26,50 @@ type Config struct {
 }
 
 type Result struct {
-	Status              string `json:"status"`
-	Endpoint            string `json:"endpoint"`
-	RequestedModel      string `json:"requested_model"`
-	ResolvedModel       string `json:"resolved_model,omitempty"`
-	ActualUpstreamModel string `json:"actual_upstream_model,omitempty"`
-	ModelResolution     string `json:"model_resolution"`
-	LoadCodeAssistMS    int64  `json:"load_code_assist_ms,omitempty"`
-	FetchModelsMS       int64  `json:"fetch_models_ms,omitempty"`
-	RequestToHeadersMS  int64  `json:"request_to_headers_ms,omitempty"`
-	FirstSSEEventMS     int64  `json:"first_sse_event_ms,omitempty"`
-	FirstTextMS         int64  `json:"first_text_ms,omitempty"`
-	FirstReasoningMS    int64  `json:"first_reasoning_ms,omitempty"`
-	TTFTMS              int64  `json:"ttft_ms,omitempty"`
-	CompletionMS        int64  `json:"completion_ms,omitempty"`
-	GenerationTotalMS   int64  `json:"generation_total_ms,omitempty"`
-	WholeProbeTotalMS   int64  `json:"whole_probe_total_ms,omitempty"`
-	InputTokens         int64  `json:"input_tokens,omitempty"`
-	OutputTokens        int64  `json:"output_tokens,omitempty"`
-	ThinkingTokens      int64  `json:"thinking_tokens,omitempty"`
-	CachedTokens        int64  `json:"cached_tokens,omitempty"`
-	TotalTokens         int64  `json:"total_tokens,omitempty"`
-	FinishReason        string `json:"finish_reason,omitempty"`
-	ResponseText        string `json:"response_text,omitempty"`
-	ReasoningText       string `json:"reasoning_text,omitempty"`
-	ToolTestRequested   bool   `json:"tool_test_requested,omitempty"`
-	ToolCallName        string `json:"tool_call_name,omitempty"`
-	ToolRoundTrip       bool   `json:"tool_round_trip,omitempty"`
-	Cancelled           bool   `json:"cancelled,omitempty"`
+	Status                        string         `json:"status"`
+	Endpoint                      string         `json:"endpoint"`
+	RequestedModel                string         `json:"requested_model"`
+	ResolvedModel                 string         `json:"resolved_model,omitempty"`
+	ActualUpstreamModel           string         `json:"actual_upstream_model,omitempty"`
+	ModelResolution               string         `json:"model_resolution"`
+	LoadCodeAssistMS              int64          `json:"load_code_assist_ms,omitempty"`
+	FetchModelsMS                 int64          `json:"fetch_models_ms,omitempty"`
+	RequestToHeadersMS            int64          `json:"request_to_headers_ms,omitempty"`
+	FirstSSEEventMS               int64          `json:"first_sse_event_ms,omitempty"`
+	FirstTextMS                   int64          `json:"first_text_ms,omitempty"`
+	FirstReasoningMS              int64          `json:"first_reasoning_ms,omitempty"`
+	TTFTMS                        int64          `json:"ttft_ms,omitempty"`
+	CompletionMS                  int64          `json:"completion_ms,omitempty"`
+	GenerationTotalMS             int64          `json:"generation_total_ms,omitempty"`
+	WholeProbeTotalMS             int64          `json:"whole_probe_total_ms,omitempty"`
+	InputTokens                   int64          `json:"input_tokens,omitempty"`
+	OutputTokens                  int64          `json:"output_tokens,omitempty"`
+	ThinkingTokens                int64          `json:"thinking_tokens,omitempty"`
+	CachedTokens                  int64          `json:"cached_tokens,omitempty"`
+	TotalTokens                   int64          `json:"total_tokens,omitempty"`
+	FinishReason                  string         `json:"finish_reason,omitempty"`
+	ResponseText                  string         `json:"response_text,omitempty"`
+	ReasoningText                 string         `json:"reasoning_text,omitempty"`
+	ToolTestRequested             bool           `json:"tool_test_requested,omitempty"`
+	ToolCallName                  string         `json:"tool_call_name,omitempty"`
+	ToolCallID                    string         `json:"tool_call_id,omitempty"`
+	ToolCallArgs                  map[string]any `json:"tool_call_args,omitempty"`
+	ToolThoughtSignaturePresent   bool           `json:"tool_thought_signature_present,omitempty"`
+	ToolThoughtSignatureUsed      bool           `json:"tool_thought_signature_used,omitempty"`
+	ToolInitialUsage              *UsageSnapshot `json:"tool_initial_usage,omitempty"`
+	ToolContinuationUsage         *UsageSnapshot `json:"tool_continuation_usage,omitempty"`
+	ToolRoundTrip                 bool           `json:"tool_round_trip,omitempty"`
+	RawSSEHasReplacementCharacter bool           `json:"raw_sse_has_replacement_character"`
+	ParserHasReplacementCharacter bool           `json:"parser_has_replacement_character"`
+	Cancelled                     bool           `json:"cancelled,omitempty"`
+}
+
+type UsageSnapshot struct {
+	InputTokens    int64 `json:"input_tokens,omitempty"`
+	OutputTokens   int64 `json:"output_tokens,omitempty"`
+	ThinkingTokens int64 `json:"thinking_tokens,omitempty"`
+	CachedTokens   int64 `json:"cached_tokens,omitempty"`
+	TotalTokens    int64 `json:"total_tokens,omitempty"`
 }
 
 func Run(ctx context.Context, client *cloudcode.Client, config Config) (result Result, err error) {
@@ -153,10 +169,20 @@ func Run(ctx context.Context, client *cloudcode.Client, config Config) (result R
 		return resultWithError(ctx, result, errors.New("get_test_value call did not contain a non-empty name"))
 	}
 	result.ToolCallName = call.Name
+	result.ToolCallID = call.ID
+	result.ToolCallArgs = call.Args
+	result.ToolInitialUsage = snapshotUsage(first.usage)
 
 	assistantContent := first.assistantToolContent()
 	if len(assistantContent.Parts) == 0 {
 		return resultWithError(ctx, result, errors.New("tool call response did not contain assistant content for continuation"))
+	}
+	for _, part := range assistantContent.Parts {
+		if part.ThoughtSignature != "" {
+			result.ToolThoughtSignaturePresent = true
+			result.ToolThoughtSignatureUsed = true
+			break
+		}
 	}
 	continuation := request
 	continuation.RequestID, err = cloudcode.NewRequestID()
@@ -180,6 +206,7 @@ func Run(ctx context.Context, client *cloudcode.Client, config Config) (result R
 		return resultWithError(ctx, result, err)
 	}
 	result.ToolRoundTrip = true
+	result.ToolContinuationUsage = snapshotUsage(second.usage)
 	result.ThinkingTokens += second.usage.ThinkingTokens
 	result.InputTokens += second.usage.InputTokens
 	result.OutputTokens += second.usage.OutputTokens
@@ -189,6 +216,16 @@ func Run(ctx context.Context, client *cloudcode.Client, config Config) (result R
 		result.FinishReason = second.finishReason
 	}
 	return result, nil
+}
+
+func snapshotUsage(usage cloudcode.Usage) *UsageSnapshot {
+	return &UsageSnapshot{
+		InputTokens:    usage.InputTokens,
+		OutputTokens:   usage.OutputTokens,
+		ThinkingTokens: usage.ThinkingTokens,
+		CachedTokens:   usage.CachedTokens,
+		TotalTokens:    usage.TotalTokens,
+	}
 }
 
 type streamSummary struct {
@@ -222,12 +259,18 @@ func consumeStream(ctx context.Context, client *cloudcode.Client, request cloudc
 			return summary, err
 		}
 		if event.Done {
+			if stream.HasReplacementCharacter() {
+				result.RawSSEHasReplacementCharacter = true
+			}
 			result.CompletionMS = elapsedMilliseconds(generationStart)
 			result.GenerationTotalMS = result.CompletionMS
 			break
 		}
 		if result.FirstSSEEventMS == 0 {
 			result.FirstSSEEventMS = elapsedMilliseconds(generationStart)
+		}
+		if strings.ContainsRune(event.Text, '\ufffd') || strings.ContainsRune(event.Reasoning, '\ufffd') {
+			result.ParserHasReplacementCharacter = true
 		}
 		if event.Text != "" {
 			if result.FirstTextMS == 0 {
@@ -251,6 +294,9 @@ func consumeStream(ctx context.Context, client *cloudcode.Client, request cloudc
 	}
 	result.ResponseText += summary.text
 	result.ReasoningText += summary.reasoning
+	if stream.HasReplacementCharacter() {
+		result.RawSSEHasReplacementCharacter = true
+	}
 	return summary, nil
 }
 

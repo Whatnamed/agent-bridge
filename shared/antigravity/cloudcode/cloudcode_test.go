@@ -32,12 +32,30 @@ func TestSSEDecoderPreservesUTF8AcrossReadBoundaries(t *testing.T) {
 	if strings.ContainsRune(event.Text, '\uFFFD') {
 		t.Fatalf("replacement character found in UTF-8 text: %q", event.Text)
 	}
+	if decoder.HasReplacementCharacter() {
+		t.Fatal("clean UTF-8 stream was marked as containing a replacement character")
+	}
 	done, err := decoder.Next()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(bytes.TrimSpace(done.Data), []byte("[DONE]")) {
 		t.Fatalf("unexpected done event: %q", done.Data)
+	}
+}
+
+func TestSSEDecoderDetectsReplacementCharacterInRawData(t *testing.T) {
+	payload := []byte(`data: {"response":{"candidates":[{"content":{"parts":[{"text":"bad `)
+	payload = append(payload, 0xef, 0xbf, 0xbd)
+	payload = append(payload, []byte(`"}]}}]}}
+
+`)...)
+	decoder := NewSSEDecoder(bytes.NewReader(payload))
+	if _, err := decoder.Next(); err != nil {
+		t.Fatal(err)
+	}
+	if !decoder.HasReplacementCharacter() {
+		t.Fatal("raw SSE replacement character was not detected")
 	}
 }
 

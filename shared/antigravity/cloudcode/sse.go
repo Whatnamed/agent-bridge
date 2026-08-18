@@ -15,10 +15,9 @@ type SSEEvent struct {
 // UTF-8 text split across network reads: converting each read to a string
 // would risk inserting replacement characters before the event is complete.
 type SSEDecoder struct {
-	reader   *bufio.Reader
-	data     bytes.Buffer
-	eof      bool
-	dispatch bool
+	reader                   *bufio.Reader
+	data                     bytes.Buffer
+	replacementCharacterSeen bool
 }
 
 func NewSSEDecoder(reader io.Reader) *SSEDecoder {
@@ -32,6 +31,9 @@ func (d *SSEDecoder) Next() (SSEEvent, error) {
 	for {
 		line, err := d.reader.ReadBytes('\n')
 		if len(line) > 0 {
+			if bytes.Contains(line, []byte{0xef, 0xbf, 0xbd}) || bytes.Contains(bytes.ToLower(line), []byte(`\ufffd`)) {
+				d.replacementCharacterSeen = true
+			}
 			line = bytes.TrimSuffix(line, []byte{'\n'})
 			line = bytes.TrimSuffix(line, []byte{'\r'})
 			if len(line) == 0 {
@@ -59,6 +61,10 @@ func (d *SSEDecoder) Next() (SSEEvent, error) {
 			return SSEEvent{}, err
 		}
 	}
+}
+
+func (d *SSEDecoder) HasReplacementCharacter() bool {
+	return d != nil && d.replacementCharacterSeen
 }
 
 func (d *SSEDecoder) takeEvent() SSEEvent {

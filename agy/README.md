@@ -1,6 +1,6 @@
 # AGY OAuth / CloudCode POC
 
-这是 `agent-bridge` monorepo 下完全隔离的 Google Antigravity/CloudCode 研究性 POC。
+这是 `agent-bridge` monorepo 下的 Google Antigravity/CloudCode 研究性 POC。经过 live 验证的 OAuth/CloudCode 实现位于 `shared/antigravity`，POC CLI 和 monitor 的可选 Direct OAuth provider 共同复用这一份代码。
 
 它只负责验证：
 
@@ -9,11 +9,11 @@
 3. `compat` 与 `minimal` 两种请求形态；
 4. 一个无文件系统、无 shell、无网络工具的 `get_test_value(name)` function-call 往返。
 
-它不是 monitor/controller 的替代品，也不是服务、托盘程序、代理网关、账号池或生产集成。
+它不是 controller 的替代品，也不是独立服务、托盘程序、账号池或第二个代理网关；monitor 仍是唯一的 `127.0.0.1:18080` 服务。
 
 ## 严格边界
 
-- 本目录是独立 Go module，只修改 `agy\`；不修改 `monitor\`、`controller\`、根仓库运行逻辑或现有 `127.0.0.1:18080`。
+- 本目录仍是独立 POC Go module；`shared/antigravity` 是被 POC 与 monitor 复用的 library，不创建额外进程或监听端口。POC CLI 不负责启动 monitor/controller。
 - 不调用、读取、复制或解析已安装 AGY CLI 的 Credential Manager 凭据。
 - 不读取 Codex/ZCode 配置或 `auth.json`，不修改 PATH、系统环境、防火墙或监听配置。
 - `antigravity` profile 使用当前直接 OAuth 实现采用的 desktop-client 配置和 CloudCode scopes；它仍然通过本 POC 自己的 browser OAuth + PKCE 流程创建一套新 token。不会复用已安装 AGY CLI 的 token。
@@ -23,6 +23,15 @@
   （代码使用 `LOCALAPPDATA`/`os.UserConfigDir` 解析，不硬编码当前用户名）。文件通过临时文件原子替换写入，并请求 `0600`；Windows 上仍应依赖并检查用户 profile 的 ACL。`logout` 只删除这个文件。
 - POC 不写持久日志；终端输出只包含脱敏状态、模型/延迟/usage/响应文本。不会输出 token、Authorization header 或完整请求头。probe 的 prompt 不写入任何日志。
 - `auth` / `models` / `probe` 的真实调用必须由用户明确执行；`go test ./...` 和 `go vet ./...` 不触发真实 OAuth 或生成请求。
+
+如果要为 monitor 建立 production 凭据，必须显式指定新的 production 路径；不会自动复制或覆盖现有 POC 凭据：
+
+```powershell
+$productionCredential = Join-Path $env:LOCALAPPDATA 'AgentBridge\antigravity\oauth_creds.json'
+go run .\cmd\agy-oauth-poc auth --credential-path $productionCredential
+```
+
+这仍然是本 POC 自己的新 browser OAuth + PKCE token；monitor 不调用 POC CLI，也不会在请求热路径读取 AGY CLI Credential Manager。
 
 ## OAuth profiles
 
@@ -142,6 +151,6 @@ go vet ./...
 
 ## 参考与当前限制
 
-请求骨架参考当前公开的 Antigravity direct-OAuth/CloudCode 实现；OAuth 的 `state`、offline refresh 和 loopback redirect 语义按 Google OAuth 文档实现。profile 只提供 OAuth 配置，不执行 GCP-managed project onboarding、账号轮换、自动 fallback、OpenAI/Responses 代理、托盘控制器或 monitor 集成。
+请求骨架参考当前公开的 Antigravity direct-OAuth/CloudCode 实现；OAuth 的 `state`、offline refresh 和 loopback redirect 语义按 Google OAuth 文档实现。POC profile 不执行 GCP-managed project onboarding、账号轮换或自动 fallback；monitor 的 production provider 只复用共享 OAuth/CloudCode library，不启动第二个 OpenAI/Responses 代理或 CloudCode 服务。
 
-只有在离线测试通过、用户明确选择并完成独立 OAuth、并且 compat/minimal/tool 的 live 证据都通过后，才有理由讨论后续集成；本轮不会自行开始真实 OAuth 或 live generation。
+只有在离线测试通过、用户明确选择并完成独立 OAuth、并且 compat/minimal/tool 的 live 证据都通过后，才有理由启用 monitor 的 Direct OAuth provider；本轮不会自行开始真实 OAuth 或 live generation。

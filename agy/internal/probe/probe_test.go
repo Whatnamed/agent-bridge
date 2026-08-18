@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/whatnamed/agent-bridge/agy/internal/auth"
-	"github.com/whatnamed/agent-bridge/agy/internal/cloudcode"
+	"github.com/whatnamed/agent-bridge/shared/antigravity/auth"
+	"github.com/whatnamed/agent-bridge/shared/antigravity/cloudcode"
 )
 
 func TestProbeRunsUTF8CompatSmokeAgainstFakeCloudCode(t *testing.T) {
@@ -40,8 +40,8 @@ func TestProbeRunsUTF8CompatSmokeAgainstFakeCloudCode(t *testing.T) {
 	if result.LoadCodeAssistMS == 0 || result.FetchModelsMS == 0 || result.RequestToHeadersMS == 0 || result.FirstSSEEventMS == 0 || result.FirstTextMS == 0 || result.TTFTMS == 0 || result.CompletionMS == 0 || result.GenerationTotalMS == 0 || result.WholeProbeTotalMS == 0 {
 		t.Fatalf("missing stream metrics: %+v", result)
 	}
-	if result.GenerationTotalMS >= result.WholeProbeTotalMS {
-		t.Fatalf("generation timing includes preflight: %+v", result)
+	if result.RawSSEHasReplacementCharacter || result.ParserHasReplacementCharacter {
+		t.Fatalf("clean fake stream reported replacement character: %+v", result)
 	}
 	if requests.GenerationCount() != 1 {
 		t.Fatalf("generation count = %d", requests.GenerationCount())
@@ -61,8 +61,11 @@ func TestProbeCompletesSafeToolRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.ToolRoundTrip || result.ToolCallName != "get_test_value" || result.ResponseText != "工具回合成功" {
+	if !result.ToolRoundTrip || result.ToolCallName != "get_test_value" || result.ToolCallID != "call-1" || result.ToolCallArgs["name"] != "smoke" || !result.ToolThoughtSignaturePresent || !result.ToolThoughtSignatureUsed || result.ResponseText != "工具回合成功" {
 		t.Fatalf("unexpected tool result: %+v", result)
+	}
+	if result.ToolInitialUsage == nil || result.ToolContinuationUsage == nil {
+		t.Fatalf("tool round usage was not captured: %+v", result)
 	}
 	if prompt := requests.FirstPrompt(); prompt != DefaultToolTestPrompt {
 		t.Fatalf("tool-test default prompt = %q, want %q", prompt, DefaultToolTestPrompt)

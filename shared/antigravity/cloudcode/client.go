@@ -127,6 +127,14 @@ func NewRequestID() (string, error) {
 	return fmt.Sprintf("agent/%s/%d/%s/1", conversationID, time.Now().UnixMilli(), trajectoryID), nil
 }
 
+// NewSessionID returns a fresh CloudCode conversation identifier for a
+// provider request. It is separate from the request id so callers can keep
+// one session across a function-call continuation when the upstream contract
+// requires it.
+func NewSessionID() (string, error) {
+	return randomHex(16)
+}
+
 func randomHex(size int) (string, error) {
 	b := make([]byte, size)
 	if _, err := rand.Read(b); err != nil {
@@ -300,6 +308,10 @@ func (s *Stream) Close() error {
 		return nil
 	}
 	return s.response.Body.Close()
+}
+
+func (s *Stream) HasReplacementCharacter() bool {
+	return s != nil && s.decoder != nil && s.decoder.HasReplacementCharacter()
 }
 
 func parseEvent(data []byte) (Event, error) {
