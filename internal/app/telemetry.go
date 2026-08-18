@@ -37,14 +37,13 @@ type telemetryContextKey struct{}
 type requestIdentityContextKey struct{}
 
 type requestIdentity struct {
-	SessionID        string
-	SessionSource    string
-	ThreadID         string
-	ClientRequestID  string
-	ClientRequestSrc string
-	ZCodeRequestID   string
-	ZCodeQueryID     string
-	PromptCacheKey   string
+	SessionID       string
+	SessionSource   string
+	ThreadID        string
+	ClientRequestID string
+	ZCodeRequestID  string
+	ZCodeQueryID    string
+	PromptCacheKey  string
 }
 
 type requestRecord struct {
@@ -59,17 +58,19 @@ type requestRecord struct {
 	ResponseBytes     int64     `json:"response_bytes"`
 	Stream            bool      `json:"stream"`
 
-	Model                     string         `json:"model"`
-	RequestedReasoningEffort  *string        `json:"requested_reasoning_effort"`
-	RequestedReasoningSummary *string        `json:"requested_reasoning_summary"`
-	TextVerbosity             *string        `json:"text_verbosity"`
-	PreviousResponseIDPresent bool           `json:"previous_response_id_present"`
-	PromptCacheKeyPresent     bool           `json:"prompt_cache_key_present"`
-	PromptCacheKeyHash        string         `json:"prompt_cache_key_hash,omitempty"`
-	ToolCount                 int            `json:"tool_count"`
-	ToolTypes                 map[string]int `json:"tool_types"`
-	ParallelToolCalls         *bool          `json:"parallel_tool_calls"`
-	ClientType                string         `json:"client_type"`
+	Model                         string         `json:"model"`
+	RequestedReasoningEffort      *string        `json:"requested_reasoning_effort"`
+	RequestedReasoningSummary     *string        `json:"requested_reasoning_summary"`
+	TextVerbosity                 *string        `json:"text_verbosity"`
+	PreviousResponseIDPresent     bool           `json:"previous_response_id_present"`
+	IncomingPromptCacheKeyPresent bool           `json:"incoming_prompt_cache_key_present"`
+	IncomingPromptCacheKeyHash    string         `json:"incoming_prompt_cache_key_hash,omitempty"`
+	UpstreamPromptCacheKeyPresent bool           `json:"upstream_prompt_cache_key_present"`
+	UpstreamPromptCacheKeyHash    string         `json:"upstream_prompt_cache_key_hash,omitempty"`
+	ToolCount                     int            `json:"tool_count"`
+	ToolTypes                     map[string]int `json:"tool_types"`
+	ParallelToolCalls             *bool          `json:"parallel_tool_calls"`
+	ClientType                    string         `json:"client_type"`
 
 	IncomingSessionSource       string `json:"incoming_session_source,omitempty"`
 	IncomingSessionIDHash       string `json:"incoming_session_id_hash,omitempty"`
@@ -211,30 +212,19 @@ func requestIdentityFromHeaders(headers http.Header) requestIdentity {
 		"x-session-id",
 	)
 	threadID, _ := firstHeader(headers, "thread-id")
-	clientRequestID, clientRequestSource := firstHeader(headers, "x-client-request-id")
+	clientRequestID, _ := firstHeader(headers, "x-client-request-id")
 	zcodeRequestID, _ := firstHeader(headers, "x-request-id")
 	zcodeQueryID, _ := firstHeader(headers, "x-query-id")
 	if threadID != "" {
 		clientRequestID = threadID
-		clientRequestSource = "thread-id"
-	} else if clientRequestID == "" {
-		switch {
-		case zcodeRequestID != "":
-			clientRequestID = zcodeRequestID
-			clientRequestSource = "x-request-id"
-		case zcodeQueryID != "":
-			clientRequestID = zcodeQueryID
-			clientRequestSource = "x-query-id"
-		}
 	}
 	return requestIdentity{
-		SessionID:        sessionID,
-		SessionSource:    sessionSource,
-		ThreadID:         threadID,
-		ClientRequestID:  clientRequestID,
-		ClientRequestSrc: clientRequestSource,
-		ZCodeRequestID:   zcodeRequestID,
-		ZCodeQueryID:     zcodeQueryID,
+		SessionID:       sessionID,
+		SessionSource:   sessionSource,
+		ThreadID:        threadID,
+		ClientRequestID: clientRequestID,
+		ZCodeRequestID:  zcodeRequestID,
+		ZCodeQueryID:    zcodeQueryID,
 	}
 }
 
@@ -937,8 +927,9 @@ func (t *requestTelemetry) observeRequest(body map[string]any, endpoint string) 
 	t.record.Model = stringValue(body["model"])
 	t.record.Stream = boolValue(body["stream"])
 	t.record.PreviousResponseIDPresent = strings.TrimSpace(stringValue(body["previous_response_id"])) != ""
-	t.record.PromptCacheKeyPresent = strings.TrimSpace(stringValue(body["prompt_cache_key"])) != ""
-	t.record.PromptCacheKeyHash = safeIDHash(stringValue(body["prompt_cache_key"]))
+	incomingPromptCacheKey := strings.TrimSpace(stringValue(body["prompt_cache_key"]))
+	t.record.IncomingPromptCacheKeyPresent = incomingPromptCacheKey != ""
+	t.record.IncomingPromptCacheKeyHash = safeIDHash(incomingPromptCacheKey)
 	t.record.InputPrefixHash = safeJSONPrefixHash(body["input"])
 	t.record.InstructionsHash = safeJSONPrefixHash(body["instructions"])
 	t.record.ToolsHash = safeJSONPrefixHash(body["tools"])
@@ -994,10 +985,9 @@ func (t *requestTelemetry) observePrepared(payload map[string]any) {
 	t.record.PreparedInstructionsHash = safeJSONPrefixHash(payload["instructions"])
 	t.record.PreparedToolsHash = safeJSONPrefixHash(payload["tools"])
 	t.record.PreparedRequestShapeHash = requestShapeHash(payload)
-	if value := stringValue(payload["prompt_cache_key"]); value != "" {
-		t.record.PromptCacheKeyPresent = true
-		t.record.PromptCacheKeyHash = safeIDHash(value)
-	}
+	upstreamPromptCacheKey := strings.TrimSpace(stringValue(payload["prompt_cache_key"]))
+	t.record.UpstreamPromptCacheKeyPresent = upstreamPromptCacheKey != ""
+	t.record.UpstreamPromptCacheKeyHash = safeIDHash(upstreamPromptCacheKey)
 	if reasoning := mapAny(payload["reasoning"]); reasoning != nil {
 		if value := stringValue(reasoning["effort"]); value != "" {
 			t.record.UpstreamReasoningEffort = stringPointer(value)

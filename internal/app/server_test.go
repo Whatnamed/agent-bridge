@@ -286,6 +286,13 @@ func TestBackendHeadersForwardPromptCacheKey(t *testing.T) {
 	if headers.Get("session-id") != "session-123" || headers.Get("thread-id") != "thread-123" || headers.Get("x-client-request-id") != "thread-123" || headers.Get("session_id") != "" {
 		t.Fatalf("headers = %#v", headers)
 	}
+	withoutThread := b.headers(credentials{AccessToken: "token"}, true, requestIdentity{
+		SessionID:       "session-123",
+		ClientRequestID: "request-123",
+	})
+	if withoutThread.Get("session-id") != "session-123" || withoutThread.Get("thread-id") != "" || withoutThread.Get("x-client-request-id") != "" {
+		t.Fatalf("headers without thread = %#v", withoutThread)
+	}
 }
 
 func TestNormalizeBackendEventDropsUnknownStatus(t *testing.T) {

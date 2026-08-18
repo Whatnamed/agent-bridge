@@ -101,10 +101,9 @@ func TestTelemetryRecordsAffinityAndShapeFingerprintsWithoutValues(t *testing.T)
 	request.Header.Set("x-query-id", "zcode-query-secret")
 	telemetry := store.begin(request, "/v1/responses")
 	telemetry.observeRequest(map[string]any{
-		"model":            "gpt-5.6-luna",
-		"input":            "PRIVATE INPUT PREFIX",
-		"instructions":     "PRIVATE INSTRUCTIONS",
-		"prompt_cache_key": "PRIVATE CACHE KEY",
+		"model":        "gpt-5.6-luna",
+		"input":        "PRIVATE INPUT PREFIX",
+		"instructions": "PRIVATE INSTRUCTIONS",
 		"tools": []any{map[string]any{
 			"type": "function",
 			"function": map[string]any{
@@ -122,7 +121,8 @@ func TestTelemetryRecordsAffinityAndShapeFingerprintsWithoutValues(t *testing.T)
 	})
 	telemetry.observeUpstreamRequest(http.Header{
 		"session-id":          []string{"zcode-session-secret"},
-		"x-client-request-id": []string{"zcode-request-secret"},
+		"thread-id":           []string{"thread-secret"},
+		"x-client-request-id": []string{"thread-secret"},
 	})
 	capture := &responseCapture{ResponseWriter: httptest.NewRecorder()}
 	_, _ = capture.Write([]byte("ok"))
@@ -133,19 +133,25 @@ func TestTelemetryRecordsAffinityAndShapeFingerprintsWithoutValues(t *testing.T)
 	if record.IncomingSessionIDHash != safeIDHash("zcode-session-secret") || record.IncomingZCodeRequestIDHash != safeIDHash("zcode-request-secret") || record.IncomingZCodeQueryIDHash != safeIDHash("zcode-query-secret") {
 		t.Fatalf("incoming identity fingerprints = %#v", record)
 	}
-	if record.UpstreamSessionIDHash != safeIDHash("zcode-session-secret") || record.UpstreamLegacySessionIDHash != "" || record.UpstreamClientRequestIDHash != safeIDHash("zcode-request-secret") {
+	if record.UpstreamSessionIDHash != safeIDHash("zcode-session-secret") || record.UpstreamLegacySessionIDHash != "" || record.UpstreamThreadIDHash != safeIDHash("thread-secret") || record.UpstreamClientRequestIDHash != safeIDHash("thread-secret") {
 		t.Fatalf("upstream identity fingerprints = %#v", record)
 	}
+	if record.IncomingPromptCacheKeyPresent || record.IncomingPromptCacheKeyHash != "" {
+		t.Fatalf("incoming prompt cache key should be absent: %#v", record)
+	}
+	if !record.UpstreamPromptCacheKeyPresent || record.UpstreamPromptCacheKeyHash != safeIDHash("PRIVATE CACHE KEY") {
+		t.Fatalf("upstream prompt cache key = %#v", record)
+	}
 	for name, value := range map[string]string{
-		"prompt_cache_key":       record.PromptCacheKeyHash,
-		"input_prefix":           record.InputPrefixHash,
-		"instructions":           record.InstructionsHash,
-		"tools":                  record.ToolsHash,
-		"request_shape":          record.RequestShapeHash,
-		"prepared_input_prefix":  record.PreparedInputPrefixHash,
-		"prepared_instructions":  record.PreparedInstructionsHash,
-		"prepared_tools":         record.PreparedToolsHash,
-		"prepared_request_shape": record.PreparedRequestShapeHash,
+		"upstream_prompt_cache_key": record.UpstreamPromptCacheKeyHash,
+		"input_prefix":              record.InputPrefixHash,
+		"instructions":              record.InstructionsHash,
+		"tools":                     record.ToolsHash,
+		"request_shape":             record.RequestShapeHash,
+		"prepared_input_prefix":     record.PreparedInputPrefixHash,
+		"prepared_instructions":     record.PreparedInstructionsHash,
+		"prepared_tools":            record.PreparedToolsHash,
+		"prepared_request_shape":    record.PreparedRequestShapeHash,
 	} {
 		if value == "" {
 			t.Fatalf("missing %s fingerprint: %#v", name, record)
@@ -159,6 +165,7 @@ func TestTelemetryRecordsAffinityAndShapeFingerprintsWithoutValues(t *testing.T)
 		"zcode-session-secret",
 		"zcode-request-secret",
 		"zcode-query-secret",
+		"thread-secret",
 		"PRIVATE INPUT PREFIX",
 		"PRIVATE INSTRUCTIONS",
 		"PRIVATE CACHE KEY",

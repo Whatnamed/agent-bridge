@@ -63,13 +63,7 @@ func (b *backend) headers(cred credentials, stream bool, identity requestIdentit
 	}
 	if identity.ThreadID != "" {
 		h.Set("thread-id", identity.ThreadID)
-	}
-	clientRequestID := identity.ClientRequestID
-	if identity.ThreadID != "" {
-		clientRequestID = identity.ThreadID
-	}
-	if clientRequestID != "" {
-		h.Set("x-client-request-id", clientRequestID)
+		h.Set("x-client-request-id", identity.ThreadID)
 	}
 	return h
 }
@@ -129,9 +123,6 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 	identity := upstreamRequestIdentity(ctx, prepared)
 	if stringValue(prepared["prompt_cache_key"]) == "" && identity.PromptCacheKey != "" {
 		prepared["prompt_cache_key"] = identity.PromptCacheKey
-	}
-	if identity.ClientRequestID == "" {
-		identity.ClientRequestID = newID("req")
 	}
 	prepared["stream"], prepared["store"] = true, false
 	setDefault(prepared, "tool_choice", "auto")

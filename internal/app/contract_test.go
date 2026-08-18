@@ -193,7 +193,7 @@ func TestGoHTTPContractResponsesLifecycleAndStreaming(t *testing.T) {
 	if !containsString(sliceAny(upstream.JSON["include"]), "reasoning.encrypted_content") {
 		t.Fatalf("upstream include = %#v", upstream.JSON["include"])
 	}
-	if upstream.Headers.Get("session_id") != "" || upstream.Headers.Get("session-id") != "" || upstream.Headers.Get("thread-id") != "" || upstream.Headers.Get("x-client-request-id") == "" {
+	if upstream.Headers.Get("session_id") != "" || upstream.Headers.Get("session-id") != "" || upstream.Headers.Get("thread-id") != "" || upstream.Headers.Get("x-client-request-id") != "" {
 		t.Fatalf("upstream headers = %#v", upstream.Headers)
 	}
 	if upstream.Headers.Get("ChatGPT-Account-ID") != "acct_go_test" || upstream.Headers.Get("Authorization") == "Bearer "+contractAPIKey {
@@ -309,7 +309,7 @@ func TestGoHTTPContractUsesZCodeSessionForPromptCacheAffinity(t *testing.T) {
 	if upstream.Headers.Get("session-id") != "zcode-session-123" || upstream.Headers.Get("session_id") != "" {
 		t.Fatalf("session headers = %#v", upstream.Headers)
 	}
-	if upstream.Headers.Get("thread-id") != "" || upstream.Headers.Get("x-client-request-id") != "zcode-request-456" {
+	if upstream.Headers.Get("thread-id") != "" || upstream.Headers.Get("x-client-request-id") != "" {
 		t.Fatalf("request headers = %#v", upstream.Headers)
 	}
 }
