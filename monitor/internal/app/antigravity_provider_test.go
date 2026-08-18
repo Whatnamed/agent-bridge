@@ -129,6 +129,16 @@ func TestAntigravityControlPlaneCachesAndListsOnlyStableModels(t *testing.T) {
 	}
 }
 
+func TestProviderModelListKeepsCodexModelsWhenAntigravityCatalogIsUnavailable(t *testing.T) {
+	provider, _, closeServer := newTestAntigravityProvider(t, nil)
+	closeServer()
+	router := &providerRouter{codex: codexModelProvider{backend: testCodexBackend{}}, antigravity: provider}
+	models, err := router.listModels(context.Background())
+	if err != nil || len(models) != 1 || models[0] != "gpt-test" {
+		t.Fatalf("models = %#v err=%v", models, err)
+	}
+}
+
 func TestAntigravityModelResolutionFailsClosedWithoutGeneration(t *testing.T) {
 	provider, fake, closeServer := newTestAntigravityProvider(t, []string{`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"must not run"}]},"finishReason":"STOP"}]}}`})
 	defer closeServer()
@@ -149,7 +159,7 @@ func TestAntigravityModelResolutionFailsClosedWithoutGeneration(t *testing.T) {
 }
 
 func TestAntigravityResponsesAndChatUseTheSameProvider(t *testing.T) {
-	events := []string{`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"你好"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":2,"totalTokenCount":11}}}`}
+	events := []string{`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"你好"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":2,"thoughtsTokenCount":3,"totalTokenCount":14}}}`}
 	provider, fake, closeServer := newTestAntigravityProvider(t, events)
 	defer closeServer()
 	router := &providerRouter{codex: codexModelProvider{backend: testCodexBackend{}}, antigravity: provider}
@@ -160,11 +170,27 @@ func TestAntigravityResponsesAndChatUseTheSameProvider(t *testing.T) {
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "你好") {
 		t.Fatalf("Responses response = %d %s", response.Code, response.Body.String())
 	}
+	var responseDocument map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &responseDocument); err != nil {
+		t.Fatal(err)
+	}
+	responseUsage := mapAny(responseDocument["usage"])
+	if intValue(responseUsage["output_tokens"]) != 5 || intValue(mapAny(responseUsage["output_tokens_details"])["reasoning_tokens"]) != 3 {
+		t.Fatalf("Responses usage = %#v", responseUsage)
+	}
 	chatRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gemini-3.7-flash-high","messages":[{"role":"user","content":"hello"}]}`))
 	chat := httptest.NewRecorder()
 	s.ServeHTTP(chat, chatRequest)
 	if chat.Code != http.StatusOK || !strings.Contains(chat.Body.String(), "你好") {
 		t.Fatalf("Chat response = %d %s", chat.Code, chat.Body.String())
+	}
+	var chatDocument map[string]any
+	if err := json.Unmarshal(chat.Body.Bytes(), &chatDocument); err != nil {
+		t.Fatal(err)
+	}
+	chatUsage := mapAny(chatDocument["usage"])
+	if intValue(chatUsage["completion_tokens"]) != 5 || intValue(mapAny(chatUsage["completion_tokens_details"])["reasoning_tokens"]) != 3 {
+		t.Fatalf("Chat usage = %#v", chatUsage)
 	}
 	fake.mu.Lock()
 	streamCalls := fake.streamCalls
@@ -219,16 +245,30 @@ func TestAntigravityToolReasoningAndSignatureTranslation(t *testing.T) {
 		"model": stableAntigravityModel,
 		"input": []any{
 			map[string]any{"role": "user", "content": "continue"},
-			map[string]any{"type": "function_call_output", "call_id": "call-1", "output": "plain tool value"},
+			map[string]any{"type": "function_call", "call_id": "call-2", "name": "get_test_value", "arguments": `{"name":"smoke"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call-2", "output": "plain tool value"},
 		},
 	}
 	plainRequest, err := buildAntigravityRequest(plainPayload, stableAntigravityModel, "projects/test-project")
 	if err != nil {
 		t.Fatal(err)
 	}
-	plainResponse := plainRequest.Request.Contents[1].Parts[0].FunctionResponse.Response
+	plainResponse := plainRequest.Request.Contents[2].Parts[0].FunctionResponse.Response
 	if plainResponse["output"] != "plain tool value" || plainResponse["_raw"] != nil {
 		t.Fatalf("plain function response = %#v", plainResponse)
+	}
+}
+
+func TestAntigravityFunctionOutputWithoutHistoryFailsClosed(t *testing.T) {
+	_, err := buildAntigravityRequest(map[string]any{
+		"model": stableAntigravityModel,
+		"input": []any{
+			map[string]any{"role": "user", "content": "continue"},
+			map[string]any{"type": "function_call_output", "call_id": "call-without-history", "output": "value"},
+		},
+	}, stableAntigravityModel, "projects/test-project")
+	if err == nil || !strings.Contains(err.Error(), "function name") {
+		t.Fatalf("missing function name was accepted: %v", err)
 	}
 }
 
@@ -259,6 +299,99 @@ func TestAntigravityToolStreamProducesFunctionCallResponse(t *testing.T) {
 	if item["type"] != "function_call" || item["name"] != "get_test_value" || item["thought_signature"] != "sig-1" {
 		t.Fatalf("function output = %#v", item)
 	}
+	types := make([]string, 0, len(received))
+	for _, event := range received {
+		types = append(types, stringValue(event["type"]))
+	}
+	for _, expected := range []string{"response.output_item.added", "response.function_call_arguments.delta", "response.function_call_arguments.done", "response.output_item.done", "response.completed"} {
+		if !containsEventType(types, expected) {
+			t.Fatalf("function stream omitted %q: %#v", expected, types)
+		}
+	}
+}
+
+func TestAntigravityTextStreamUsesCanonicalLifecycle(t *testing.T) {
+	provider, _, closeServer := newTestAntigravityProvider(t, []string{`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason":"STOP"}]}}`})
+	defer closeServer()
+	var received []map[string]any
+	if err := provider.stream(context.Background(), map[string]any{
+		"model": stableAntigravityModel, "input": []any{map[string]any{"role": "user", "content": "say hello"}},
+	}, func(event map[string]any) error {
+		received = append(received, event)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	types := make([]string, 0, len(received))
+	for _, event := range received {
+		types = append(types, stringValue(event["type"]))
+	}
+	for _, expected := range []string{"response.output_item.added", "response.content_part.added", "response.output_text.delta", "response.output_text.done", "response.content_part.done", "response.output_item.done", "response.completed"} {
+		if !containsEventType(types, expected) {
+			t.Fatalf("text stream omitted %q: %#v", expected, types)
+		}
+	}
+}
+
+func containsEventType(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func TestAntigravitySystemDeveloperAndToolChoiceAreExplicitlyTranslated(t *testing.T) {
+	request, err := buildAntigravityRequest(map[string]any{
+		"model":        stableAntigravityModel,
+		"instructions": "top-level instruction",
+		"input": []any{
+			map[string]any{"role": "developer", "content": "developer instruction"},
+			map[string]any{"role": "user", "content": "call the selected tool"},
+		},
+		"tools":       []any{map[string]any{"type": "function", "function": map[string]any{"name": "lookup"}}},
+		"tool_choice": map[string]any{"type": "function", "name": "lookup"},
+	}, stableAntigravityModel, "projects/test-project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(request.Request.Contents) != 1 || request.Request.Contents[0].Role != "user" {
+		t.Fatalf("contents = %#v", request.Request.Contents)
+	}
+	if request.Request.SystemInstruction == nil || len(request.Request.SystemInstruction.Parts) != 2 || request.Request.SystemInstruction.Parts[0].Text != "top-level instruction" || request.Request.SystemInstruction.Parts[1].Text != "developer instruction" {
+		t.Fatalf("system instruction = %#v", request.Request.SystemInstruction)
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(encoded, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire["session_id"] != nil || mapAny(wire["request"])["sessionId"] == nil {
+		t.Fatalf("session id placement = %#v", wire)
+	}
+	config := request.Request.ToolConfig
+	if config == nil || config.FunctionCallingConfig == nil || config.FunctionCallingConfig.Mode != "ANY" || len(config.FunctionCallingConfig.AllowedFunctionNames) != 1 || config.FunctionCallingConfig.AllowedFunctionNames[0] != "lookup" {
+		t.Fatalf("tool config = %#v", config)
+	}
+	noneRequest, err := buildAntigravityRequest(map[string]any{
+		"model":       stableAntigravityModel,
+		"input":       []any{map[string]any{"role": "user", "content": "plain"}},
+		"tool_choice": "none",
+	}, stableAntigravityModel, "projects/test-project")
+	if err != nil || noneRequest.Request.ToolConfig == nil || noneRequest.Request.ToolConfig.FunctionCallingConfig.Mode != "NONE" {
+		t.Fatalf("none tool config = %#v err=%v", noneRequest.Request.ToolConfig, err)
+	}
+	if _, err := buildAntigravityRequest(map[string]any{
+		"model":       stableAntigravityModel,
+		"input":       []any{map[string]any{"role": "user", "content": "plain"}},
+		"tool_choice": "unsupported",
+	}, stableAntigravityModel, "projects/test-project"); err == nil {
+		t.Fatal("unsupported tool_choice was silently ignored")
+	}
 }
 
 func TestProviderTelemetryStoresMetadataOnly(t *testing.T) {
@@ -266,18 +399,21 @@ func TestProviderTelemetryStoresMetadataOnly(t *testing.T) {
 	record := &requestRecord{}
 	telemetry := &requestTelemetry{record: record}
 	telemetry.observeProvider(providerRoute{
-		Provider:            antigravityProviderID,
-		RequestedModel:      "gemini-requested",
-		ActualUpstreamModel: stableAntigravityModel,
-		ControlPlaneProject: "projects/test-project",
-		CatalogSize:         4,
-		OAuthTokenExpiry:    tokenExpiry,
+		Provider:                     antigravityProviderID,
+		RequestedModel:               "gemini-requested",
+		ActualUpstreamModel:          stableAntigravityModel,
+		ControlPlaneProjectAvailable: true,
+		CatalogSize:                  4,
+		OAuthTokenExpiry:             tokenExpiry,
 	})
 	encoded := string(mustJSON(record))
-	for _, expected := range []string{"antigravity", stableAntigravityModel, "projects/test-project"} {
+	for _, expected := range []string{"antigravity", stableAntigravityModel, `"control_plane_project_available":true`} {
 		if !strings.Contains(encoded, expected) {
 			t.Fatalf("telemetry omitted %q: %s", expected, encoded)
 		}
+	}
+	if strings.Contains(encoded, "projects/test-project") {
+		t.Fatalf("telemetry persisted the control-plane project: %s", encoded)
 	}
 	for _, forbidden := range []string{"access-token", "refresh-token", "hello", "AGY_POC_OK", "signature-from-model"} {
 		if strings.Contains(strings.ToLower(encoded), forbidden) {

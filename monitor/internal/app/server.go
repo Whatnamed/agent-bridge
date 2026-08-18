@@ -341,7 +341,11 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) {
 	}
 	data := make([]any, len(ids))
 	for i, id := range ids {
-		data[i] = map[string]any{"id": id, "object": "model", "created": 0, "owned_by": "codex"}
+		owner := "codex"
+		if isStableAntigravityModel(id) {
+			owner = antigravityProviderID
+		}
+		data[i] = map[string]any{"id": id, "object": "model", "created": 0, "owned_by": owner}
 	}
 	writeJSON(w, 200, map[string]any{"object": "list", "data": data})
 }
@@ -628,7 +632,14 @@ func (s *server) chatCollection(w http.ResponseWriter, r *http.Request) {
 	if observer := telemetryFromContext(r.Context()); observer != nil {
 		observer.observeRequest(body, "/v1/chat/completions")
 	}
-	responsePayload := chatToResponse(body, s.cfg.Model)
+	responsePayload, err := chatToResponse(body, s.cfg.Model)
+	if err != nil {
+		if observer := telemetryFromContext(r.Context()); observer != nil {
+			observer.observeStreamError()
+		}
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", nil, nil)
+		return
+	}
 	provider, err := s.resolveProvider(r.Context(), responsePayload)
 	if err != nil {
 		if observer := telemetryFromContext(r.Context()); observer != nil {
@@ -835,6 +846,9 @@ func toolDelta(item map[string]any, index int, args string, identity, legacy boo
 		fn := map[string]any{"arguments": args}
 		if identity {
 			fn["name"] = stringValue(item["name"])
+			if signature := firstMapString(item, "thought_signature", "thoughtSignature"); signature != "" {
+				fn["thought_signature"] = signature
+			}
 		}
 		return map[string]any{"function_call": fn}
 	}
@@ -842,7 +856,10 @@ func toolDelta(item map[string]any, index int, args string, identity, legacy boo
 	call := map[string]any{"index": index, "function": fn}
 	if identity {
 		fn["name"] = stringValue(item["name"])
-		call["id"] = stringValue(valueOr(item["call_id"], valueOr(item["id"], fmt.Sprintf("call_%d", index))))
+		call["id"] = functionCallTransportID(item)
+		if stringValue(call["id"]) == "" {
+			call["id"] = fmt.Sprintf("call_%d", index)
+		}
 		call["type"] = "function"
 	}
 	return map[string]any{"tool_calls": []any{call}}

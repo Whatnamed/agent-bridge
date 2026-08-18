@@ -255,12 +255,19 @@ func (p *antigravityProvider) emitCanonicalStream(ctx context.Context, stream *c
 	if err := emitAntigravityEvent(ctx, fn, created); err != nil {
 		return err
 	}
+	if err := emitAntigravityEvent(ctx, fn, map[string]any{
+		"type":     "response.in_progress",
+		"response": cloneMap(mapAny(created["response"])),
+	}); err != nil {
+		return err
+	}
 	var text strings.Builder
 	var reasoning strings.Builder
 	var usage cloudcode.Usage
 	finishReason := ""
 	items := make([]map[string]any, 0, 3)
 	functionKeys := make(map[string]struct{})
+	functionArguments := make(map[string]string)
 	var messageItem map[string]any
 	var reasoningItem map[string]any
 	for {
@@ -277,20 +284,46 @@ func (p *antigravityProvider) emitCanonicalStream(ctx context.Context, stream *c
 		if event.Reasoning != "" {
 			reasoning.WriteString(event.Reasoning)
 			if reasoningItem == nil {
-				reasoningItem = map[string]any{"id": newID("rs"), "type": "reasoning", "status": "completed", "summary": []any{}}
+				reasoningItem = map[string]any{"id": newID("rs"), "type": "reasoning", "status": "in_progress", "summary": []any{}}
 				items = append(items, reasoningItem)
+				outputIndex := len(items) - 1
+				if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": cloneMap(reasoningItem)}); err != nil {
+					return err
+				}
+				if err := emitAntigravityEvent(ctx, fn, map[string]any{
+					"type": "response.reasoning_summary_part.added", "output_index": outputIndex,
+					"item_id": reasoningItem["id"], "summary_index": 0,
+					"part": map[string]any{"type": "summary_text", "text": ""},
+				}); err != nil {
+					return err
+				}
 			}
-			if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.reasoning_summary_text.delta", "item_id": reasoningItem["id"], "delta": event.Reasoning}); err != nil {
+			if err := emitAntigravityEvent(ctx, fn, map[string]any{
+				"type": "response.reasoning_summary_text.delta", "output_index": indexOfItem(items, reasoningItem),
+				"item_id": reasoningItem["id"], "summary_index": 0, "delta": event.Reasoning,
+			}); err != nil {
 				return err
 			}
 		}
 		if event.Text != "" {
 			text.WriteString(event.Text)
 			if messageItem == nil {
-				messageItem = map[string]any{"id": newID("msg"), "type": "message", "role": "assistant", "status": "completed", "phase": "final_answer", "content": []any{map[string]any{"type": "output_text", "text": "", "annotations": []any{}}}}
+				messageItem = map[string]any{"id": newID("msg"), "type": "message", "role": "assistant", "status": "in_progress", "phase": "final_answer", "content": []any{map[string]any{"type": "output_text", "text": "", "annotations": []any{}, "logprobs": []any{}}}}
 				items = append(items, messageItem)
+				outputIndex := len(items) - 1
+				if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": cloneMap(messageItem)}); err != nil {
+					return err
+				}
+				if err := emitAntigravityEvent(ctx, fn, map[string]any{
+					"type": "response.content_part.added", "output_index": outputIndex, "item_id": messageItem["id"], "content_index": 0,
+					"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}, "logprobs": []any{}},
+				}); err != nil {
+					return err
+				}
 			}
-			if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.output_text.delta", "item_id": messageItem["id"], "delta": event.Text}); err != nil {
+			if err := emitAntigravityEvent(ctx, fn, map[string]any{
+				"type": "response.output_text.delta", "output_index": indexOfItem(items, messageItem), "item_id": messageItem["id"], "content_index": 0, "delta": event.Text,
+			}); err != nil {
 				return err
 			}
 		}
@@ -299,27 +332,48 @@ func (p *antigravityProvider) emitCanonicalStream(ctx context.Context, stream *c
 			if callID == "" {
 				callID = newID("call")
 			}
+			call.Name = strings.TrimSpace(call.Name)
+			if call.Name == "" {
+				return errors.New("Antigravity function call did not include a name")
+			}
 			key := callID + "\x00" + call.Name
+			arguments := "{}"
+			if call.Args != nil {
+				encoded, err := json.Marshal(call.Args)
+				if err != nil {
+					return fmt.Errorf("encode Antigravity function call arguments: %w", err)
+				}
+				arguments = string(encoded)
+			}
 			if _, seen := functionKeys[key]; seen {
+				for _, item := range items {
+					if stringValue(item["call_id"]) == callID && stringValue(item["name"]) == call.Name {
+						functionArguments[stringValue(item["id"])] = arguments
+						if stringValue(item["thought_signature"]) == "" {
+							if signature := functionThoughtSignature(event, call); signature != "" {
+								item["thought_signature"] = signature
+							}
+						}
+						break
+					}
+				}
 				continue
 			}
 			functionKeys[key] = struct{}{}
-			arguments, _ := json.Marshal(call.Args)
 			item := map[string]any{
-				"id": callID, "type": "function_call", "status": "completed", "call_id": callID,
-				"name": call.Name, "arguments": string(arguments),
+				"id": callID, "type": "function_call", "status": "in_progress", "call_id": callID,
+				"name": call.Name, "arguments": "",
 			}
 			if signature := functionThoughtSignature(event, call); signature != "" {
 				item["thought_signature"] = signature
 			}
 			items = append(items, item)
-			if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.output_item.added", "output_index": len(items) - 1, "item": cloneMap(item)}); err != nil {
+			outputIndex := len(items) - 1
+			functionArguments[callID] = arguments
+			if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": cloneMap(item)}); err != nil {
 				return err
 			}
-			if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.function_call_arguments.delta", "output_index": len(items) - 1, "item_id": callID, "delta": string(arguments)}); err != nil {
-				return err
-			}
-			if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.output_item.done", "output_index": len(items) - 1, "item": cloneMap(item)}); err != nil {
+			if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.function_call_arguments.delta", "output_index": outputIndex, "item_id": callID, "delta": arguments}); err != nil {
 				return err
 			}
 		}
@@ -327,20 +381,53 @@ func (p *antigravityProvider) emitCanonicalStream(ctx context.Context, stream *c
 			break
 		}
 	}
-	if messageItem != nil {
-		content := sliceAny(messageItem["content"])
-		if len(content) > 0 {
-			if part := mapAny(content[0]); part != nil {
+	for outputIndex, item := range items {
+		switch item["type"] {
+		case "reasoning":
+			item["status"] = "completed"
+			item["summary"] = []any{map[string]any{"type": "summary_text", "text": reasoning.String()}}
+			if err := emitAntigravityEvent(ctx, fn, map[string]any{
+				"type": "response.reasoning_summary_text.done", "output_index": outputIndex, "item_id": item["id"], "summary_index": 0, "text": reasoning.String(),
+			}); err != nil {
+				return err
+			}
+			if err := emitAntigravityEvent(ctx, fn, map[string]any{
+				"type": "response.reasoning_summary_part.done", "output_index": outputIndex, "item_id": item["id"], "summary_index": 0,
+				"part": map[string]any{"type": "summary_text", "text": reasoning.String()},
+			}); err != nil {
+				return err
+			}
+		case "message":
+			item["status"] = "completed"
+			content := sliceAny(item["content"])
+			part := mapAny(content[0])
+			if part != nil {
 				part["text"] = text.String()
 			}
+			if err := emitAntigravityEvent(ctx, fn, map[string]any{
+				"type": "response.output_text.done", "output_index": outputIndex, "item_id": item["id"], "content_index": 0, "text": text.String(), "logprobs": []any{},
+			}); err != nil {
+				return err
+			}
+			if err := emitAntigravityEvent(ctx, fn, map[string]any{
+				"type": "response.content_part.done", "output_index": outputIndex, "item_id": item["id"], "content_index": 0, "part": cloneMap(part),
+			}); err != nil {
+				return err
+			}
+		case "function_call":
+			arguments := functionArguments[stringValue(item["id"])]
+			if arguments == "" {
+				arguments = "{}"
+			}
+			item["arguments"] = arguments
+			item["status"] = "completed"
+			if err := emitAntigravityEvent(ctx, fn, map[string]any{
+				"type": "response.function_call_arguments.done", "output_index": outputIndex, "item_id": item["id"], "arguments": arguments,
+			}); err != nil {
+				return err
+			}
 		}
-		if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.output_item.done", "output_index": indexOfItem(items, messageItem), "item": cloneMap(messageItem)}); err != nil {
-			return err
-		}
-	}
-	if reasoningItem != nil {
-		reasoningItem["summary"] = []any{map[string]any{"type": "summary_text", "text": reasoning.String()}}
-		if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.output_item.done", "output_index": indexOfItem(items, reasoningItem), "item": cloneMap(reasoningItem)}); err != nil {
+		if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.output_item.done", "output_index": outputIndex, "item": cloneMap(item)}); err != nil {
 			return err
 		}
 	}
@@ -410,14 +497,14 @@ func antigravityUsage(usage cloudcode.Usage) map[string]any {
 	if usage.InputTokens != 0 {
 		result["input_tokens"] = usage.InputTokens
 	}
-	if usage.OutputTokens != 0 {
-		result["output_tokens"] = usage.OutputTokens
+	outputTokens := usage.OutputTokens + usage.ThinkingTokens
+	if outputTokens != 0 {
+		result["output_tokens"] = outputTokens
 	}
 	if usage.ThinkingTokens != 0 {
-		result["reasoning_tokens"] = usage.ThinkingTokens
+		result["output_tokens_details"] = map[string]any{"reasoning_tokens": usage.ThinkingTokens}
 	}
 	if usage.CachedTokens != 0 {
-		result["cached_input_tokens"] = usage.CachedTokens
 		result["input_tokens_details"] = map[string]any{"cached_tokens": usage.CachedTokens}
 	}
 	if usage.TotalTokens != 0 {
@@ -442,26 +529,44 @@ func buildAntigravityRequest(payload map[string]any, model, project string) (clo
 		UserAgent:    cloudcode.DefaultRequestUserAgent,
 		RequestType:  cloudcode.DefaultRequestType,
 		RequestID:    requestID,
-		SessionID:    sessionID,
 		Request:      cloudcode.InternalRequest{SessionID: sessionID},
 	}
-	contents, err := antigravityContents(sliceAny(payload["input"]))
+	contents, inlineSystemParts, err := antigravityContents(sliceAny(payload["input"]))
 	if err != nil {
 		return cloudcode.GenerateRequest{}, err
 	}
 	request.Request.Contents = contents
-	if instructions := strings.TrimSpace(stringValue(payload["instructions"])); instructions != "" {
-		request.Request.SystemInstruction = &cloudcode.SystemInstruction{Role: "user", Parts: []cloudcode.ContentPart{{Text: instructions}}}
+	instructionParts := make([]cloudcode.ContentPart, 0, len(inlineSystemParts)+1)
+	instructions, err := antigravityInstructionText(payload["instructions"])
+	if err != nil {
+		return cloudcode.GenerateRequest{}, err
+	}
+	if instructions = strings.TrimSpace(instructions); instructions != "" {
+		instructionParts = append(instructionParts, cloudcode.ContentPart{Text: instructions})
+	}
+	instructionParts = append(instructionParts, inlineSystemParts...)
+	if len(instructionParts) > 0 {
+		request.Request.SystemInstruction = &cloudcode.SystemInstruction{Role: "user", Parts: instructionParts}
 	}
 	request.Request.Tools = antigravityTools(sliceAny(payload["tools"]))
+	toolConfig, err := antigravityToolConfig(payload["tool_choice"])
+	if err != nil {
+		return cloudcode.GenerateRequest{}, err
+	}
+	request.Request.ToolConfig = toolConfig
 	if generation := antigravityGenerationConfig(payload); generation != nil {
 		request.Request.GenerationConfig = generation
 	}
 	return request, nil
 }
 
-func antigravityContents(input []any) ([]cloudcode.Content, error) {
+func antigravityContents(input []any) ([]cloudcode.Content, []cloudcode.ContentPart, error) {
 	contents := make([]cloudcode.Content, 0, len(input))
+	systemParts := make([]cloudcode.ContentPart, 0)
+	functionNames, err := responseFunctionCallNames(input)
+	if err != nil {
+		return nil, nil, err
+	}
 	for _, raw := range input {
 		item := mapAny(raw)
 		if item == nil {
@@ -473,25 +578,46 @@ func antigravityContents(input []any) ([]cloudcode.Content, error) {
 		typ := stringValue(item["type"])
 		switch typ {
 		case "function_call":
+			callID := strings.TrimSpace(stringValue(valueOr(item["call_id"], item["id"])))
+			name := strings.TrimSpace(stringValue(item["name"]))
+			if callID == "" || name == "" {
+				return nil, nil, errors.New("function_call must include call_id and name")
+			}
 			args := mapValueFromJSON(item["arguments"])
-			part := cloudcode.ContentPart{FunctionCall: &cloudcode.FunctionCall{ID: stringValue(valueOr(item["call_id"], item["id"])), Name: stringValue(item["name"]), Args: args}}
+			part := cloudcode.ContentPart{FunctionCall: &cloudcode.FunctionCall{ID: callID, Name: name, Args: args}}
 			if signature := firstMapString(item, "thought_signature", "thoughtSignature"); signature != "" {
 				part.ThoughtSignature = signature
 			}
 			contents = append(contents, cloudcode.Content{Role: "model", Parts: []cloudcode.ContentPart{part}})
 		case "function_call_output":
+			name, err := resolveResponseFunctionOutputName(item, functionNames)
+			if err != nil {
+				return nil, nil, err
+			}
 			response := functionResponseValue(item["output"])
-			contents = append(contents, cloudcode.Content{Role: "user", Parts: []cloudcode.ContentPart{{FunctionResponse: &cloudcode.FunctionResponse{ID: stringValue(item["call_id"]), Name: stringValue(item["name"]), Response: response}}}})
+			contents = append(contents, cloudcode.Content{Role: "user", Parts: []cloudcode.ContentPart{{FunctionResponse: &cloudcode.FunctionResponse{ID: stringValue(item["call_id"]), Name: name, Response: response}}}})
 		case "reasoning":
 			if encrypted := firstMapString(item, "encrypted_content", "encryptedContent"); encrypted != "" {
 				contents = append(contents, cloudcode.Content{Role: "model", Parts: []cloudcode.ContentPart{{EncryptedContent: encrypted}}})
 			}
 		default:
 			role := stringValue(item["role"])
+			if role == "system" || role == "developer" {
+				text, err := antigravityInstructionText(item["content"])
+				if err != nil {
+					return nil, nil, err
+				}
+				if text = strings.TrimSpace(text); text != "" {
+					systemParts = append(systemParts, cloudcode.ContentPart{Text: text})
+				}
+				continue
+			}
 			if role == "assistant" {
 				role = "model"
-			} else {
+			} else if role == "" || role == "user" {
 				role = "user"
+			} else {
+				return nil, nil, fmt.Errorf("unsupported Responses input role %q", role)
 			}
 			text := responseInputText(item["content"])
 			if text != "" {
@@ -500,9 +626,9 @@ func antigravityContents(input []any) ([]cloudcode.Content, error) {
 		}
 	}
 	if len(contents) == 0 {
-		return nil, errors.New("Antigravity request input is empty")
+		return nil, nil, errors.New("Antigravity request input is empty")
 	}
-	return contents, nil
+	return contents, systemParts, nil
 }
 
 func responseInputText(value any) string {
@@ -520,6 +646,29 @@ func responseInputText(value any) string {
 		}
 	}
 	return result.String()
+}
+
+func antigravityInstructionText(value any) (string, error) {
+	if value == nil {
+		return "", nil
+	}
+	if text, ok := value.(string); ok {
+		return text, nil
+	}
+	var result strings.Builder
+	for _, raw := range sliceAny(value) {
+		part := mapAny(raw)
+		if part == nil {
+			return "", errors.New("Antigravity system/developer instructions support text parts only")
+		}
+		switch stringValue(part["type"]) {
+		case "input_text", "text", "output_text":
+			result.WriteString(stringValue(part["text"]))
+		default:
+			return "", errors.New("Antigravity system/developer instructions support text parts only")
+		}
+	}
+	return result.String(), nil
 }
 
 func antigravityTools(tools []any) []cloudcode.Tool {
@@ -541,6 +690,45 @@ func antigravityTools(tools []any) []cloudcode.Tool {
 		}}})
 	}
 	return result
+}
+
+func antigravityToolConfig(value any) (*cloudcode.ToolConfig, error) {
+	if value == nil {
+		return nil, nil
+	}
+	if mode, ok := value.(string); ok {
+		switch strings.ToLower(strings.TrimSpace(mode)) {
+		case "", "auto":
+			return nil, nil
+		case "none":
+			return &cloudcode.ToolConfig{FunctionCallingConfig: &cloudcode.FunctionCallingConfig{Mode: "NONE"}}, nil
+		case "required":
+			return &cloudcode.ToolConfig{FunctionCallingConfig: &cloudcode.FunctionCallingConfig{Mode: "ANY"}}, nil
+		default:
+			return nil, fmt.Errorf("unsupported tool_choice %q", mode)
+		}
+	}
+	m := mapAny(value)
+	if m == nil {
+		return nil, errors.New("tool_choice must be auto, none, required, or a function selection")
+	}
+	if strings.ToLower(strings.TrimSpace(stringValue(m["type"]))) != "function" {
+		return nil, errors.New("unsupported tool_choice object")
+	}
+	name := ""
+	if fn := mapAny(m["function"]); fn != nil {
+		name = strings.TrimSpace(stringValue(fn["name"]))
+	}
+	if name == "" {
+		name = strings.TrimSpace(stringValue(m["name"]))
+	}
+	if name == "" {
+		return nil, errors.New("tool_choice function name is required")
+	}
+	return &cloudcode.ToolConfig{FunctionCallingConfig: &cloudcode.FunctionCallingConfig{
+		Mode:                 "ANY",
+		AllowedFunctionNames: []string{name},
+	}}, nil
 }
 
 func antigravitySchema(value any) *cloudcode.ParameterSchema {

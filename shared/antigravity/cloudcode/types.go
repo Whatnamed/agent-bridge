@@ -94,6 +94,15 @@ type Tool struct {
 	FunctionDeclarations []FunctionDeclaration `json:"functionDeclarations,omitempty"`
 }
 
+type FunctionCallingConfig struct {
+	Mode                 string   `json:"mode,omitempty"`
+	AllowedFunctionNames []string `json:"allowedFunctionNames,omitempty"`
+}
+
+type ToolConfig struct {
+	FunctionCallingConfig *FunctionCallingConfig `json:"functionCallingConfig,omitempty"`
+}
+
 type ThinkingConfig struct {
 	IncludeThoughts *bool  `json:"includeThoughts,omitempty"`
 	ThinkingLevel   string `json:"thinkingLevel,omitempty"`
@@ -111,6 +120,7 @@ type InternalRequest struct {
 	Contents          []Content          `json:"contents,omitempty"`
 	SystemInstruction *SystemInstruction `json:"systemInstruction,omitempty"`
 	Tools             []Tool             `json:"tools,omitempty"`
+	ToolConfig        *ToolConfig        `json:"toolConfig,omitempty"`
 	GenerationConfig  *GenerationConfig  `json:"generationConfig,omitempty"`
 	SessionID         string             `json:"sessionId,omitempty"`
 }
@@ -127,7 +137,10 @@ type GenerateRequest struct {
 }
 
 type Usage struct {
-	InputTokens    int64 `json:"input_tokens,omitempty"`
+	InputTokens int64 `json:"input_tokens,omitempty"`
+	// OutputTokens is the visible candidate output count from CloudCode;
+	// thinking tokens are kept separately and combined only at the public
+	// Responses usage boundary.
 	OutputTokens   int64 `json:"output_tokens,omitempty"`
 	ThinkingTokens int64 `json:"thinking_tokens,omitempty"`
 	CachedTokens   int64 `json:"cached_tokens,omitempty"`
