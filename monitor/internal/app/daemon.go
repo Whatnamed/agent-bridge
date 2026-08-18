@@ -49,6 +49,7 @@ func runDaemonCommand(command string, args []string) error {
 	}
 	if serverFlags != nil {
 		cfg.Timeout = time.Duration(*serverFlags.timeout * float64(time.Second))
+		cfg.CodexScanInterval = time.Duration(*serverFlags.codexScanInterval * float64(time.Second))
 		cfg.AntigravityCatalogTTL = time.Duration(*serverFlags.antigravityCatalogTTL * float64(time.Second))
 		cfg.AntigravityProjectTTL = time.Duration(*serverFlags.antigravityProjectTTL * float64(time.Second))
 	}
@@ -56,8 +57,12 @@ func runDaemonCommand(command string, args []string) error {
 	cfg.AntigravityCredentialPath = expandHome(cfg.AntigravityCredentialPath)
 	cfg.AntigravityEndpoint = strings.TrimRight(strings.TrimSpace(cfg.AntigravityEndpoint), "/")
 	cfg.AntigravityProject = strings.TrimSpace(cfg.AntigravityProject)
-	if cfg.Port < 1 || cfg.Port > 65535 || stopSeconds <= 0 || cfg.Timeout <= 0 || cfg.MaxStored < 0 || cfg.Concurrency < 0 {
+	if cfg.Port < 1 || cfg.Port > 65535 || stopSeconds <= 0 || cfg.Timeout <= 0 || cfg.MaxStored < 0 || cfg.Concurrency < 0 ||
+		cfg.CodexImportDays < 1 || cfg.CodexScanInterval < 5*time.Second {
 		return errors.New("port, timeout, storage, concurrency, or stop-timeout is invalid")
+	}
+	if cfg.CodexCollectorEnabled && (cfg.CodexSessionsDir == "" || cfg.CodexArchivedSessionsDir == "") {
+		return errors.New("Codex collector settings are invalid")
 	}
 	if cfg.AntigravityOAuthProfile != "" && cfg.AntigravityOAuthProfile != "antigravity" && cfg.AntigravityOAuthProfile != "custom" {
 		return errors.New("antigravity OAuth profile must be antigravity or custom")
@@ -84,6 +89,7 @@ func runDaemonCommand(command string, args []string) error {
 
 type daemonServerFlags struct {
 	timeout               *float64
+	codexScanInterval     *float64
 	antigravityCatalogTTL *float64
 	antigravityProjectTTL *float64
 }
@@ -104,6 +110,12 @@ func addDaemonServerFlags(fs *flag.FlagSet, cfg *config) *daemonServerFlags {
 	fs.IntVar(&cfg.TelemetryQueueSize, "telemetry-queue-size", cfg.TelemetryQueueSize, "bounded telemetry writer queue size")
 	fs.BoolVar(&cfg.DashboardEnabled, "dashboard-enabled", cfg.DashboardEnabled, "enable the local dashboard")
 	fs.StringVar(&cfg.ReasoningSummaryDefault, "reasoning-summary-default", cfg.ReasoningSummaryDefault, "default reasoning summary: none or auto")
+	fs.BoolVar(&cfg.CodexCollectorEnabled, "codex-collector-enabled", cfg.CodexCollectorEnabled, "enable read-only Codex rollout import")
+	fs.StringVar(&cfg.CodexSessionsDir, "codex-sessions-dir", cfg.CodexSessionsDir, "Codex sessions directory")
+	fs.StringVar(&cfg.CodexArchivedSessionsDir, "codex-archived-sessions-dir", cfg.CodexArchivedSessionsDir, "Codex archived sessions directory")
+	fs.IntVar(&cfg.CodexImportDays, "codex-import-days", cfg.CodexImportDays, "days of Codex rollout history to import")
+	codexScanInterval := cfg.CodexScanInterval.Seconds()
+	fs.Float64Var(&codexScanInterval, "codex-scan-interval", codexScanInterval, "Codex rollout scan interval seconds")
 	fs.BoolVar(&cfg.AntigravityEnabled, "antigravity-enabled", cfg.AntigravityEnabled, "enable the Direct OAuth Antigravity provider")
 	fs.StringVar(&cfg.AntigravityOAuthProfile, "antigravity-oauth-profile", cfg.AntigravityOAuthProfile, "Antigravity OAuth profile: antigravity or custom")
 	fs.StringVar(&cfg.AntigravityCredentialPath, "antigravity-credential-path", cfg.AntigravityCredentialPath, "Antigravity OAuth credential path")
@@ -114,7 +126,8 @@ func addDaemonServerFlags(fs *flag.FlagSet, cfg *config) *daemonServerFlags {
 	fs.Float64Var(&antigravityCatalogTTL, "antigravity-catalog-ttl", antigravityCatalogTTL, "Antigravity catalog cache TTL seconds")
 	fs.Float64Var(&antigravityProjectTTL, "antigravity-project-ttl", antigravityProjectTTL, "Antigravity project cache TTL seconds")
 	return &daemonServerFlags{
-		timeout: &timeout, antigravityCatalogTTL: &antigravityCatalogTTL, antigravityProjectTTL: &antigravityProjectTTL,
+		timeout: &timeout, codexScanInterval: &codexScanInterval,
+		antigravityCatalogTTL: &antigravityCatalogTTL, antigravityProjectTTL: &antigravityProjectTTL,
 	}
 }
 
@@ -246,6 +259,11 @@ func serverCommandArgs(command string, cfg config) []string {
 		"--telemetry-queue-size", strconv.Itoa(cfg.TelemetryQueueSize),
 		"--dashboard-enabled", strconv.FormatBool(cfg.DashboardEnabled),
 		"--reasoning-summary-default", cfg.ReasoningSummaryDefault,
+		"--codex-collector-enabled", strconv.FormatBool(cfg.CodexCollectorEnabled),
+		"--codex-sessions-dir", cfg.CodexSessionsDir,
+		"--codex-archived-sessions-dir", cfg.CodexArchivedSessionsDir,
+		"--codex-import-days", strconv.Itoa(cfg.CodexImportDays),
+		"--codex-scan-interval", formatSeconds(cfg.CodexScanInterval),
 		"--antigravity-enabled", strconv.FormatBool(cfg.AntigravityEnabled),
 		"--antigravity-oauth-profile", cfg.AntigravityOAuthProfile,
 		"--antigravity-credential-path", cfg.AntigravityCredentialPath,

@@ -98,6 +98,11 @@ func TestServerCommandArgsPreserveDaemonSettings(t *testing.T) {
 	cfg.AntigravityProject = "projects/verified"
 	cfg.AntigravityCatalogTTL = 45 * time.Minute
 	cfg.AntigravityProjectTTL = 30 * time.Minute
+	cfg.CodexCollectorEnabled = true
+	cfg.CodexSessionsDir = `C:\Users\test\.codex\sessions`
+	cfg.CodexArchivedSessionsDir = `C:\Users\test\.codex\archived_sessions`
+	cfg.CodexImportDays = 30
+	cfg.CodexScanInterval = 60 * time.Second
 	args := serverCommandArgs("daemon-run", cfg)
 	joined := strings.Join(args, " ")
 	for _, expected := range []string{
@@ -107,6 +112,8 @@ func TestServerCommandArgsPreserveDaemonSettings(t *testing.T) {
 		"--antigravity-endpoint " + cfg.AntigravityEndpoint,
 		"--antigravity-project " + cfg.AntigravityProject,
 		"--antigravity-catalog-ttl 2700", "--antigravity-project-ttl 1800",
+		"--codex-collector-enabled true", "--codex-sessions-dir " + cfg.CodexSessionsDir,
+		"--codex-archived-sessions-dir " + cfg.CodexArchivedSessionsDir, "--codex-import-days 30", "--codex-scan-interval 60",
 	} {
 		if !strings.Contains(joined, expected) {
 			t.Fatalf("args %q do not contain %q", joined, expected)

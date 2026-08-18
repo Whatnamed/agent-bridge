@@ -82,11 +82,12 @@ $ uv run --with openai python example.py
 This branch adds a local, read-only monitor to the Go runtime while preserving
 the v0.2.0 `/v1/responses` and `/v1/chat/completions` contract. The dashboard is
 embedded in the executable and is available at `http://127.0.0.1:18080/dashboard`
-when `dashboard.enabled` is true. It has Chinese Overview, Requests, and
-Diagnostics views, plus JSON endpoints under `/dashboard/api/`. Requests are
-read from retained JSONL history with a bounded recent in-memory timeline; the
-first page with newest sorting refreshes while visible, and later pages do not
-move automatically.
+when `dashboard.enabled` is true. It has Chinese Overview and Requests views,
+a synchronized ZCode/Codex/DSH/Unknown source filter, and a privacy-safe detail
+drawer, plus JSON endpoints under `/dashboard/api/`. Requests and Codex turns
+are read from retained JSONL summaries with a bounded recent in-memory timeline;
+the first page with newest sorting refreshes while visible, and later pages do
+not move automatically.
 
 Only real model workloads are recorded by default: `POST /v1/responses` and
 `POST /v1/chat/completions`. Health, models, and other compatibility routes are
