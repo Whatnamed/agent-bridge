@@ -1,0 +1,203 @@
+package cloudcode
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestSSEDecoderPreservesUTF8AcrossReadBoundaries(t *testing.T) {
+	payload := []byte("data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"你好，世界\"}]}}]}}\n\ndata: [DONE]\n\n")
+	decoder := NewSSEDecoder(&oneByteReader{data: payload})
+	first, err := decoder.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, err := parseEvent(first.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Text != "你好，世界" {
+		t.Fatalf("text = %q", event.Text)
+	}
+	if strings.ContainsRune(event.Text, '\uFFFD') {
+		t.Fatalf("replacement character found in UTF-8 text: %q", event.Text)
+	}
+	done, err := decoder.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(bytes.TrimSpace(done.Data), []byte("[DONE]")) {
+		t.Fatalf("unexpected done event: %q", done.Data)
+	}
+}
+
+func TestParseEventReadsThoughtsUsageAndFunctionCall(t *testing.T) {
+	data := []byte(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"内部思考","thought":true,"thoughtSignature":"sig-1"},{"functionCall":{"id":"call-1","name":"get_test_value","args":{"name":"smoke"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":7,"thoughtsTokenCount":5,"cachedContentTokenCount":3,"totalTokenCount":23}}}`)
+	event, err := parseEvent(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Reasoning != "内部思考" || len(event.FunctionCalls) != 1 || event.FunctionCalls[0].ID != "call-1" {
+		t.Fatalf("unexpected event: %+v", event)
+	}
+	if event.Usage.InputTokens != 11 || event.Usage.OutputTokens != 7 || event.Usage.ThinkingTokens != 5 || event.Usage.CachedTokens != 3 || event.Usage.TotalTokens != 23 {
+		t.Fatalf("unexpected usage: %+v", event.Usage)
+	}
+	if event.FinishReason != "STOP" || len(event.ThoughtSignatures) != 1 {
+		t.Fatalf("unexpected finish/signature: %+v", event)
+	}
+}
+
+func TestNewRequestModesKeepRequiredOuterContract(t *testing.T) {
+	compat, err := NewRequest(ModeCompat, "gemini-3.7-flash-high", "project", "OAUTH_OK", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compat.UserAgent != "antigravity" || compat.RequestType != "agent" || compat.RequestID == "" || compat.Request.SessionID == "" {
+		t.Fatalf("compat request missing required fields: %+v", compat)
+	}
+	if compat.Request.SystemInstruction == nil || compat.Request.GenerationConfig == nil || compat.Request.GenerationConfig.ThinkingConfig == nil {
+		t.Fatal("compat request should include compatibility-only fields")
+	}
+	minimal, err := NewRequest(ModeMinimal, "gemini-3.7-flash-high", "project", "OAUTH_OK", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if minimal.UserAgent != "antigravity" || minimal.RequestType != "agent" || minimal.RequestID == "" || minimal.Request.SessionID == "" {
+		t.Fatalf("minimal request missing required fields: %+v", minimal)
+	}
+	if minimal.Request.SystemInstruction != nil || minimal.Request.GenerationConfig != nil {
+		t.Fatal("minimal request retained compatibility-only fields")
+	}
+	if len(minimal.Request.Tools) != 1 || len(minimal.Request.Tools[0].FunctionDeclarations) != 1 {
+		t.Fatal("minimal request did not include the single safe POC tool")
+	}
+}
+
+func TestResolveModelDoesNotInventFallback(t *testing.T) {
+	catalog := ModelsResponse{Models: map[string]AvailableModel{"catalog-model": {DisplayName: "Catalog"}}, DefaultAgentModelID: "catalog-model"}
+	if got, resolution := ResolveModel("catalog-model", catalog); got != "catalog-model" || resolution != "catalog_exact" {
+		t.Fatalf("exact resolution = %q/%q", got, resolution)
+	}
+	if got, resolution := ResolveModel("unknown-model", catalog); got != "catalog-model" || resolution != "catalog_default" {
+		t.Fatalf("default resolution = %q/%q", got, resolution)
+	}
+	if got, resolution := ResolveModel("unknown-model", ModelsResponse{}); got != "unknown-model" || resolution != "requested_unverified" {
+		t.Fatalf("fallback resolution invented a model: %q/%q", got, resolution)
+	}
+}
+
+func TestClientRefreshesOnceAfter401(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got == "" {
+			t.Error("missing authorization")
+		}
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"cloudaicompanionProject":"project"}`)
+	}))
+	defer server.Close()
+	source := &refreshingTokenSource{}
+	client := NewClient(server.URL, source)
+	client.HTTPClient = server.Client()
+	if _, err := client.LoadCodeAssist(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if source.refreshes != 1 || requests.Load() != 2 {
+		t.Fatalf("refreshes=%d requests=%d", source.refreshes, requests.Load())
+	}
+}
+
+func TestStreamCancellationClosesRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"response\":{}}\n\n")
+		flusher.Flush()
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, testStaticToken{value: "test-token"})
+	client.HTTPClient = server.Client()
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := client.StreamGenerateContent(ctx, GenerateRequest{Model: "model", Request: InternalRequest{Contents: []Content{{Role: "user", Parts: []ContentPart{{Text: "x"}}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Next(); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	_, err = stream.Next()
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("stream error = %v, want context canceled", err)
+	}
+	_ = stream.Close()
+}
+
+type oneByteReader struct {
+	data []byte
+	pos  int
+}
+
+func (r *oneByteReader) Read(buffer []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	buffer[0] = r.data[r.pos]
+	r.pos++
+	return 1, nil
+}
+
+type refreshingTokenSource struct {
+	refreshes int
+}
+
+func (s *refreshingTokenSource) AccessToken(context.Context) (string, error) {
+	return "test-token", nil
+}
+func (s *refreshingTokenSource) Refresh(context.Context) error {
+	s.refreshes++
+	return nil
+}
+
+type testStaticToken struct {
+	value string
+}
+
+func (s testStaticToken) AccessToken(context.Context) (string, error) { return s.value, nil }
+func (s testStaticToken) Refresh(context.Context) error               { return nil }
+
+func TestJSONRequestBodyIsValid(t *testing.T) {
+	request, err := NewRequest(ModeCompat, "model", "project", "只回复：OAUTH_OK", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte("OAUTH_OK")) {
+		t.Fatal("request body lost prompt")
+	}
+	if strings.Contains(string(body), "\uFFFD") {
+		t.Fatal("request body contains replacement character")
+	}
+	if len(body) == 0 || fmt.Sprint(time.Now()) == "" {
+		t.Fatal("unreachable guard")
+	}
+}
