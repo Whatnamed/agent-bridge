@@ -225,6 +225,21 @@ func serverCommandArgs(command string, cfg config) []string {
 	return args
 }
 
+func newSupervisedServerCommand(executable string, cfg config) *exec.Cmd {
+	child := exec.Command(executable, serverCommandArgs("serve", cfg)...)
+	child.Stdin = nil
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	child.Env = os.Environ()
+	// The supervisor itself is detached on Windows, but its foreground
+	// serve child must be detached as well. Otherwise Windows may create a
+	// console host (and, with Windows Terminal configured as the default,
+	// a visible Terminal tab) for the child even though the tray launcher
+	// and supervisor were started without a window.
+	configureDaemonProcess(child)
+	return child
+}
+
 func runSupervised(cfg config, version string) error {
 	executable, err := os.Executable()
 	if err != nil {
@@ -236,11 +251,7 @@ func runSupervised(cfg config, version string) error {
 
 	restartDelay := initialRestartDelay
 	for {
-		child := exec.Command(executable, serverCommandArgs("serve", cfg)...)
-		child.Stdin = nil
-		child.Stdout = os.Stdout
-		child.Stderr = os.Stderr
-		child.Env = os.Environ()
+		child := newSupervisedServerCommand(executable, cfg)
 		fmt.Fprintf(os.Stderr, "daemon supervisor starting server %s\n", version)
 		if err := child.Start(); err != nil {
 			return err

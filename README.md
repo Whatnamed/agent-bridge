@@ -652,6 +652,11 @@ On Linux and macOS, `stop` drains in-flight HTTP requests up to
 `--stop-timeout`. Windows terminates the daemon process tree on a best-effort
 basis, so an active stream may be interrupted.
 
+On Windows, both the daemon supervisor and its foreground `serve` child use
+detached, separate-process-group creation. This keeps a console host or
+Windows Terminal tab from appearing when the daemon is started by a hidden
+tray controller.
+
 Docker should run `serve` in the foreground and let the container runtime manage
 restarts; do not use `start` inside a container.
 
