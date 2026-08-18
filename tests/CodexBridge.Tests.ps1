@@ -20,6 +20,9 @@ $script:RuntimeTestConfig = [pscustomobject]@{
     PidFilePath = 'C:\Users\hasee\.config\openai-api-server-via-codex\run\server-127.0.0.1-18080.pid'
     LogFilePath = 'C:\Users\hasee\.config\openai-api-server-via-codex\run\server-127.0.0.1-18080.log'
     AuthJsonPath = 'C:\Users\hasee\.codex\auth.json'
+    TelemetryEnabled = $true
+    DashboardEnabled = $true
+    ReasoningSummaryDefault = 'none'
 }
 
 function Get-TestArgumentValue {
@@ -245,9 +248,14 @@ Describe 'Codex Bridge deterministic runtime arguments' {
         }
 
         (Get-TestArgumentValue -Arguments $start -Flag '--auth-json') | Should Be $script:RuntimeTestConfig.AuthJsonPath
+        (Get-TestArgumentValue -Arguments $start -Flag '--telemetry-enabled') | Should Be 'true'
+        (Get-TestArgumentValue -Arguments $start -Flag '--dashboard-enabled') | Should Be 'true'
+        (Get-TestArgumentValue -Arguments $start -Flag '--reasoning-summary-default') | Should Be 'none'
         (@($start | Where-Object { $_ -eq '--verbose' }).Count) | Should Be 1
         (@($stop | Where-Object { $_ -eq '--auth-json' }).Count) | Should Be 0
         (@($status | Where-Object { $_ -eq '--auth-json' }).Count) | Should Be 0
+        (@($stop | Where-Object { $_ -eq '--telemetry-enabled' }).Count) | Should Be 0
+        (@($status | Where-Object { $_ -eq '--dashboard-enabled' }).Count) | Should Be 0
     }
 
     It 'does not inherit host or port from an external config object' {

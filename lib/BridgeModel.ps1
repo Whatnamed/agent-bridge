@@ -41,6 +41,25 @@ function New-BridgeRuntimeArguments {
     )
     if ($IncludeAuthJson) { $arguments += @('--auth-json', [string]$Config.AuthJsonPath) }
     if ($IncludeVerbose) { $arguments += '--verbose' }
+    if ($Verb -eq 'start') {
+        $telemetryEnabled = 'true'
+        $dashboardEnabled = 'true'
+        $reasoningSummaryDefault = 'none'
+        if ($Config.PSObject.Properties['TelemetryEnabled'] -and $null -ne $Config.TelemetryEnabled) {
+            $telemetryEnabled = ([bool]$Config.TelemetryEnabled).ToString().ToLowerInvariant()
+        }
+        if ($Config.PSObject.Properties['DashboardEnabled'] -and $null -ne $Config.DashboardEnabled) {
+            $dashboardEnabled = ([bool]$Config.DashboardEnabled).ToString().ToLowerInvariant()
+        }
+        if ($Config.PSObject.Properties['ReasoningSummaryDefault'] -and -not [string]::IsNullOrWhiteSpace([string]$Config.ReasoningSummaryDefault)) {
+            $reasoningSummaryDefault = [string]$Config.ReasoningSummaryDefault
+        }
+        $arguments += @(
+            '--telemetry-enabled', $telemetryEnabled,
+            '--dashboard-enabled', $dashboardEnabled,
+            '--reasoning-summary-default', $reasoningSummaryDefault
+        )
+    }
     return [string[]]$arguments
 }
 

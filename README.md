@@ -28,6 +28,11 @@
 - log file：`$env:USERPROFILE\.config\openai-api-server-via-codex\run\server-127.0.0.1-18080.log`
 - auth path：`$env:USERPROFILE\.codex\auth.json`
 
+`start` 还会显式传入 `--telemetry-enabled=true`、
+`--dashboard-enabled=true` 和 `--reasoning-summary-default=none`；`stop` 与
+`status` 只传入各自 CLI 支持的目标路径参数。这样外部 `config.toml`、环境
+变量或 bridge 默认值变化时，托盘仍只管理这里声明的实例。
+
 当前 review 分支优先使用已构建的 monitor binary；它来自独立的
 `feature/codex-monitor` 分支，不覆盖正在运行的 stable `uvx` 实例。若要
 回到已验证的发布包，只需把顶部 `$BridgeExecutablePath` 设为空，控制器

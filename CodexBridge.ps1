@@ -33,6 +33,9 @@ $BridgeExecutableName = "$BridgePackage.exe"
 $BridgeSupervisorCommandMarker = 'daemon-run'
 $BridgeHost = '127.0.0.1'
 [int]$BridgePort = 18080
+$TelemetryEnabled = $true
+$DashboardEnabled = $true
+$ReasoningSummaryDefault = 'none'
 
 if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
     throw 'USERPROFILE is not available; refusing to construct Codex runtime paths.'
@@ -70,6 +73,9 @@ $script:Config = [pscustomobject]@{
     BridgeSupervisorCommandMarker = $BridgeSupervisorCommandMarker
     BridgeHost = $BridgeHost
     BridgePort = $BridgePort
+    TelemetryEnabled = $TelemetryEnabled
+    DashboardEnabled = $DashboardEnabled
+    ReasoningSummaryDefault = $ReasoningSummaryDefault
     RunDirectory = $RunDirectory
     PidFilePath = (Join-Path $RunDirectory $PidFileName)
     LogFileName = $LogFileName
