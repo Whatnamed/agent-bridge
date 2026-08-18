@@ -1,0 +1,5 @@
+*.exe
+*.test
+*.out
+oauth_creds.json
+.oauth_creds-*.tmp
