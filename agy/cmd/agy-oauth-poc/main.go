@@ -64,9 +64,9 @@ func usage() {
 	fmt.Println("  probe         run the explicit compat|minimal streaming probe")
 	fmt.Println("  logout        delete only this POC credential file")
 	fmt.Println()
-	fmt.Println("required for auth/probe/models:")
-	fmt.Println("  AGY_POC_CLIENT_ID      separate Google OAuth desktop-client id")
-	fmt.Println("  AGY_POC_CLIENT_SECRET  optional for public desktop clients; never persisted")
+	fmt.Println("OAuth profiles for auth/models/probe:")
+	fmt.Println("  --oauth-profile antigravity  current direct-OAuth desktop-client profile (default)")
+	fmt.Println("  --oauth-profile custom       read AGY_POC_CLIENT_ID/SECRET from the environment")
 }
 
 func runAuth(args []string) error {
@@ -77,10 +77,11 @@ func runAuth(args []string) error {
 	timeout := flags.Duration("timeout", 2*time.Minute, "OAuth callback timeout")
 	redirectURI := flags.String("redirect-uri", auth.DefaultRedirectURI, "loopback redirect URI registered for this OAuth client")
 	credentialPath := flags.String("credential-path", auth.DefaultCredentialPath(), "isolated POC credential path")
+	oauthProfile := flags.String("oauth-profile", string(auth.DefaultProfile), "OAuth profile: antigravity or custom")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	config, err := auth.ConfigFromEnvironment()
+	config, err := auth.ConfigForProfile(*oauthProfile)
 	if err != nil {
 		return err
 	}
@@ -182,10 +183,11 @@ func runModels(args []string) error {
 	flags.SetOutput(os.Stderr)
 	endpoint := flags.String("endpoint", cloudcode.DefaultEndpoint, "CloudCode endpoint")
 	credentialPath := flags.String("credential-path", auth.DefaultCredentialPath(), "isolated POC credential path")
+	oauthProfile := flags.String("oauth-profile", string(auth.DefaultProfile), "OAuth profile: antigravity or custom")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	config, err := auth.ConfigFromEnvironment()
+	config, err := auth.ConfigForProfile(*oauthProfile)
 	if err != nil {
 		return err
 	}
@@ -218,34 +220,82 @@ func runModels(args []string) error {
 	return nil
 }
 
-func runProbe(args []string) (probe.Result, error) {
+type probeCommandOptions struct {
+	Mode            cloudcode.Mode
+	Model           string
+	Project         string
+	Prompt          string
+	PromptSpecified bool
+	Endpoint        string
+	ToolTest        bool
+	Timeout         time.Duration
+	CredentialPath  string
+	OAuthProfile    string
+}
+
+func parseProbeArgs(args []string) (probeCommandOptions, error) {
 	flags := flag.NewFlagSet("probe", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	mode := flags.String("mode", string(cloudcode.ModeCompat), "compat or minimal")
 	model := flags.String("model", probe.DefaultModel, "requested CloudCode model id")
 	project := flags.String("project", "", "explicit verified Cloud AI Companion project id")
-	prompt := flags.String("prompt", "只回复：OAUTH_OK", "probe prompt; it is not written to a log")
+	prompt := flags.String("prompt", "", "probe prompt; it is not written to a log")
 	endpoint := flags.String("endpoint", cloudcode.DefaultEndpoint, "CloudCode endpoint")
 	toolTest := flags.Bool("tool-test", false, "enable only the safe get_test_value function-call round trip")
 	timeout := flags.Duration("timeout", 90*time.Second, "probe timeout")
 	credentialPath := flags.String("credential-path", auth.DefaultCredentialPath(), "isolated POC credential path")
+	oauthProfile := flags.String("oauth-profile", string(auth.DefaultProfile), "OAuth profile: antigravity or custom")
 	if err := flags.Parse(args); err != nil {
-		return probe.Result{}, err
+		return probeCommandOptions{}, err
 	}
-	config, err := auth.ConfigFromEnvironment()
+	promptSpecified := false
+	flags.Visit(func(value *flag.Flag) {
+		if value.Name == "prompt" {
+			promptSpecified = true
+		}
+	})
+	effectivePrompt := *prompt
+	if !promptSpecified {
+		if *toolTest {
+			effectivePrompt = probe.DefaultToolTestPrompt
+		} else {
+			effectivePrompt = probe.DefaultPrompt
+		}
+	}
+	return probeCommandOptions{
+		Mode:            cloudcode.Mode(*mode),
+		Model:           *model,
+		Project:         *project,
+		Prompt:          effectivePrompt,
+		PromptSpecified: promptSpecified,
+		Endpoint:        *endpoint,
+		ToolTest:        *toolTest,
+		Timeout:         *timeout,
+		CredentialPath:  *credentialPath,
+		OAuthProfile:    *oauthProfile,
+	}, nil
+}
+
+func runProbe(args []string) (probe.Result, error) {
+	options, err := parseProbeArgs(args)
 	if err != nil {
 		return probe.Result{}, err
 	}
-	manager := &auth.TokenManager{Path: *credentialPath, Config: config}
-	client := cloudcode.NewClient(*endpoint, manager)
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	config, err := auth.ConfigForProfile(options.OAuthProfile)
+	if err != nil {
+		return probe.Result{}, err
+	}
+	manager := &auth.TokenManager{Path: options.CredentialPath, Config: config}
+	client := cloudcode.NewClient(options.Endpoint, manager)
+	ctx, cancel := context.WithTimeout(context.Background(), options.Timeout)
 	defer cancel()
 	result, err := probe.Run(ctx, client, probe.Config{
-		Mode:           cloudcode.Mode(*mode),
-		RequestedModel: *model,
-		Project:        *project,
-		Prompt:         *prompt,
-		ToolTest:       *toolTest,
+		Mode:            options.Mode,
+		RequestedModel:  options.Model,
+		Project:         options.Project,
+		Prompt:          options.Prompt,
+		PromptSpecified: options.PromptSpecified,
+		ToolTest:        options.ToolTest,
 	})
 	return result, err
 }
