@@ -72,7 +72,7 @@ type requestRecord struct {
 	Provider                      string         `json:"provider,omitempty"`
 	RequestedModel                string         `json:"requested_model,omitempty"`
 	ActualUpstreamModel           string         `json:"actual_upstream_model,omitempty"`
-	ControlPlaneProject           string         `json:"control_plane_project,omitempty"`
+	ControlPlaneProjectAvailable  bool           `json:"control_plane_project_available"`
 	ModelCatalogSize              int            `json:"model_catalog_size,omitempty"`
 	OAuthTokenExpiry              *time.Time     `json:"oauth_token_expiry,omitempty"`
 	RequestedReasoningEffort      *string        `json:"requested_reasoning_effort"`
@@ -1197,9 +1197,7 @@ func (t *requestTelemetry) observeProvider(route providerRoute) {
 		t.record.ActualUpstreamModel = route.ActualUpstreamModel
 		t.record.Model = route.ActualUpstreamModel
 	}
-	if route.ControlPlaneProject != "" {
-		t.record.ControlPlaneProject = safeToken(route.ControlPlaneProject)
-	}
+	t.record.ControlPlaneProjectAvailable = route.ControlPlaneProjectAvailable
 	if route.CatalogSize > 0 {
 		t.record.ModelCatalogSize = route.CatalogSize
 	}

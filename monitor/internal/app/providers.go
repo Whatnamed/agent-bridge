@@ -36,12 +36,12 @@ func (p codexModelProvider) listModels(ctx context.Context) ([]string, error) {
 }
 
 type providerRoute struct {
-	Provider            string
-	RequestedModel      string
-	ActualUpstreamModel string
-	ControlPlaneProject string
-	CatalogSize         int
-	OAuthTokenExpiry    time.Time
+	Provider                     string
+	RequestedModel               string
+	ActualUpstreamModel          string
+	ControlPlaneProjectAvailable bool
+	CatalogSize                  int
+	OAuthTokenExpiry             time.Time
 }
 
 type providerRouter struct {
@@ -113,12 +113,12 @@ func (r *providerRouter) resolve(ctx context.Context, requested string) (modelPr
 		return nil, providerRoute{}, &backendError{400, fmt.Sprintf("Model %q was not verified in the current Antigravity catalog; no fallback model was selected.", requested)}
 	}
 	return r.antigravity, providerRoute{
-		Provider:            r.antigravity.ID(),
-		RequestedModel:      resolution.RequestedModel,
-		ActualUpstreamModel: resolution.ActualUpstreamModel,
-		ControlPlaneProject: r.antigravity.projectSnapshot(),
-		CatalogSize:         r.antigravity.catalogSize(),
-		OAuthTokenExpiry:    r.antigravity.oauthExpiry(),
+		Provider:                     r.antigravity.ID(),
+		RequestedModel:               resolution.RequestedModel,
+		ActualUpstreamModel:          resolution.ActualUpstreamModel,
+		ControlPlaneProjectAvailable: r.antigravity.projectSnapshot() != "",
+		CatalogSize:                  r.antigravity.catalogSize(),
+		OAuthTokenExpiry:             r.antigravity.oauthExpiry(),
 	}, nil
 }
 
@@ -129,10 +129,9 @@ func (r *providerRouter) listModels(ctx context.Context) ([]string, error) {
 	ids := r.codexIDs(ctx)
 	if r.antigravity != nil {
 		antigravityIDs, err := r.antigravity.listModels(ctx)
-		if err != nil {
-			return nil, err
+		if err == nil {
+			ids = append(ids, antigravityIDs...)
 		}
-		ids = append(ids, antigravityIDs...)
 	}
 	return uniqueModelIDs(ids), nil
 }
