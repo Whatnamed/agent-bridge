@@ -86,14 +86,52 @@ func TestNewRequestModesKeepRequiredOuterContract(t *testing.T) {
 
 func TestResolveModelDoesNotInventFallback(t *testing.T) {
 	catalog := ModelsResponse{Models: map[string]AvailableModel{"catalog-model": {DisplayName: "Catalog"}}, DefaultAgentModelID: "catalog-model"}
-	if got, resolution := ResolveModel("catalog-model", catalog); got != "catalog-model" || resolution != "catalog_exact" {
-		t.Fatalf("exact resolution = %q/%q", got, resolution)
+	exact := ResolveModel("catalog-model", catalog)
+	if exact.ActualUpstreamModel != "catalog-model" || exact.Status != "catalog_exact" || !exact.Verified() {
+		t.Fatalf("exact resolution = %+v", exact)
 	}
-	if got, resolution := ResolveModel("unknown-model", catalog); got != "catalog-model" || resolution != "catalog_default" {
-		t.Fatalf("default resolution = %q/%q", got, resolution)
+	missing := ResolveModel("unknown-model", catalog)
+	if missing.ActualUpstreamModel != "" || missing.Status != "requested_unverified" || missing.Verified() {
+		t.Fatalf("missing model was not fail-closed: %+v", missing)
 	}
-	if got, resolution := ResolveModel("unknown-model", ModelsResponse{}); got != "unknown-model" || resolution != "requested_unverified" {
-		t.Fatalf("fallback resolution invented a model: %q/%q", got, resolution)
+	if got := ResolveModel("  catalog-model  ", catalog); got.ActualUpstreamModel != "catalog-model" || got.Status != "catalog_exact" {
+		t.Fatalf("trimmed exact resolution = %+v", got)
+	}
+}
+
+func TestStreamAllowsCleanEOFAfterTrustedTermination(t *testing.T) {
+	stream := &Stream{decoder: NewSSEDecoder(strings.NewReader("data: {\"response\":{\"candidates\":[{\"finishReason\":\"STOP\"}]}}\n\n"))}
+	if _, err := stream.Next(); err != nil {
+		t.Fatal(err)
+	}
+	done, err := stream.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !done.Done || !done.CleanEOF {
+		t.Fatalf("clean EOF was not accepted: %+v", done)
+	}
+}
+
+func TestStreamAllowsCleanEOFAfterFinalUsage(t *testing.T) {
+	stream := &Stream{decoder: NewSSEDecoder(strings.NewReader("data: {\"response\":{\"usageMetadata\":{\"totalTokenCount\":3}}}\n\n"))}
+	if _, err := stream.Next(); err != nil {
+		t.Fatal(err)
+	}
+	done, err := stream.Next()
+	if err != nil || !done.Done || !done.CleanEOF {
+		t.Fatalf("final usage did not authorize clean EOF: done=%+v err=%v", done, err)
+	}
+}
+
+func TestStreamRejectsCleanEOFWithoutTrustedTermination(t *testing.T) {
+	stream := &Stream{decoder: NewSSEDecoder(strings.NewReader("data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}}\n\n"))}
+	if _, err := stream.Next(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := stream.Next()
+	if !errors.Is(err, ErrTruncatedStream) {
+		t.Fatalf("EOF error = %v, want ErrTruncatedStream", err)
 	}
 }
 

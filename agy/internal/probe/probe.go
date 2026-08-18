@@ -10,64 +10,85 @@ import (
 	"github.com/whatnamed/agent-bridge/agy/internal/cloudcode"
 )
 
-const DefaultModel = "gemini-3.7-flash-high"
+const (
+	DefaultModel          = "gemini-3.7-flash-high"
+	DefaultPrompt         = "只回复：OAUTH_OK"
+	DefaultToolTestPrompt = `必须调用 get_test_value，参数 name="smoke"。获得工具结果后，只回复工具返回的 value。`
+)
 
 type Config struct {
-	Mode           cloudcode.Mode
-	RequestedModel string
-	Project        string
-	Prompt         string
-	ToolTest       bool
+	Mode            cloudcode.Mode
+	RequestedModel  string
+	Project         string
+	Prompt          string
+	PromptSpecified bool
+	ToolTest        bool
 }
 
 type Result struct {
-	Status            string `json:"status"`
-	Endpoint          string `json:"endpoint"`
-	RequestedModel    string `json:"requested_model"`
-	ResolvedModel     string `json:"resolved_model"`
-	ModelResolution   string `json:"model_resolution"`
-	TTFTMS            int64  `json:"ttft_ms,omitempty"`
-	FirstByteMS       int64  `json:"first_sse_event_ms,omitempty"`
-	FirstTextMS       int64  `json:"first_text_ms,omitempty"`
-	FirstReasoningMS  int64  `json:"first_reasoning_ms,omitempty"`
-	CompletionMS      int64  `json:"completion_ms,omitempty"`
-	TotalDurationMS   int64  `json:"total_duration_ms,omitempty"`
-	InputTokens       int64  `json:"input_tokens,omitempty"`
-	OutputTokens      int64  `json:"output_tokens,omitempty"`
-	ThinkingTokens    int64  `json:"thinking_tokens,omitempty"`
-	CachedTokens      int64  `json:"cached_tokens,omitempty"`
-	TotalTokens       int64  `json:"total_tokens,omitempty"`
-	FinishReason      string `json:"finish_reason,omitempty"`
-	ResponseText      string `json:"response_text,omitempty"`
-	ReasoningText     string `json:"reasoning_text,omitempty"`
-	ToolTestRequested bool   `json:"tool_test_requested,omitempty"`
-	ToolCallName      string `json:"tool_call_name,omitempty"`
-	ToolRoundTrip     bool   `json:"tool_round_trip,omitempty"`
-	Cancelled         bool   `json:"cancelled,omitempty"`
+	Status              string `json:"status"`
+	Endpoint            string `json:"endpoint"`
+	RequestedModel      string `json:"requested_model"`
+	ResolvedModel       string `json:"resolved_model,omitempty"`
+	ActualUpstreamModel string `json:"actual_upstream_model,omitempty"`
+	ModelResolution     string `json:"model_resolution"`
+	LoadCodeAssistMS    int64  `json:"load_code_assist_ms,omitempty"`
+	FetchModelsMS       int64  `json:"fetch_models_ms,omitempty"`
+	RequestToHeadersMS  int64  `json:"request_to_headers_ms,omitempty"`
+	FirstSSEEventMS     int64  `json:"first_sse_event_ms,omitempty"`
+	FirstTextMS         int64  `json:"first_text_ms,omitempty"`
+	FirstReasoningMS    int64  `json:"first_reasoning_ms,omitempty"`
+	TTFTMS              int64  `json:"ttft_ms,omitempty"`
+	CompletionMS        int64  `json:"completion_ms,omitempty"`
+	GenerationTotalMS   int64  `json:"generation_total_ms,omitempty"`
+	WholeProbeTotalMS   int64  `json:"whole_probe_total_ms,omitempty"`
+	InputTokens         int64  `json:"input_tokens,omitempty"`
+	OutputTokens        int64  `json:"output_tokens,omitempty"`
+	ThinkingTokens      int64  `json:"thinking_tokens,omitempty"`
+	CachedTokens        int64  `json:"cached_tokens,omitempty"`
+	TotalTokens         int64  `json:"total_tokens,omitempty"`
+	FinishReason        string `json:"finish_reason,omitempty"`
+	ResponseText        string `json:"response_text,omitempty"`
+	ReasoningText       string `json:"reasoning_text,omitempty"`
+	ToolTestRequested   bool   `json:"tool_test_requested,omitempty"`
+	ToolCallName        string `json:"tool_call_name,omitempty"`
+	ToolRoundTrip       bool   `json:"tool_round_trip,omitempty"`
+	Cancelled           bool   `json:"cancelled,omitempty"`
 }
 
-func Run(ctx context.Context, client *cloudcode.Client, config Config) (Result, error) {
+func Run(ctx context.Context, client *cloudcode.Client, config Config) (result Result, err error) {
+	wholeProbeStart := time.Now()
+	defer func() {
+		result.WholeProbeTotalMS = elapsedMilliseconds(wholeProbeStart)
+	}()
+
 	if client == nil {
 		return Result{Status: "error"}, errors.New("probe CloudCode client is nil")
 	}
 	if config.Mode == "" {
 		config.Mode = cloudcode.ModeCompat
 	}
-	if config.RequestedModel == "" {
+	if strings.TrimSpace(config.RequestedModel) == "" {
 		config.RequestedModel = DefaultModel
 	}
-	if config.Prompt == "" {
-		config.Prompt = "只回复：OAUTH_OK"
+	if !config.PromptSpecified && strings.TrimSpace(config.Prompt) == "" {
+		if config.ToolTest {
+			config.Prompt = DefaultToolTestPrompt
+		} else {
+			config.Prompt = DefaultPrompt
+		}
 	}
 
-	result := Result{
+	result = Result{
 		Status:            "starting",
 		Endpoint:          client.Endpoint,
 		RequestedModel:    config.RequestedModel,
 		ToolTestRequested: config.ToolTest,
 	}
-	start := time.Now()
+
+	loadStart := time.Now()
 	loadResponse, err := client.LoadCodeAssist(ctx)
+	result.LoadCodeAssistMS = elapsedMilliseconds(loadStart)
 	if err != nil {
 		result.Status = statusForError(ctx, err)
 		result.Cancelled = result.Status == "cancelled"
@@ -84,24 +105,32 @@ func Run(ctx context.Context, client *cloudcode.Client, config Config) (Result, 
 		return resultWithError(ctx, result, errors.New("loadCodeAssist did not return a Cloud AI Companion project; pass --project only when independently verified"))
 	}
 
+	fetchStart := time.Now()
 	catalog, err := client.FetchAvailableModels(ctx)
+	result.FetchModelsMS = elapsedMilliseconds(fetchStart)
 	if err != nil {
 		return resultWithError(ctx, result, fmt.Errorf("fetchAvailableModels: %w", err))
 	}
-	resolved, resolution := cloudcode.ResolveModel(config.RequestedModel, catalog)
-	result.ResolvedModel = resolved
-	result.ModelResolution = resolution
+	modelResolution := cloudcode.ResolveModel(config.RequestedModel, catalog)
+	result.RequestedModel = modelResolution.RequestedModel
+	result.ResolvedModel = modelResolution.ActualUpstreamModel
+	result.ActualUpstreamModel = modelResolution.ActualUpstreamModel
+	result.ModelResolution = modelResolution.Status
+	if !modelResolution.Verified() {
+		result.Status = "model_not_found"
+		return result, fmt.Errorf("model-not-found: requested model %q was not present in the current CloudCode catalog; status=%s; generation was not sent", modelResolution.RequestedModel, modelResolution.Status)
+	}
 
-	request, err := cloudcode.NewRequest(config.Mode, resolved, project, config.Prompt, config.ToolTest)
+	request, err := cloudcode.NewRequest(config.Mode, modelResolution.ActualUpstreamModel, project, config.Prompt, config.ToolTest)
 	if err != nil {
 		return resultWithError(ctx, result, err)
 	}
-	first, err := consumeStream(ctx, client, request, start, &result)
+	generationStart := time.Now()
+	first, err := consumeStream(ctx, client, request, generationStart, &result)
 	if err != nil {
 		return resultWithError(ctx, result, err)
 	}
 	result.Status = "ok"
-	result.TotalDurationMS = elapsedMilliseconds(start)
 	result.InputTokens = first.usage.InputTokens
 	result.OutputTokens = first.usage.OutputTokens
 	result.ThinkingTokens = first.usage.ThinkingTokens
@@ -146,7 +175,7 @@ func Run(ctx context.Context, client *cloudcode.Client, config Config) (Result, 
 			},
 		}}},
 	})
-	second, err := consumeStream(ctx, client, continuation, start, &result)
+	second, err := consumeStream(ctx, client, continuation, generationStart, &result)
 	if err != nil {
 		return resultWithError(ctx, result, err)
 	}
@@ -159,7 +188,6 @@ func Run(ctx context.Context, client *cloudcode.Client, config Config) (Result, 
 	if second.finishReason != "" {
 		result.FinishReason = second.finishReason
 	}
-	result.TotalDurationMS = elapsedMilliseconds(start)
 	return result, nil
 }
 
@@ -172,40 +200,45 @@ type streamSummary struct {
 	candidates    []cloudcode.Candidate
 }
 
-func consumeStream(ctx context.Context, client *cloudcode.Client, request cloudcode.GenerateRequest, start time.Time, result *Result) (streamSummary, error) {
+func consumeStream(ctx context.Context, client *cloudcode.Client, request cloudcode.GenerateRequest, generationStart time.Time, result *Result) (streamSummary, error) {
 	stream, err := client.StreamGenerateContent(ctx, request)
 	if err != nil {
-		result.TotalDurationMS = elapsedMilliseconds(start)
+		result.GenerationTotalMS = elapsedMilliseconds(generationStart)
 		return streamSummary{}, err
 	}
 	defer stream.Close()
+	if result.RequestToHeadersMS == 0 {
+		receivedAt := stream.ResponseReceivedAt
+		if receivedAt.IsZero() {
+			receivedAt = time.Now()
+		}
+		result.RequestToHeadersMS = durationMilliseconds(generationStart, receivedAt)
+	}
 	summary := streamSummary{}
-	firstEvent := true
 	for {
 		event, err := stream.Next()
 		if err != nil {
-			result.TotalDurationMS = elapsedMilliseconds(start)
+			result.GenerationTotalMS = elapsedMilliseconds(generationStart)
 			return summary, err
 		}
-		now := elapsedMilliseconds(start)
-		if firstEvent {
-			result.FirstByteMS = now
-			firstEvent = false
-		}
 		if event.Done {
-			result.CompletionMS = now
+			result.CompletionMS = elapsedMilliseconds(generationStart)
+			result.GenerationTotalMS = result.CompletionMS
 			break
+		}
+		if result.FirstSSEEventMS == 0 {
+			result.FirstSSEEventMS = elapsedMilliseconds(generationStart)
 		}
 		if event.Text != "" {
 			if result.FirstTextMS == 0 {
-				result.FirstTextMS = now
-				result.TTFTMS = now
+				result.FirstTextMS = elapsedMilliseconds(generationStart)
+				result.TTFTMS = result.FirstTextMS
 			}
 			summary.text += event.Text
 		}
 		if event.Reasoning != "" {
 			if result.FirstReasoningMS == 0 {
-				result.FirstReasoningMS = now
+				result.FirstReasoningMS = elapsedMilliseconds(generationStart)
 			}
 			summary.reasoning += event.Reasoning
 		}
@@ -247,7 +280,11 @@ func statusForError(ctx context.Context, err error) string {
 }
 
 func elapsedMilliseconds(start time.Time) int64 {
-	value := time.Since(start).Milliseconds()
+	return durationMilliseconds(start, time.Now())
+}
+
+func durationMilliseconds(start, end time.Time) int64 {
+	value := end.Sub(start).Milliseconds()
 	if value < 1 {
 		return 1
 	}

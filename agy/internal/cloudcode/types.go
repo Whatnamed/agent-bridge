@@ -133,6 +133,10 @@ type Usage struct {
 	TotalTokens    int64 `json:"total_tokens,omitempty"`
 }
 
+func (u Usage) HasData() bool {
+	return u.InputTokens != 0 || u.OutputTokens != 0 || u.ThinkingTokens != 0 || u.CachedTokens != 0 || u.TotalTokens != 0
+}
+
 func (u *Usage) Merge(other Usage) {
 	if u == nil {
 		return
@@ -166,12 +170,14 @@ func (u *Usage) Add(other Usage) {
 }
 
 type Candidate struct {
-	Role  string
-	Parts []ContentPart
+	Role         string
+	FinishReason string
+	Parts        []ContentPart
 }
 
 type Event struct {
 	Done              bool
+	CleanEOF          bool
 	Text              string
 	Reasoning         string
 	FinishReason      string

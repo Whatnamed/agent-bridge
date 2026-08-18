@@ -236,6 +236,7 @@ type Stream struct {
 	response           *http.Response
 	decoder            *SSEDecoder
 	ResponseReceivedAt time.Time
+	trustedTermination bool
 }
 
 func (c *Client) StreamGenerateContent(ctx context.Context, request GenerateRequest) (*Stream, error) {
@@ -264,6 +265,12 @@ func (s *Stream) Next() (Event, error) {
 	}
 	event, err := s.decoder.Next()
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			if s.trustedTermination {
+				return Event{Done: true, CleanEOF: true}, nil
+			}
+			return Event{}, fmt.Errorf("%w: no finishReason, terminal candidate, or final usage was observed", ErrTruncatedStream)
+		}
 		return Event{}, err
 	}
 	if bytes.Equal(bytes.TrimSpace(event.Data), []byte("[DONE]")) {
@@ -272,7 +279,20 @@ func (s *Stream) Next() (Event, error) {
 	if len(bytes.TrimSpace(event.Data)) == 0 {
 		return Event{}, nil
 	}
-	return parseEvent(event.Data)
+	parsed, err := parseEvent(event.Data)
+	if err != nil {
+		return Event{}, err
+	}
+	if parsed.FinishReason != "" || parsed.Usage.HasData() {
+		s.trustedTermination = true
+	}
+	for _, candidate := range parsed.Candidates {
+		if candidate.FinishReason != "" {
+			s.trustedTermination = true
+			break
+		}
+	}
+	return parsed, nil
 }
 
 func (s *Stream) Close() error {
@@ -303,6 +323,7 @@ func parseEvent(data []byte) (Event, error) {
 		candidate := Candidate{Role: stringValue(candidateMap["role"])}
 		if reason := firstString(candidateMap, "finishReason", "finish_reason"); reason != "" {
 			event.FinishReason = reason
+			candidate.FinishReason = reason
 		}
 		content, _ := candidateMap["content"].(map[string]any)
 		if candidate.Role == "" {
@@ -417,16 +438,43 @@ func firstInt(source map[string]any, keys ...string) int64 {
 	return 0
 }
 
-// ResolveModel only uses a model id observed in fetchAvailableModels or the
-// caller's explicit id. It never invents a tiered/fallback model name.
-func ResolveModel(requested string, catalog ModelsResponse) (resolved, resolution string) {
+var ErrTruncatedStream = errors.New("truncated CloudCode SSE stream")
+
+type ModelResolution struct {
+	RequestedModel      string
+	ActualUpstreamModel string
+	Status              string
+}
+
+func (r ModelResolution) Verified() bool {
+	return r.Status == "catalog_exact" || r.Status == "alias_verified"
+}
+
+// Keep this map empty until an alias has been verified against the current
+// CloudCode catalog and request/response behavior. In particular, the catalog
+// default is not a valid implicit fallback for a benchmark request.
+var verifiedModelAliases = map[string]string{}
+
+func ResolveModel(requested string, catalog ModelsResponse) ModelResolution {
+	requested = strings.TrimSpace(requested)
 	if _, ok := catalog.Models[requested]; ok {
-		return requested, "catalog_exact"
-	}
-	if catalog.DefaultAgentModelID != "" {
-		if _, ok := catalog.Models[catalog.DefaultAgentModelID]; ok {
-			return catalog.DefaultAgentModelID, "catalog_default"
+		return ModelResolution{
+			RequestedModel:      requested,
+			ActualUpstreamModel: requested,
+			Status:              "catalog_exact",
 		}
 	}
-	return requested, "requested_unverified"
+	if actual, ok := verifiedModelAliases[requested]; ok {
+		if _, present := catalog.Models[actual]; present {
+			return ModelResolution{
+				RequestedModel:      requested,
+				ActualUpstreamModel: actual,
+				Status:              "alias_verified",
+			}
+		}
+	}
+	return ModelResolution{
+		RequestedModel: requested,
+		Status:         "requested_unverified",
+	}
 }
