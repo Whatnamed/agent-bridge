@@ -21,8 +21,8 @@ metadata only; runtime translation never branches on ZCode or DSH.
 | Tool outputs | yes | yes | yes | yes | Order and name must match the originating call group |
 | Cancellation | existing server contract | existing server contract | covered by shared server tests | covered by shared server tests | No provider-specific retry or replay |
 | Usage/cache/reasoning tokens | yes | yes | telemetry fixture | telemetry fixture | Metadata only; no prompt/output/reasoning text |
-| Inline image data | offline serializer | offline serializer | fixture-ready | fixture-ready | `data:` URL only; five image MIME types; internal endpoint probe pending |
-| Structured output | 400 | 400 | fail closed | fail closed | No internal endpoint verification yet |
+| Inline image data | offline serializer | offline serializer | fixture-ready | fixture-ready | `data:` URL only; five image MIME types; one internal tiny smoke passed |
+| Structured output | JSON object/schema | JSON object/schema | fixture-ready | fixture-ready | `generationConfig.responseMimeType/responseSchema`; one internal schema smoke passed |
 | Unsupported content/tool types | 400 | 400 | fail closed | fail closed | Never silently discard semantic input |
 | Error status/retry semantics | yes | yes | yes | yes | Typed provider mapping; no generation replay |
 
@@ -37,8 +37,9 @@ The adapter classifies request fields into three categories:
    is not part of the CloudCode request. It may still be represented in
    privacy-safe telemetry.
 3. Explicit rejection: semantically important fields that this beta cannot
-   guarantee, including structured output, remote image URLs, files, unknown
-   content parts, non-function tools, and `parallel_tool_calls=false`.
+   guarantee, including remote image URLs, files, unknown content parts,
+   non-function tools, unsupported structured-output formats, and
+   `parallel_tool_calls=false`.
 
 ## Tool continuation
 
@@ -52,9 +53,10 @@ depend on an in-memory map. Invalid or incomplete metadata is rejected with a
 ## Verification status
 
 The compatibility fixtures and offline tests are authoritative for protocol
-shape. They do not perform OAuth, model generation, image upload, or structured
-output generation. A tiny internal image/schema probe is a separate gate and
-must never use a user-provided image or expose credentials.
+shape. One tiny synthetic image probe and one tiny synthetic structured-output
+probe were run against the internal endpoint using the existing credential;
+neither used a user-provided image or exposed credentials. No OAuth flow was
+performed and no general live generation was run.
 
 Protocol references used during implementation:
 
