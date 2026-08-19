@@ -793,7 +793,11 @@ func buildAntigravityRequest(payload map[string]any, model, project string) (clo
 		return cloudcode.GenerateRequest{}, err
 	}
 	request.Request.ToolConfig = toolConfig
-	if generation := antigravityGenerationConfig(payload); generation != nil {
+	generation, err := antigravityGenerationConfig(payload)
+	if err != nil {
+		return cloudcode.GenerateRequest{}, err
+	}
+	if generation != nil {
 		request.Request.GenerationConfig = generation
 	}
 	encoded, err := json.Marshal(request)
@@ -815,20 +819,8 @@ func validateAntigravityPayload(payload map[string]any) error {
 			return errors.New("Antigravity does not support parallel_tool_calls=false")
 		}
 	}
-	if text, ok := payload["text"].(map[string]any); ok {
-		if format, exists := text["format"]; exists && format != nil {
-			formatType := strings.TrimSpace(stringValue(mapAny(format)["type"]))
-			switch formatType {
-			case "text":
-				// Explicit text format is the ordinary Responses text mode.
-			case "json_schema", "json_object":
-				return fmt.Errorf("Antigravity does not support text.format %q", formatType)
-			case "":
-				return errors.New("Antigravity does not support text.format")
-			default:
-				return fmt.Errorf("Antigravity does not support text.format %q", formatType)
-			}
-		}
+	if _, _, err := antigravityStructuredOutputFormat(payload); err != nil {
+		return err
 	}
 	if raw, exists := payload["response_format"]; exists && raw != nil {
 		formatType := ""
@@ -995,7 +987,7 @@ func antigravitySchema(value any) *cloudcode.ParameterSchema {
 	return result
 }
 
-func antigravityGenerationConfig(payload map[string]any) *cloudcode.GenerationConfig {
+func antigravityGenerationConfig(payload map[string]any) (*cloudcode.GenerationConfig, error) {
 	config := &cloudcode.GenerationConfig{}
 	hasConfig := false
 	if value, ok := payload["temperature"].(float64); ok {
@@ -1015,12 +1007,65 @@ func antigravityGenerationConfig(payload map[string]any) *cloudcode.GenerationCo
 		config.ThinkingConfig = thinking
 		hasConfig = true
 	}
-	return func() *cloudcode.GenerationConfig {
+	formatType, schema, err := antigravityStructuredOutputFormat(payload)
+	if err != nil {
+		return nil, err
+	}
+	switch formatType {
+	case "json_object", "json_schema":
+		config.ResponseMimeType = "application/json"
+		config.ResponseSchema = schema
+		hasConfig = true
+	}
+	return func() (*cloudcode.GenerationConfig, error) {
 		if !hasConfig {
-			return nil
+			return nil, nil
 		}
-		return config
+		return config, nil
 	}()
+}
+
+func antigravityStructuredOutputFormat(payload map[string]any) (string, any, error) {
+	text, exists := payload["text"]
+	if !exists || text == nil {
+		return "", nil, nil
+	}
+	textMap := mapAny(text)
+	if textMap == nil {
+		return "", nil, errors.New("Antigravity text configuration must be an object")
+	}
+	rawFormat, exists := textMap["format"]
+	if !exists || rawFormat == nil {
+		return "", nil, nil
+	}
+	format := mapAny(rawFormat)
+	if format == nil {
+		return "", nil, errors.New("Antigravity does not support text.format")
+	}
+	formatType := strings.TrimSpace(stringValue(format["type"]))
+	switch formatType {
+	case "text":
+		return "text", nil, nil
+	case "json_object":
+		return "json_object", nil, nil
+	case "json_schema":
+		schema := format["schema"]
+		if schema == nil {
+			return "", nil, errors.New("Antigravity json_schema format requires schema")
+		}
+		switch value := schema.(type) {
+		case map[string]any:
+			return "json_schema", cloneMap(value), nil
+		case []any:
+			return "json_schema", cloneSlice(value), nil
+		default:
+			return "", nil, errors.New("Antigravity json_schema format requires an object or array schema")
+		}
+	case "":
+		return "", nil, errors.New("Antigravity does not support text.format")
+	default:
+		return "", nil, fmt.Errorf("Antigravity does not support text.format %q", formatType)
+	}
 }
 
 func antigravityThinkingLevel(effort string) string {

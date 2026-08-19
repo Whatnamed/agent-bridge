@@ -122,10 +122,12 @@ type ThinkingConfig struct {
 }
 
 type GenerationConfig struct {
-	Temperature     float64         `json:"temperature,omitempty"`
-	TopP            float64         `json:"topP,omitempty"`
-	ThinkingConfig  *ThinkingConfig `json:"thinkingConfig,omitempty"`
-	MaxOutputTokens int             `json:"maxOutputTokens,omitempty"`
+	Temperature      float64         `json:"temperature,omitempty"`
+	TopP             float64         `json:"topP,omitempty"`
+	ThinkingConfig   *ThinkingConfig `json:"thinkingConfig,omitempty"`
+	MaxOutputTokens  int             `json:"maxOutputTokens,omitempty"`
+	ResponseMimeType string          `json:"responseMimeType,omitempty"`
+	ResponseSchema   any             `json:"responseSchema,omitempty"`
 }
 
 type InternalRequest struct {

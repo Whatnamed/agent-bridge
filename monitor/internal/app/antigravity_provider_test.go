@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -540,6 +541,84 @@ func TestAntigravityTextStreamUsesCanonicalLifecycle(t *testing.T) {
 	}
 }
 
+func TestAntigravityStructuredOutputMapsToGenerateConfig(t *testing.T) {
+	tests := []struct {
+		name       string
+		format     map[string]any
+		wantMime   string
+		wantSchema any
+	}{
+		{
+			name:     "json object",
+			format:   map[string]any{"type": "json_object"},
+			wantMime: "application/json",
+		},
+		{
+			name: "json schema",
+			format: map[string]any{
+				"type": "json_schema",
+				"name": "answer",
+				"schema": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"ok": map[string]any{"type": "boolean"}},
+					"required":   []any{"ok"},
+				},
+			},
+			wantMime: "application/json",
+			wantSchema: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"ok": map[string]any{"type": "boolean"}},
+				"required":   []any{"ok"},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			request, err := buildAntigravityRequest(map[string]any{
+				"model": stableAntigravityModel,
+				"input": []any{map[string]any{"role": "user", "content": "return an answer"}},
+				"text":  map[string]any{"format": tc.format},
+			}, stableAntigravityModel, "projects/test-project")
+			if err != nil {
+				t.Fatal(err)
+			}
+			config := request.Request.GenerationConfig
+			if config == nil || config.ResponseMimeType != tc.wantMime {
+				t.Fatalf("generation config = %#v", config)
+			}
+			if tc.wantSchema == nil {
+				if config.ResponseSchema != nil {
+					t.Fatalf("json_object unexpectedly has schema: %#v", config.ResponseSchema)
+				}
+			} else if !reflect.DeepEqual(config.ResponseSchema, tc.wantSchema) {
+				t.Fatalf("schema = %#v, want %#v", config.ResponseSchema, tc.wantSchema)
+			}
+		})
+	}
+	if _, err := buildAntigravityRequest(map[string]any{
+		"model": stableAntigravityModel,
+		"input": []any{map[string]any{"role": "user", "content": "bad"}},
+		"text":  map[string]any{"format": map[string]any{"type": "json_schema"}},
+	}, stableAntigravityModel, "projects/test-project"); err == nil || !strings.Contains(err.Error(), "requires schema") {
+		t.Fatalf("missing schema was accepted: %v", err)
+	}
+	chat, err := chatToResponse(map[string]any{
+		"model": "gemini-3.7-flash-high",
+		"messages": []any{map[string]any{"role": "user", "content": "return JSON"}},
+		"response_format": map[string]any{"type": "json_object"},
+	}, stableAntigravityModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chatRequest, err := buildAntigravityRequest(chat, stableAntigravityModel, "projects/test-project")
+	if err != nil {
+		t.Fatalf("Chat structured output was not mapped: %v", err)
+	}
+	if chatRequest.Request.GenerationConfig == nil || chatRequest.Request.GenerationConfig.ResponseMimeType != "application/json" {
+		t.Fatalf("Chat generation config = %#v", chatRequest.Request.GenerationConfig)
+	}
+}
+
 func TestAntigravityUnsupportedCapabilitiesReturnBadRequestBeforeStreaming(t *testing.T) {
 	provider, fake, closeServer := newTestAntigravityProvider(t, []string{`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"must not run"}]},"finishReason":"STOP"}]}}`})
 	defer closeServer()
@@ -550,23 +629,6 @@ func TestAntigravityUnsupportedCapabilitiesReturnBadRequestBeforeStreaming(t *te
 		path string
 		body map[string]any
 	}{
-		{
-			name: "responses json schema",
-			path: "/v1/responses",
-			body: map[string]any{
-				"model": stableAntigravityModel, "stream": true, "input": "hello",
-				"text": map[string]any{"format": map[string]any{"type": "json_schema"}},
-			},
-		},
-		{
-			name: "chat json object",
-			path: "/v1/chat/completions",
-			body: map[string]any{
-				"model": stableAntigravityModel, "stream": true,
-				"messages":        []any{map[string]any{"role": "user", "content": "hello"}},
-				"response_format": map[string]any{"type": "json_object"},
-			},
-		},
 		{
 			name: "chat unknown response format",
 			path: "/v1/chat/completions",
