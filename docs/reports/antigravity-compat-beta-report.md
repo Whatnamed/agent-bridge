@@ -50,6 +50,58 @@ The branch remains independent of `main`; no merge was performed.
 - The compatibility matrix and offline fixtures cover normal Responses, normal
   Chat, ZCode tool history, and DSH Chat tool history.
 
+## Thought-signature transport
+
+| Gemini case | CloudCode history reconstruction | Durable client transport |
+| --- | --- | --- |
+| Single function call | One model Content and one ordered function-response user Content; the exact part keeps its signature | Legacy-compatible `agytc_` or v2 envelope when grouping metadata is present |
+| Parallel function calls | One model Content with ordered functionCall parts, followed by one user Content with ordered functionResponse parts | `agytc2_` carries step ID, part index, group size, and only the signature-bearing part's signature |
+| Sequential function calls | Separate model/user Content pairs for each step; all signatures remain attached to their original parts | Each step receives its own v2 step ID; history alone is sufficient after a Bridge restart |
+
+The envelope is deterministic, URL/JSON-safe, rejects malformed metadata, and is
+idempotent across Responses -> Chat -> Responses conversion. Modern Chat keeps
+the signature in `extra_content.google.thought_signature` and the opaque ID;
+it is never added to `tool_calls[].function`.
+
+## Upstream error mapping
+
+| Upstream condition | Bridge result | Retry/replay behavior |
+| --- | --- | --- |
+| HTTP 400 / 422 | 400 `invalid_request_error`, `provider_invalid_request` | Not retryable; no generation replay |
+| HTTP 401 | 401 provider authentication error | No provider replay; existing token-refresh path remains bounded to one retry |
+| HTTP 403 | 403 provider permission error | Not retryable |
+| HTTP 429 | 429 provider rate-limit error | Retryable metadata only; safe numeric `Retry-After` may be forwarded |
+| HTTP 5xx | Sanitized 502/503/504 provider upstream error | Retryable metadata only; no automatic generation replay |
+| Network timeout | 504 provider timeout | No automatic replay |
+| Other transport failure | 502 provider transport error | No automatic replay |
+| Mid-stream failure | SSE error event, immediate end, no `[DONE]`, no successful response-store entry | Never converted into a success |
+
+Provider error telemetry contains only provider, operation, upstream status,
+error class, retryable metadata, and timing-safe diagnostics; no upstream body
+or authorization material is retained.
+
+## Readiness / cold-start state machine
+
+| State | Meaning | Request behavior |
+| --- | --- | --- |
+| `disabled` | Antigravity is not configured/enabled | Codex remains available; Antigravity is not selected |
+| `warming` | Background or first-request control-plane refresh is in progress | The first Antigravity request synchronously shares the serialized refresh |
+| `ready` | Project and exact catalog are available | Generation may proceed after exact model verification |
+| `degraded` | Last control-plane/provider refresh failed or expired | Antigravity request fails with typed provider diagnostics; Codex is unaffected |
+
+`loadCodeAssist` and `fetchAvailableModels` share one serialized refresh path.
+Prewarm is bounded and does not gate `/healthz` or create a second daemon.
+
+## Compatibility matrix and sources
+
+The authoritative detailed matrix is
+[`docs/antigravity-compatibility.md`](../antigravity-compatibility.md). It
+covers Responses, Chat Completions, ZCode and DSH fixtures across text,
+instructions, history, reasoning, stream/non-stream, single/parallel/
+sequential tools, tool outputs, cancellation, usage, images, structured
+output, unsupported inputs, and error semantics. Source and Provider remain
+independent dimensions; ZCode/DSH labels never alter runtime translation.
+
 ## Image probe boundary
 
 Offline tests cover all five supported MIME types, ordering, serialization,
@@ -90,8 +142,21 @@ known Windows fake-server condition per the task scope.
 - `bcb0137` `docs(antigravity): publish compatibility beta report`
 - `b70a798` `feat(antigravity): support verified structured output`
 - `88f6f66` `docs(antigravity): record structured output verification`
+- `6421979` `docs(antigravity): finalize compatibility beta report`
 
 Earlier beta commits `504e9da` and `e5c69d9` remain in the branch history.
+
+## Main files
+
+- `monitor/internal/app/antigravity_provider.go`
+- `monitor/internal/app/antigravity_tool_history.go`
+- `monitor/internal/app/tool_protocol.go`
+- `monitor/internal/app/compat.go`
+- `monitor/internal/app/dashboard.go` and embedded dashboard assets
+- `monitor/internal/app/testdata/compat/`
+- `shared/antigravity/cloudcode/types.go`, `client.go`, and SSE parser
+- `docs/antigravity-compatibility.md`
+- `docs/reports/antigravity-compat-beta-report.md`
 
 ## Deliberate limitations
 
