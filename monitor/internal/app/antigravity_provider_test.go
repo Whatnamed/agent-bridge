@@ -252,6 +252,46 @@ func TestAntigravityReasoningEffortMustMatchGemini37Preset(t *testing.T) {
 	}
 }
 
+func TestAntigravityHTTPGenerationParametersPreserveJSONNumbersAndZero(t *testing.T) {
+	provider, fake, closeServer := newTestAntigravityProvider(t, nil)
+	defer closeServer()
+	router := &providerRouter{codex: codexModelProvider{backend: testCodexBackend{}}, antigravity: provider}
+	s := &server{cfg: config{}, backend: testCodexBackend{}, providers: router, responses: newResponseStore(5), chats: newChatStore(5)}
+	requests := []struct {
+		path string
+		body string
+	}{
+		{
+			path: "/v1/responses",
+			body: `{"model":"gemini-3.7-flash-high","input":"hello","temperature":0,"top_p":0}`,
+		},
+		{
+			path: "/v1/chat/completions",
+			body: `{"model":"gemini-3.7-flash-high","messages":[{"role":"user","content":"hello"}],"temperature":0,"top_p":0}`,
+		},
+	}
+	for _, tc := range requests {
+		response := httptest.NewRecorder()
+		s.ServeHTTP(response, httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body)))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status = %d body=%s", tc.path, response.Code, response.Body.String())
+		}
+	}
+	fake.mu.Lock()
+	bodies := append([]map[string]any(nil), fake.generateBodies...)
+	fake.mu.Unlock()
+	if len(bodies) != len(requests) {
+		t.Fatalf("generation bodies = %d, want %d", len(bodies), len(requests))
+	}
+	for index, body := range bodies {
+		request := mapAny(body["request"])
+		generation := mapAny(request["generationConfig"])
+		if generation == nil || generation["temperature"] != float64(0) || generation["topP"] != float64(0) {
+			t.Fatalf("request %d generation config = %#v", index, generation)
+		}
+	}
+}
+
 func TestProviderModelListKeepsCodexModelsWhenAntigravityCatalogIsUnavailable(t *testing.T) {
 	provider, _, closeServer := newTestAntigravityProvider(t, nil)
 	closeServer()
@@ -603,8 +643,8 @@ func TestAntigravityStructuredOutputMapsToGenerateConfig(t *testing.T) {
 		t.Fatalf("missing schema was accepted: %v", err)
 	}
 	chat, err := chatToResponse(map[string]any{
-		"model": "gemini-3.7-flash-high",
-		"messages": []any{map[string]any{"role": "user", "content": "return JSON"}},
+		"model":           "gemini-3.7-flash-high",
+		"messages":        []any{map[string]any{"role": "user", "content": "return JSON"}},
 		"response_format": map[string]any{"type": "json_object"},
 	}, stableAntigravityModel)
 	if err != nil {

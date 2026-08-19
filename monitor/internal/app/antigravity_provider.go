@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"sort"
@@ -990,11 +991,19 @@ func antigravitySchema(value any) *cloudcode.ParameterSchema {
 func antigravityGenerationConfig(payload map[string]any) (*cloudcode.GenerationConfig, error) {
 	config := &cloudcode.GenerationConfig{}
 	hasConfig := false
-	if value, ok := payload["temperature"].(float64); ok {
-		config.Temperature, hasConfig = value, true
+	if value, exists := payload["temperature"]; exists && value != nil {
+		parsed, err := antigravityFloatParameter(value, "temperature", 0, 2)
+		if err != nil {
+			return nil, err
+		}
+		config.Temperature, hasConfig = parsed, true
 	}
-	if value, ok := payload["top_p"].(float64); ok {
-		config.TopP, hasConfig = value, true
+	if value, exists := payload["top_p"]; exists && value != nil {
+		parsed, err := antigravityFloatParameter(value, "top_p", 0, 1)
+		if err != nil {
+			return nil, err
+		}
+		config.TopP, hasConfig = parsed, true
 	}
 	if tokens := intValue(payload["max_output_tokens"]); tokens > 0 {
 		config.MaxOutputTokens, hasConfig = tokens, true
@@ -1023,6 +1032,48 @@ func antigravityGenerationConfig(payload map[string]any) (*cloudcode.GenerationC
 		}
 		return config, nil
 	}()
+}
+
+func antigravityFloatParameter(value any, name string, minimum, maximum float64) (*float64, error) {
+	var parsed float64
+	switch value := value.(type) {
+	case json.Number:
+		var err error
+		parsed, err = value.Float64()
+		if err != nil {
+			return nil, fmt.Errorf("Antigravity %s must be a JSON number", name)
+		}
+	case float64:
+		parsed = value
+	case float32:
+		parsed = float64(value)
+	case int:
+		parsed = float64(value)
+	case int8:
+		parsed = float64(value)
+	case int16:
+		parsed = float64(value)
+	case int32:
+		parsed = float64(value)
+	case int64:
+		parsed = float64(value)
+	case uint:
+		parsed = float64(value)
+	case uint8:
+		parsed = float64(value)
+	case uint16:
+		parsed = float64(value)
+	case uint32:
+		parsed = float64(value)
+	case uint64:
+		parsed = float64(value)
+	default:
+		return nil, fmt.Errorf("Antigravity %s must be a JSON number", name)
+	}
+	if math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed < minimum || parsed > maximum {
+		return nil, fmt.Errorf("Antigravity %s must be between %g and %g", name, minimum, maximum)
+	}
+	return &parsed, nil
 }
 
 func antigravityStructuredOutputFormat(payload map[string]any) (string, any, error) {
