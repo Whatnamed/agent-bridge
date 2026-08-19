@@ -1,0 +1,15 @@
+{
+  "entrypoint": "responses",
+  "source": "ZCode",
+  "request": {
+    "model": "gemini-3.7-flash-high",
+    "input": [
+      {"role": "user", "content": "Use the available tool if needed."},
+      {"type": "function_call", "call_id": "agytc_eyJjYWxsX2lkIjoiY2FsbC16Y29kZS0xIiwic2lnbmF0dXJlIjoic2lnLXpjb2RlIn0", "name": "get_test_value", "arguments": "{\"name\":\"smoke\"}"},
+      {"type": "function_call_output", "call_id": "agytc_eyJjYWxsX2lkIjoiY2FsbC16Y29kZS0xIiwic2lnbmF0dXJlIjoic2lnLXpjb2RlIn0", "name": "get_test_value", "output": {"value": "fixture"}}
+    ],
+    "tools": [
+      {"type": "function", "function": {"name": "get_test_value", "parameters": {"type": "object"}}}
+    ]
+  }
+}

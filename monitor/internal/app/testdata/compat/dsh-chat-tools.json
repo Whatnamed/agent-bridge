@@ -1,0 +1,15 @@
+{
+  "entrypoint": "chat",
+  "source": "DSH",
+  "request": {
+    "model": "gemini-3.7-flash-low",
+    "messages": [
+      {"role": "user", "content": "Use the available tool if needed."},
+      {"role": "assistant", "tool_calls": [{"id": "call-dsh-1", "type": "function", "function": {"name": "get_test_value", "arguments": "{\"name\":\"smoke\"}"}, "extra_content": {"google": {"thought_signature": "sig-dsh"}}}]},
+      {"role": "tool", "tool_call_id": "call-dsh-1", "name": "get_test_value", "content": "fixture"}
+    ],
+    "tools": [
+      {"type": "function", "function": {"name": "get_test_value", "parameters": {"type": "object"}}}
+    ]
+  }
+}
