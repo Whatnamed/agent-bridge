@@ -156,6 +156,11 @@ known Windows fake-server condition per the task scope.
 - `b70a798` `feat(antigravity): support verified structured output`
 - `88f6f66` `docs(antigravity): record structured output verification`
 - `6421979` `docs(antigravity): finalize compatibility beta report`
+- `3c80fd6` `fix(antigravity): preserve numeric generation parameters`
+- `beb433b` `fix(antigravity): replay public reasoning summaries safely`
+- `c9eca24` `fix(antigravity): group split parallel tool events`
+- `b4b0a82` `fix(antigravity): reject unsupported schema semantics`
+- `a265c70` `docs(antigravity): record follow-up beta verification`
 
 Earlier beta commits `504e9da` and `e5c69d9` remain in the branch history.
 
