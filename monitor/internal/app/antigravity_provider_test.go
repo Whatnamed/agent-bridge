@@ -322,6 +322,20 @@ func TestAntigravityToolStreamProducesFunctionCallResponse(t *testing.T) {
 	}
 }
 
+func TestAntigravityExplicitTextFormatRemainsOrdinaryText(t *testing.T) {
+	request, err := buildAntigravityRequest(map[string]any{
+		"model": stableAntigravityModel,
+		"input": []any{map[string]any{"role": "user", "content": "hello"}},
+		"text":  map[string]any{"format": map[string]any{"type": "text"}},
+	}, stableAntigravityModel, "projects/test-project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(request.Request.Contents) != 1 || request.Request.Contents[0].Parts[0].Text != "hello" {
+		t.Fatalf("request contents = %#v", request.Request.Contents)
+	}
+}
+
 func TestAntigravityTextStreamUsesCanonicalLifecycle(t *testing.T) {
 	provider, _, closeServer := newTestAntigravityProvider(t, []string{`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason":"STOP"}]}}`})
 	defer closeServer()
@@ -426,6 +440,32 @@ func TestAntigravityUnsupportedCapabilitiesReturnBadRequestBeforeStreaming(t *te
 			path: "/v1/responses",
 			body: map[string]any{
 				"model": stableAntigravityModel, "stream": true, "input": "hello", "parallel_tool_calls": false,
+			},
+		},
+		{
+			name: "unknown input item",
+			path: "/v1/responses",
+			body: map[string]any{
+				"model": stableAntigravityModel, "stream": true,
+				"input": []any{map[string]any{"type": "input_file", "file_id": "file_1"}},
+			},
+		},
+		{
+			name: "unknown content part",
+			path: "/v1/responses",
+			body: map[string]any{
+				"model": stableAntigravityModel, "stream": true,
+				"input": []any{map[string]any{"role": "user", "content": []any{
+					map[string]any{"type": "input_file", "file_id": "file_1"},
+				}}},
+			},
+		},
+		{
+			name: "non function tool",
+			path: "/v1/responses",
+			body: map[string]any{
+				"model": stableAntigravityModel, "stream": true, "input": "hello",
+				"tools": []any{map[string]any{"type": "web_search"}},
 			},
 		},
 	}
