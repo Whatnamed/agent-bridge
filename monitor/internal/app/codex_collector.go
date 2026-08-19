@@ -46,6 +46,14 @@ type codexUsage struct {
 	TotalTokens       *int64 `json:"total_tokens"`
 }
 
+type codexUsageKind uint8
+
+const (
+	codexUsageEmpty codexUsageKind = iota
+	codexUsageEstimate
+	codexUsageSampling
+)
+
 type codexSessionMetadata struct {
 	RolloutHash     string `json:"rollout_hash"`
 	SessionIDHash   string `json:"session_id_hash,omitempty"`
@@ -98,6 +106,7 @@ type codexTurnState struct {
 type codexFileCheckpoint struct {
 	RolloutHash string                      `json:"rollout_hash"`
 	PathHash    string                      `json:"path_hash"`
+	RolloutAt   time.Time                   `json:"rollout_at,omitempty"`
 	Offset      int64                       `json:"offset"`
 	Size        int64                       `json:"size"`
 	ModTime     time.Time                   `json:"mod_time"`
@@ -278,7 +287,7 @@ func (c *codexCollector) scanOnce() {
 			c.logError("rollout_scan_failed")
 		}
 	}
-	c.cleanupRetention()
+	c.cleanupRetention(files)
 	c.saveCheckpoint()
 	c.metrics.lastSyncUnixNano.Store(time.Now().UTC().UnixNano())
 	c.metrics.lastScanDurationMS.Store(time.Since(started).Milliseconds())
@@ -314,17 +323,16 @@ func (c *codexCollector) discoverFiles() []string {
 			if _, ok := seen[absolute]; ok {
 				return nil
 			}
-			known := c.knownPath(absolute)
-			if !known {
-				when, ok := rolloutTimeFromName(name)
-				if !ok {
-					if info, statErr := entry.Info(); statErr == nil {
-						when = info.ModTime()
-					}
-				}
-				if !when.IsZero() && when.Before(cutoff) {
-					return nil
-				}
+			info, err := entry.Info()
+			if err != nil {
+				return nil
+			}
+			when, ok := rolloutTimeFromName(name)
+			if !ok {
+				when = info.ModTime()
+			}
+			if !when.IsZero() && when.Before(cutoff) && info.ModTime().Before(cutoff) {
+				return nil
 			}
 			seen[absolute] = struct{}{}
 			result = append(result, absolute)
@@ -333,18 +341,6 @@ func (c *codexCollector) discoverFiles() []string {
 	}
 	sort.Strings(result)
 	return result
-}
-
-func (c *codexCollector) knownPath(path string) bool {
-	hash := pathHash(path)
-	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
-	for _, entry := range c.checkpoint.Files {
-		if entry != nil && entry.PathHash == hash {
-			return true
-		}
-	}
-	return false
 }
 
 func (c *codexCollector) processFile(path string) error {
@@ -364,6 +360,10 @@ func (c *codexCollector) processFile(path string) error {
 	if key == "" {
 		key = pathHash(path)
 		metadata.RolloutHash = key
+	}
+	rolloutAt, ok := rolloutTimeFromName(filepath.Base(path))
+	if !ok {
+		rolloutAt = info.ModTime()
 	}
 	c.stateMu.Lock()
 	entry := c.checkpoint.Files[key]
@@ -395,6 +395,9 @@ func (c *codexCollector) processFile(path string) error {
 	}
 	entry.RolloutHash = key
 	entry.PathHash = pathHash(path)
+	if !rolloutAt.IsZero() {
+		entry.RolloutAt = rolloutAt
+	}
 	entry.Size = info.Size()
 	entry.ModTime = info.ModTime()
 	entry.PrefixHash = prefixHash
@@ -595,8 +598,8 @@ func (p *codexLineProcessor) tokenCount(payload codexEventMessagePayload) {
 		p.collector.metrics.unknownEvents.Add(1)
 		return
 	}
-	usage := normalizeCodexUsage(payload.Info.LastTokenUsage)
-	if usage == nil {
+	usage, kind := normalizeCodexUsage(payload.Info.LastTokenUsage)
+	if kind != codexUsageSampling || usage == nil {
 		return
 	}
 	p.entry.NextSample++
@@ -615,21 +618,28 @@ func (p *codexLineProcessor) tokenCount(payload codexEventMessagePayload) {
 	}
 }
 
-func normalizeCodexUsage(usage codexUsage) *codexUsage {
+func normalizeCodexUsage(usage codexUsage) (*codexUsage, codexUsageKind) {
 	if usage.InputTokens == nil && usage.CachedInputTokens == nil && usage.CacheWriteTokens == nil && usage.OutputTokens == nil && usage.ReasoningTokens == nil && usage.TotalTokens == nil {
-		return nil
+		return nil, codexUsageEmpty
 	}
 	// The first token_count snapshot observed in the current schema can carry
-	// only total_tokens while serializing zeroes for the component fields. Do
-	// not turn those placeholder zeroes into real usage.
+	// only total_tokens while serializing zeroes for the component fields. It is
+	// an estimate of the current context, not a model sampling result.
 	if usage.TotalTokens != nil && *usage.TotalTokens > 0 && numberValue(usage.InputTokens) == 0 && numberValue(usage.CachedInputTokens) == 0 && numberValue(usage.CacheWriteTokens) == 0 && numberValue(usage.OutputTokens) == 0 && numberValue(usage.ReasoningTokens) == 0 {
-		usage.InputTokens = nil
-		usage.CachedInputTokens = nil
-		usage.CacheWriteTokens = nil
-		usage.OutputTokens = nil
-		usage.ReasoningTokens = nil
+		return nil, codexUsageEstimate
 	}
-	return &usage
+	if usage.InputTokens == nil || *usage.InputTokens <= 0 {
+		if usage.CachedInputTokens == nil || *usage.CachedInputTokens <= 0 {
+			if usage.CacheWriteTokens == nil || *usage.CacheWriteTokens <= 0 {
+				if usage.OutputTokens == nil || *usage.OutputTokens <= 0 {
+					if usage.ReasoningTokens == nil || *usage.ReasoningTokens <= 0 {
+						return nil, codexUsageEmpty
+					}
+				}
+			}
+		}
+	}
+	return &usage, codexUsageSampling
 }
 
 func mergeCodexTurnUsage(turn *codexTurnState, usage *codexUsage) {
@@ -805,10 +815,36 @@ func (c *codexCollector) saveCheckpoint() {
 	}
 }
 
-func (c *codexCollector) cleanupRetention() {
+func (c *codexCollector) cleanupRetention(activeFiles []string) {
+	cutoff := time.Now().Local().AddDate(0, 0, -c.importDays)
+	activePathHashes := make(map[string]struct{}, len(activeFiles))
+	for _, path := range activeFiles {
+		activePathHashes[pathHash(path)] = struct{}{}
+	}
+	c.stateMu.Lock()
+	for key, entry := range c.checkpoint.Files {
+		if entry == nil {
+			delete(c.checkpoint.Files, key)
+			continue
+		}
+		if _, active := activePathHashes[entry.PathHash]; active {
+			continue
+		}
+		rolloutAt := entry.RolloutAt
+		if rolloutAt.IsZero() {
+			rolloutAt = entry.ModTime
+		}
+		if rolloutAt.IsZero() || entry.ModTime.IsZero() {
+			continue
+		}
+		if rolloutAt.Before(cutoff) && entry.ModTime.Before(cutoff) {
+			delete(c.checkpoint.Files, key)
+		}
+	}
+	c.stateMu.Unlock()
+
 	c.store.historyMu.Lock()
 	defer c.store.historyMu.Unlock()
-	cutoff := time.Now().Local().AddDate(0, 0, -c.importDays)
 	files, _ := filepath.Glob(filepath.Join(c.summaryDir, "*.jsonl"))
 	for _, name := range files {
 		if filepath.Base(name) == codexCheckpointName {

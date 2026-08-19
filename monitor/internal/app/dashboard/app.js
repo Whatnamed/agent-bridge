@@ -23,12 +23,26 @@
   const yesNo = (value) => value == null ? "—" : (value ? "是" : "否");
   const statusLabel = (value) => ({ success: "成功", failed: "失败", cancelled: "已取消" }[value] || value || "未知");
   const rangeLabel = (value) => ({ today: "今天", "1h": "最近 1 小时", "6h": "最近 6 小时", "24h": "最近 24 小时", "7d": "最近 7 天", "30d": "最近 30 天" }[value] || value || "当前范围");
-  const sourceLabel = (item) => {
+  const sourceKey = (item) => {
     if (String(item?.source || "").toLowerCase() === "codex" || String(item?.client_type || "").toLowerCase() === "codex") return "Codex";
     const value = String(item?.client_type || "Unknown");
     return ["ZCode", "DSH", "Unknown"].includes(value) ? value : "Unknown";
   };
-  const sourceClass = (item) => sourceLabel(item).toLowerCase();
+  const sourceValueLabel = (value) => ({ Unknown: "未知", unknown: "未知" }[String(value)] || value || "—");
+  const sourceLabel = (item) => sourceValueLabel(sourceKey(item));
+  const sourceClass = (item) => sourceKey(item).toLowerCase();
+  const recordKindLabel = (value) => ({ request: "请求", turn: "轮次" }[String(value)] || value || "—");
+  const secondarySourceLabel = (value) => ({ cli: "命令行", user: "用户", subagent: "子智能体", Unknown: "未知", unknown: "未知" }[String(value)] || value || "—");
+  const directionLabel = (value) => ({ upstream: "上游", downstream: "下游" }[String(value)] || value || "—");
+  const eventTypeLabel = (value) => ({
+    encrypted_reasoning: "加密推理",
+    function_call: "函数调用",
+    function_call_output: "函数调用结果",
+    reasoning: "推理",
+    summary_delta: "摘要增量",
+    tool_call: "工具调用",
+    tool_call_output: "工具调用结果"
+  }[String(value)] || value || "—");
   const sourceFilter = () => $("source-filter")?.value || "all";
   const windowDuration = (minutes) => {
     if (minutes == null) return "周期不可用";
@@ -53,9 +67,17 @@
     if (requested === upstream) return requested + " ✓";
     return requested + " → " + upstream + " ⚠";
   };
+  const tokenRatioText = (secondary, denominator) => {
+    if (!finiteNumber(secondary)) return "";
+    const value = Number(secondary);
+    if (value === 0) return "0%";
+    if (!finiteNumber(denominator) || Number(denominator) <= 0) return "";
+    return (value * 100 / Number(denominator)).toFixed(1) + "%";
+  };
   const tokenCell = (primary, secondary, secondaryLabel) => {
     const primaryText = compactToken(primary), secondaryText = compactToken(secondary);
-    return '<span class="cell-main" title="精确值：' + esc(exact(primary)) + '">' + esc(primaryText) + '</span><span class="cell-sub" title="精确值：' + esc(exact(secondary)) + '">' + esc(secondaryLabel) + ' ' + esc(secondaryText) + '</span>';
+    const ratio = tokenRatioText(secondary, primary);
+    return '<span class="cell-main" title="精确值：' + esc(exact(primary)) + '">' + esc(primaryText) + '</span><span class="cell-sub" title="精确值：' + esc(exact(secondary)) + '">' + esc(secondaryLabel + ' ' + secondaryText + (ratio ? ' · ' + ratio : '')) + '</span>';
   };
   const ratioText = (value) => finiteNumber(value) ? Number(value).toFixed(1) + "%" : "—";
   const durationForItem = (item) => item.duration_available === false && !Number(item.request_duration_ms) ? null : item.request_duration_ms;
@@ -112,14 +134,14 @@
       renderCodexCollector(data.codex);
       const stats = data.stats || {};
       const values = [
-        ["请求 / turns", num(stats.requests)], ["成功率", ratioText(stats.success_rate)],
-        ["输入 Token", compactToken(stats.input_tokens)], ["缓存 Token", compactToken(stats.cached_input_tokens)],
-        ["请求缓存命中率", ratioText(stats.request_cache_hit_percent)], ["Token 缓存占比", ratioText(stats.token_cache_ratio_percent)],
-        ["输出 Token", compactToken(stats.output_tokens)], ["推理 Token", compactToken(stats.reasoning_tokens)],
-        ["TTFT 中位数", formatDuration(stats.median_ttft_ms)], ["TTFT P95", formatDuration(stats.p95_ttft_ms)],
-        ["总耗时中位数", formatDuration(stats.median_duration_ms)], ["总耗时 P95", formatDuration(stats.p95_duration_ms)]
+        ["请求 / 轮次", num(stats.requests), num(stats.requests)], ["成功率", ratioText(stats.success_rate), ratioText(stats.success_rate)],
+        ["输入 Token", compactToken(stats.input_tokens), exact(stats.input_tokens)], ["缓存 Token", compactToken(stats.cached_input_tokens), exact(stats.cached_input_tokens)],
+        ["请求缓存命中率", ratioText(stats.request_cache_hit_percent), ratioText(stats.request_cache_hit_percent)], ["Token 缓存占比", ratioText(stats.token_cache_ratio_percent), ratioText(stats.token_cache_ratio_percent)],
+        ["输出 Token", compactToken(stats.output_tokens), exact(stats.output_tokens)], ["推理 Token", compactToken(stats.reasoning_tokens), exact(stats.reasoning_tokens)],
+        ["TTFT 中位数", formatDuration(stats.median_ttft_ms), formatDuration(stats.median_ttft_ms)], ["TTFT P95", formatDuration(stats.p95_ttft_ms), formatDuration(stats.p95_ttft_ms)],
+        ["总耗时中位数", formatDuration(stats.median_duration_ms), formatDuration(stats.median_duration_ms)], ["总耗时 P95", formatDuration(stats.p95_duration_ms), formatDuration(stats.p95_duration_ms)]
       ];
-      $("summary-grid").innerHTML = values.map(([label, value]) => '<div class="summary-item"><span>' + label + '</span><strong title="精确值：' + esc(value) + '">' + esc(value) + '</strong></div>').join("");
+      $("summary-grid").innerHTML = values.map(([label, value, precise]) => '<div class="summary-item"><span>' + label + '</span><strong title="精确值：' + esc(precise) + '">' + esc(value) + '</strong></div>').join("");
       const memory = data.memory || {};
       $("heap-alloc").textContent = formatBytes(memory.heap_alloc_bytes);
       $("heap-inuse").textContent = formatBytes(memory.heap_inuse_bytes);
@@ -151,8 +173,8 @@
     const rows = data.data || [];
     $("request-table").innerHTML = rows.length ? rows.map((item) => {
       const statusClass = item.outcome === "success" ? "ok" : item.outcome === "cancelled" ? "warn" : "bad";
-      return '<tr data-id="' + esc(item.internal_request_id) + '"><td>' + esc(time(item.started_at)) + '</td><td><span class="source-badge source-' + sourceClass(item) + '">' + esc(sourceLabel(item)) + '</span><span class="cell-sub">' + esc(item.record_kind || "request") + '</span></td><td title="' + esc(item.model || "不可用") + '">' + esc(item.model || "—") + '</td><td>' + esc(effortDisplay(item)) + '</td><td>' + tokenCell(item.input_tokens, item.cached_input_tokens, "缓存") + '</td><td>' + tokenCell(item.output_tokens, item.reasoning_tokens, "推理") + '</td><td>' + formatDuration(item.first_upstream_event_ms) + '</td><td>' + formatDuration(item.ttft_ms, "无文本") + '</td><td>' + formatDuration(durationForItem(item)) + '</td><td class="' + statusClass + '">' + esc(statusLabel(item.outcome)) + '</td></tr>';
-    }).join("") : '<tr><td colspan="10" class="empty">当前范围没有请求或 turns。</td></tr>';
+      return '<tr data-id="' + esc(item.internal_request_id) + '"><td>' + esc(time(item.started_at)) + '</td><td><span class="source-badge source-' + sourceClass(item) + '">' + esc(sourceLabel(item)) + '</span><span class="cell-sub">' + esc(recordKindLabel(item.record_kind || "request")) + '</span></td><td title="' + esc(item.model || "不可用") + '">' + esc(item.model || "—") + '</td><td>' + esc(effortDisplay(item)) + '</td><td>' + tokenCell(item.input_tokens, item.cached_input_tokens, "缓存") + '</td><td>' + tokenCell(item.output_tokens, item.reasoning_tokens, "推理") + '</td><td>' + formatDuration(item.first_upstream_event_ms) + '</td><td>' + formatDuration(item.ttft_ms, "无文本") + '</td><td>' + formatDuration(durationForItem(item)) + '</td><td class="' + statusClass + '">' + esc(statusLabel(item.outcome)) + '</td></tr>';
+    }).join("") : '<tr><td colspan="10" class="empty">当前范围没有请求或轮次。</td></tr>';
     document.querySelectorAll("#request-table tr[data-id]").forEach((row) => row.addEventListener("click", () => loadDetail(row.dataset.id)));
     updatePagination(data);
   }
@@ -186,21 +208,21 @@
     const rows = [
       ["入站 prompt_cache_key", presenceHash(item.incoming_prompt_cache_key_present, item.incoming_prompt_cache_key_hash)],
       ["上游 prompt_cache_key", presenceHash(item.upstream_prompt_cache_key_present, item.upstream_prompt_cache_key_hash)],
-      ["入站 Session hash", hashValue(item.incoming_session_id_hash)], ["上游 Session hash", hashValue(item.upstream_session_id_hash)],
-      ["入站 Thread hash", hashValue(item.incoming_thread_id_hash)], ["上游 Thread hash", hashValue(item.upstream_thread_id_hash)],
-      ["入站 x-client-request-id hash", hashValue(item.incoming_client_request_id_hash)], ["上游 x-client-request-id hash", hashValue(item.upstream_client_request_id_hash)],
-      ["入站 Toolset hash", hashValue(item.tools_hash)], ["上游 Toolset hash", hashValue(item.prepared_tools_hash)],
-      ["入站 Instructions hash", hashValue(item.instructions_hash)], ["上游 Instructions hash", hashValue(item.prepared_instructions_hash)],
-      ["入站 Request shape hash", hashValue(item.request_shape_hash)], ["上游 Request shape hash", hashValue(item.prepared_request_shape_hash)],
+      ["入站 Session Hash", hashValue(item.incoming_session_id_hash)], ["上游 Session Hash", hashValue(item.upstream_session_id_hash)],
+      ["入站 Thread Hash", hashValue(item.incoming_thread_id_hash)], ["上游 Thread Hash", hashValue(item.upstream_thread_id_hash)],
+      ["入站 x-client-request-id Hash", hashValue(item.incoming_client_request_id_hash)], ["上游 x-client-request-id Hash", hashValue(item.upstream_client_request_id_hash)],
+      ["入站工具集 Hash", hashValue(item.tools_hash)], ["上游工具集 Hash", hashValue(item.prepared_tools_hash)],
+      ["入站指令 Hash", hashValue(item.instructions_hash)], ["上游指令 Hash", hashValue(item.prepared_instructions_hash)],
+      ["入站请求形状 Hash", hashValue(item.request_shape_hash)], ["上游请求形状 Hash", hashValue(item.prepared_request_shape_hash)],
       ["previous_response_id", yesNo(item.previous_response_id_present)]
     ];
     return '<details class="cache-diagnostics"><summary>缓存诊断</summary><p class="muted">这里只展示存在性和 hash 前缀，不展示原始 ID、prompt 或工具 schema，也不据此推断命中原因。</p><div class="detail-grid">' + rows.map(([label, value]) => '<div class="detail-cell"><span>' + label + '</span><strong>' + esc(value) + '</strong></div>').join("") + '</div></details>';
   }
   function samplingTable(item) {
     const samples = Array.isArray(item.sampling) ? item.sampling : [];
-    if (!samples.length) return '<div class="empty">没有可用的 sampling usage</div>';
+    if (!samples.length) return '<div class="empty">没有可用的采样用量</div>';
     const rows = samples.map((sample) => '<tr><td>' + esc(sample.index ?? "—") + '</td><td title="精确值：' + esc(exact(sample.input_tokens)) + '">' + esc(compactToken(sample.input_tokens)) + '</td><td title="精确值：' + esc(exact(sample.cached_input_tokens)) + '">' + esc(compactToken(sample.cached_input_tokens)) + '</td><td title="精确值：' + esc(exact(sample.output_tokens)) + '">' + esc(compactToken(sample.output_tokens)) + '</td><td title="精确值：' + esc(exact(sample.reasoning_tokens)) + '">' + esc(compactToken(sample.reasoning_tokens)) + '</td><td title="精确值：' + esc(exact(sample.total_tokens)) + '">' + esc(compactToken(sample.total_tokens)) + '</td></tr>').join("");
-    return '<div class="table-wrap sampling-table"><table><thead><tr><th>#</th><th>Input</th><th>Cached</th><th>Output</th><th>Reasoning</th><th>Total</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+    return '<div class="table-wrap sampling-table"><table><thead><tr><th>#</th><th>输入</th><th>缓存</th><th>输出</th><th>推理</th><th>总计</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
   }
   let detailGeneration = 0;
   function openDrawer() {
@@ -224,19 +246,19 @@
       if (generation !== detailGeneration) return;
       const toolTypes = Object.entries(item.tool_types || {}).map(([key, value]) => key + ": " + value).join(", ") || "—";
       const cells = [
-        ["来源", sourceLabel(item)], ["记录类型", item.record_kind], ["开始", date(item.started_at)], ["完成", date(item.completed_at)],
-        ["rollout hash", hashValue(item.rollout_id_hash)], ["session hash", hashValue(item.session_id_hash)], ["turn hash", hashValue(item.turn_id_hash)], ["secondary source", item.secondary_source],
-        ["模型", item.model], ["requested model", item.requested_model], ["actual upstream model", item.actual_upstream_model], ["provider", item.provider], ["context window", num(item.context_window)], ["subagent", yesNo(item.subagent)],
-        ["结果", statusLabel(item.outcome)], ["客户端", item.client_type], ["接口", item.endpoint], ["HTTP", String(item.http_method || "—") + " " + String(item.http_status ?? "—")],
+        ["来源", sourceLabel(item)], ["记录类型", recordKindLabel(item.record_kind)], ["开始", date(item.started_at)], ["完成", date(item.completed_at)],
+        ["rollout Hash", hashValue(item.rollout_id_hash)], ["session Hash", hashValue(item.session_id_hash)], ["turn Hash", hashValue(item.turn_id_hash)], ["次级来源", secondarySourceLabel(item.secondary_source)],
+        ["模型", item.model], ["请求模型", item.requested_model], ["实际上游模型", item.actual_upstream_model], ["提供方", item.provider], ["上下文窗口", num(item.context_window)], ["子智能体", yesNo(item.subagent)],
+        ["结果", statusLabel(item.outcome)], ["客户端", sourceValueLabel(item.client_type)], ["接口", item.endpoint], ["HTTP", String(item.http_method || "—") + " " + String(item.http_status ?? "—")],
         ["SSE 流式", yesNo(item.stream)], ["请求推理强度", item.requested_reasoning_effort], ["上游推理强度", item.upstream_reasoning_effort], ["强度判定", effortDisplay(item)],
-        ["输入 Token", exact(item.input_tokens)], ["缓存 Token", exact(item.cached_input_tokens)], ["Cache write", exact(item.cache_write_tokens)], ["输出 Token", exact(item.output_tokens)], ["推理 Token", exact(item.reasoning_tokens)], ["总 Token", exact(item.total_tokens)],
-        ["sampling 数", item.sampling_count || (item.sampling || []).length], ["首个上游事件", formatDuration(item.first_upstream_event_ms)], ["首个 reasoning", formatDuration(item.first_reasoning_event_ms)], ["首个工具调用", formatDuration(item.first_tool_call_ms)], ["TTFT", formatDuration(item.ttft_ms, "无文本")], ["总耗时", formatDuration(durationForItem(item))],
-        ["Reasoning 条目", item.reasoning_item_count], ["可读 summary 条目", item.readable_reasoning_summary_item_count], ["Summary delta", item.reasoning_summary_delta_count], ["Function call 数", item.function_call_count], ["Tool call 数", item.tool_call_count], ["上游事件", item.upstream_event_count], ["下游事件", item.downstream_event_count],
-        ["Encrypted reasoning", yesNo(item.upstream_encrypted_reasoning_enabled)], ["客户端断开", yesNo(item.client_disconnected)], ["上游流错误", yesNo(item.upstream_stream_error)]
+        ["输入 Token", exact(item.input_tokens)], ["缓存 Token", exact(item.cached_input_tokens)], ["缓存写入 Token", exact(item.cache_write_tokens)], ["输出 Token", exact(item.output_tokens)], ["推理 Token", exact(item.reasoning_tokens)], ["总 Token", exact(item.total_tokens)],
+        ["采样次数", item.sampling_count || (item.sampling || []).length], ["首个上游事件", formatDuration(item.first_upstream_event_ms)], ["首个推理", formatDuration(item.first_reasoning_event_ms)], ["首个工具调用", formatDuration(item.first_tool_call_ms)], ["TTFT", formatDuration(item.ttft_ms, "无文本")], ["总耗时", formatDuration(durationForItem(item))],
+        ["推理条目", item.reasoning_item_count], ["可读摘要条目", item.readable_reasoning_summary_item_count], ["摘要增量", item.reasoning_summary_delta_count], ["函数调用次数", item.function_call_count], ["工具调用次数", item.tool_call_count], ["上游事件", item.upstream_event_count], ["下游事件", item.downstream_event_count],
+        ["加密推理", yesNo(item.upstream_encrypted_reasoning_enabled)], ["客户端断开", yesNo(item.client_disconnected)], ["上游流错误", yesNo(item.upstream_stream_error)]
       ];
       const detailCells = cells.map(([label, value]) => '<div class="detail-cell"><span>' + label + '</span><strong>' + esc(value) + '</strong></div>').join("");
-      const timeline = (item.timeline || []).map((event) => '<div class="timeline-row"><span>' + formatDuration(event.relative_ms) + '</span><span>' + esc(event.direction) + '</span><strong>' + esc(event.type) + '</strong><span>' + esc(event.item_type || event.item_id_hash || "") + '</span></div>').join("");
-      const sampling = item.source === "codex" ? '<div class="card-heading"><span>Codex sampling 明细</span><span class="muted">仅 usage，不含 rollout 内容</span></div>' + samplingTable(item) : "";
+      const timeline = (item.timeline || []).map((event) => '<div class="timeline-row"><span>' + formatDuration(event.relative_ms) + '</span><span>' + esc(directionLabel(event.direction)) + '</span><strong>' + esc(eventTypeLabel(event.type)) + '</strong><span>' + esc(event.item_type ? eventTypeLabel(event.item_type) : (event.item_id_hash || "")) + '</span></div>').join("");
+      const sampling = item.source === "codex" ? '<div class="card-heading"><span>Codex 采样明细</span><span class="muted">仅用量，不含 rollout 内容</span></div>' + samplingTable(item) : "";
       $("detail").innerHTML = '<div class="detail-grid">' + detailCells + '</div>' + sampling + cacheDiagnostics(item) + '<div class="card-heading"><span>事件时间线元数据</span><span class="muted">不包含文本 payload</span></div><div class="timeline">' + (timeline || '<div class="empty">该记录没有保留内存事件</div>') + '</div>';
     } catch (error) { if (generation === detailGeneration) $("detail").textContent = String(error); }
   }

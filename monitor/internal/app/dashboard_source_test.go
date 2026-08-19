@@ -134,9 +134,32 @@ func TestDashboardAssetsExposeSourceFilterDrawerAndPrivacyContract(t *testing.T)
 			t.Fatalf("dashboard marker %q is missing", marker)
 		}
 	}
-	for _, marker := range []string{"compactToken", "sampling", "Escape", "source:", "缓存诊断"} {
+	for _, marker := range []string{
+		"compactToken", "tokenRatioText", "sampling", "Escape", "source:", "缓存诊断",
+		"recordKindLabel", "sourceValueLabel", "secondarySourceLabel", "directionLabel", "eventTypeLabel",
+		`request: "请求"`, `turn: "轮次"`, `Unknown: "未知"`, `cli: "命令行"`, `subagent: "子智能体"`,
+		"values.map(([label, value, precise])", "exact(stats.input_tokens)", "exact(stats.cached_input_tokens)", "exact(stats.output_tokens)", "exact(stats.reasoning_tokens)",
+		"Codex 采样明细", "<th>输入</th>", "<th>缓存</th>", "<th>输出</th>", "<th>推理</th>", "<th>总计</th>",
+	} {
 		if !strings.Contains(appText, marker) {
 			t.Fatalf("dashboard script marker %q is missing", marker)
+		}
+	}
+	for _, marker := range []string{"请求 / 轮次", "已导入轮次", "采集延迟", "当前堆分配", "使用中的堆", "Go 堆保留", "Response 缓存", "Chat 缓存", "未知"} {
+		if !strings.Contains(pageText+appText, marker) {
+			t.Fatalf("Chinese dashboard label %q is missing", marker)
+		}
+	}
+	for _, forbidden := range []string{
+		"请求 / turns", "当前范围没有请求或 turns。", "esc(item.record_kind || \"request\")",
+		"[\"记录类型\", item.record_kind]", "[\"secondary source\"", "[\"requested model\"",
+		"[\"actual upstream model\"", "[\"provider\"", "[\"context window\"", "[\"subagent\"",
+		"[\"sampling 数\"", "[\"Reasoning 条目\"", "[\"Summary delta\"", "[\"Function call 数\"", "[\"Tool call 数\"",
+		"esc(event.direction)", "esc(event.type)",
+		">Input</th>", ">Cached</th>", ">Output</th>", ">Reasoning</th>", ">Total</th>", ">Unknown</option>",
+	} {
+		if strings.Contains(pageText+appText, forbidden) {
+			t.Fatalf("legacy user-visible label %q is still present", forbidden)
 		}
 	}
 	if !strings.Contains(styleText, "position: sticky") {

@@ -71,6 +71,14 @@ func TestCodexCollectorImportsOnlyRedactedTurnSummaries(t *testing.T) {
 	writeCodexEnvelope(t, file, "event_msg", started.Format(time.RFC3339Nano), map[string]any{
 		"type": "task_started", "turn_id": "turn-secret-raw", "started_at": started.Format(time.RFC3339Nano), "model": "gpt-test-model", "model_context_window": 258400,
 	}, true)
+	writeCodexEnvelope(t, file, "event_msg", started.Add(10*time.Millisecond).Format(time.RFC3339Nano), map[string]any{
+		"type": "token_count", "info": map[string]any{
+			"last_token_usage": map[string]any{
+				"input_tokens": 0, "cached_input_tokens": 0, "cache_write_input_tokens": 0,
+				"output_tokens": 0, "reasoning_output_tokens": 0, "total_tokens": 145000,
+			},
+		},
+	}, true)
 	writeCodexEnvelope(t, file, "event_msg", started.Add(20*time.Millisecond).Format(time.RFC3339Nano), map[string]any{
 		"type": "token_count", "info": map[string]any{
 			"last_token_usage":  map[string]any{"input_tokens": 100, "cached_input_tokens": 20, "cache_write_input_tokens": 2, "output_tokens": 30, "reasoning_output_tokens": 10, "total_tokens": 160},
@@ -227,6 +235,55 @@ func TestCodexCollectorImportsOnlyRedactedTurnSummaries(t *testing.T) {
 	}
 	if len(store.readCodexRecords(time.Time{})) != 1 {
 		t.Fatal("rewrite/truncate duplicated the turn")
+	}
+}
+
+func TestCodexCollectorPrunesExpiredCheckpointsButKeepsRecentlyUpdatedRollouts(t *testing.T) {
+	_, collector, sessions, _ := newTestCodexCollector(t)
+	now := time.Now().Local().Truncate(time.Second)
+	old := now.AddDate(0, 0, -45)
+	oldName := "rollout-" + old.Format("2006-01-02T15-04-05") + "-old.jsonl"
+	oldPath := filepath.Join(sessions, oldName)
+	if err := os.WriteFile(oldPath, []byte{}, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(oldPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	collector.checkpoint.Files["stale"] = &codexFileCheckpoint{
+		RolloutHash: "stale",
+		PathHash:    pathHash(oldPath),
+		RolloutAt:   old,
+		ModTime:     old,
+	}
+	collector.checkpoint.Files["missing"] = &codexFileCheckpoint{
+		RolloutHash: "missing",
+		PathHash:    pathHash(filepath.Join(sessions, "rollout-missing.jsonl")),
+		RolloutAt:   old,
+		ModTime:     old,
+	}
+	recentName := "rollout-" + old.Format("2006-01-02T15-04-05") + "-recent.jsonl"
+	recentPath := filepath.Join(sessions, recentName)
+	if err := os.WriteFile(recentPath, []byte{}, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	collector.scanOnce()
+	if _, ok := collector.checkpoint.Files["stale"]; ok {
+		t.Fatal("expired checkpoint for old rollout was retained")
+	}
+	if _, ok := collector.checkpoint.Files["missing"]; ok {
+		t.Fatal("expired checkpoint for missing rollout was retained")
+	}
+	var recent *codexFileCheckpoint
+	for _, entry := range collector.checkpoint.Files {
+		if entry != nil && entry.PathHash == pathHash(recentPath) {
+			recent = entry
+			break
+		}
+	}
+	if recent == nil || !recent.RolloutAt.Before(now.AddDate(0, 0, -30)) || !recent.ModTime.After(old) {
+		t.Fatalf("recently updated old rollout checkpoint = %#v", recent)
 	}
 }
 
