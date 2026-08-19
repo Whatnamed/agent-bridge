@@ -148,6 +148,28 @@ func (r *providerRouter) listModels(ctx context.Context) ([]string, error) {
 	return uniqueModelIDs(ids), nil
 }
 
+func (r *providerRouter) prewarm(ctx context.Context) {
+	if r != nil && r.antigravity != nil {
+		r.antigravity.prewarm(ctx)
+	}
+}
+
+func (r *providerRouter) diagnostics() map[string]any {
+	if r == nil {
+		return map[string]any{
+			"codex":       map[string]any{"status": "ready"},
+			"antigravity": map[string]any{"status": antigravityStateDisabled},
+		}
+	}
+	result := map[string]any{"codex": map[string]any{"status": "ready"}}
+	if r.antigravity == nil {
+		result["antigravity"] = map[string]any{"status": antigravityStateDisabled}
+	} else {
+		result["antigravity"] = r.antigravity.diagnostics()
+	}
+	return result
+}
+
 func uniqueModelIDs(ids []string) []string {
 	seen := make(map[string]struct{}, len(ids))
 	result := make([]string, 0, len(ids))

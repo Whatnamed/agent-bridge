@@ -101,9 +101,15 @@ func (s *server) dashboardOverview(w http.ResponseWriter, r *http.Request) {
 		"quota":                   quota,
 		"range":                   dashboardRangeName(r.URL.Query()),
 		"source":                  dashboardSourceName(r.URL.Query()),
-		"stats":                   summarizeRecords(records),
-		"codex":                   s.telemetry.codexSnapshot(),
-		"memory":                  s.dashboardMemorySnapshot(),
+		"providers": func() map[string]any {
+			if s.providers == nil {
+				return (&providerRouter{}).diagnostics()
+			}
+			return s.providers.diagnostics()
+		}(),
+		"stats":  summarizeRecords(records),
+		"codex":  s.telemetry.codexSnapshot(),
+		"memory": s.dashboardMemorySnapshot(),
 	})
 }
 
