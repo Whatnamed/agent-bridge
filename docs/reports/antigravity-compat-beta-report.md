@@ -87,6 +87,9 @@ known Windows fake-server condition per the task scope.
 - `043da93` `test(antigravity): add compatibility fixtures and protocol gates`
 - `a20d439` `feat(monitor): add independent provider dashboard filter`
 - `2a38305` `test(monitor): accept verified provider models`
+- `bcb0137` `docs(antigravity): publish compatibility beta report`
+- `b70a798` `feat(antigravity): support verified structured output`
+- `88f6f66` `docs(antigravity): record structured output verification`
 
 Earlier beta commits `504e9da` and `e5c69d9` remain in the branch history.
 
