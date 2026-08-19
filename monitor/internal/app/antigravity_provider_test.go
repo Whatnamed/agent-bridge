@@ -642,6 +642,32 @@ func TestAntigravityStructuredOutputMapsToGenerateConfig(t *testing.T) {
 	}, stableAntigravityModel, "projects/test-project"); err == nil || !strings.Contains(err.Error(), "requires schema") {
 		t.Fatalf("missing schema was accepted: %v", err)
 	}
+	if _, err := buildAntigravityRequest(map[string]any{
+		"model": stableAntigravityModel,
+		"input": []any{map[string]any{"role": "user", "content": "bad"}},
+		"text": map[string]any{"format": map[string]any{
+			"type": "json_schema", "schema": map[string]any{
+				"type": "object", "properties": map[string]any{
+					"answer": map[string]any{"type": "string", "pattern": "^[a-z]+$"},
+				},
+			},
+		}},
+	}, stableAntigravityModel, "projects/test-project"); err == nil || !strings.Contains(err.Error(), "unsupported schema keyword") {
+		t.Fatalf("unsupported structured schema keyword was accepted: %v", err)
+	}
+	if _, err := buildAntigravityRequest(map[string]any{
+		"model": stableAntigravityModel,
+		"input": []any{map[string]any{"role": "user", "content": "bad"}},
+		"tools": []any{map[string]any{"type": "function", "function": map[string]any{
+			"name": "lookup", "parameters": map[string]any{
+				"type": "object", "properties": map[string]any{
+					"query": map[string]any{"type": "string", "minLength": 1},
+				},
+			},
+		}}},
+	}, stableAntigravityModel, "projects/test-project"); err == nil || !strings.Contains(err.Error(), "schema keyword") {
+		t.Fatalf("unsupported function schema keyword was accepted: %v", err)
+	}
 	chat, err := chatToResponse(map[string]any{
 		"model":           "gemini-3.7-flash-high",
 		"messages":        []any{map[string]any{"role": "user", "content": "return JSON"}},
@@ -656,6 +682,33 @@ func TestAntigravityStructuredOutputMapsToGenerateConfig(t *testing.T) {
 	}
 	if chatRequest.Request.GenerationConfig == nil || chatRequest.Request.GenerationConfig.ResponseMimeType != "application/json" {
 		t.Fatalf("Chat generation config = %#v", chatRequest.Request.GenerationConfig)
+	}
+}
+
+func TestAntigravityStructuredSchemaAcceptsDocumentedSubset(t *testing.T) {
+	schema := map[string]any{
+		"type":                 "object",
+		"title":                "answer",
+		"additionalProperties": false,
+		"properties": map[string]any{
+			"score":  map[string]any{"type": "number", "minimum": 0, "maximum": 1},
+			"date":   map[string]any{"type": "string", "format": "date"},
+			"maybe":  map[string]any{"type": []any{"string", "null"}},
+			"choice": map[string]any{"anyOf": []any{map[string]any{"type": "string"}, map[string]any{"type": "null"}}},
+			"tags":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1, "maxItems": 3},
+		},
+		"required": []any{"score"},
+	}
+	request, err := buildAntigravityRequest(map[string]any{
+		"model": stableAntigravityModel,
+		"input": []any{map[string]any{"role": "user", "content": "return the answer"}},
+		"text":  map[string]any{"format": map[string]any{"type": "json_schema", "schema": schema}},
+	}, stableAntigravityModel, "projects/test-project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Request.GenerationConfig == nil || request.Request.GenerationConfig.ResponseMimeType != "application/json" || !reflect.DeepEqual(request.Request.GenerationConfig.ResponseSchema, cloneMap(schema)) {
+		t.Fatalf("structured schema was not preserved: %#v", request.Request.GenerationConfig)
 	}
 }
 

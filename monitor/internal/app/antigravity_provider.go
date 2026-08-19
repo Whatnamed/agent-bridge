@@ -933,8 +933,12 @@ func antigravityTools(value any) ([]cloudcode.Tool, error) {
 		if fn == nil || strings.TrimSpace(stringValue(fn["name"])) == "" {
 			return nil, errors.New("Antigravity function tools must include a name")
 		}
+		parameters, err := antigravitySchema(fn["parameters"])
+		if err != nil {
+			return nil, err
+		}
 		result = append(result, cloudcode.Tool{FunctionDeclarations: []cloudcode.FunctionDeclaration{{
-			Name: stringValue(fn["name"]), Description: stringValue(fn["description"]), Parameters: antigravitySchema(fn["parameters"]),
+			Name: stringValue(fn["name"]), Description: stringValue(fn["description"]), Parameters: parameters,
 		}}})
 	}
 	return result, nil
@@ -977,30 +981,6 @@ func antigravityToolConfig(value any) (*cloudcode.ToolConfig, error) {
 		Mode:                 "ANY",
 		AllowedFunctionNames: []string{name},
 	}}, nil
-}
-
-func antigravitySchema(value any) *cloudcode.ParameterSchema {
-	m := mapAny(value)
-	if m == nil {
-		return nil
-	}
-	result := &cloudcode.ParameterSchema{Type: strings.ToUpper(stringValue(m["type"])), Description: stringValue(m["description"])}
-	for _, raw := range sliceAny(m["required"]) {
-		if name := strings.TrimSpace(stringValue(raw)); name != "" {
-			result.Required = append(result.Required, name)
-		}
-	}
-	for _, raw := range sliceAny(m["enum"]) {
-		result.Enum = append(result.Enum, stringValue(raw))
-	}
-	if properties := mapAny(m["properties"]); properties != nil {
-		result.Properties = map[string]*cloudcode.ParameterSchema{}
-		for name, raw := range properties {
-			result.Properties[name] = antigravitySchema(raw)
-		}
-	}
-	result.Items = antigravitySchema(m["items"])
-	return result
 }
 
 func antigravityGenerationConfig(payload map[string]any) (*cloudcode.GenerationConfig, error) {
@@ -1118,6 +1098,9 @@ func antigravityStructuredOutputFormat(payload map[string]any) (string, any, err
 		schema := format["schema"]
 		if schema == nil {
 			return "", nil, errors.New("Antigravity json_schema format requires schema")
+		}
+		if err := validateAntigravityResponseSchema(schema); err != nil {
+			return "", nil, err
 		}
 		switch value := schema.(type) {
 		case map[string]any:

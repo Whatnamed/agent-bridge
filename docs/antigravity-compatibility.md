@@ -22,7 +22,7 @@ metadata only; runtime translation never branches on ZCode or DSH.
 | Cancellation | existing server contract | existing server contract | covered by shared server tests | covered by shared server tests | No provider-specific retry or replay |
 | Usage/cache/reasoning tokens | yes | yes | telemetry fixture | telemetry fixture | Metadata only; no prompt/output/reasoning text |
 | Inline image data | offline serializer | offline serializer | fixture-ready | fixture-ready | `data:` URL only; five image MIME types; one internal tiny smoke passed |
-| Structured output | JSON object/schema | JSON object/schema | fixture-ready | fixture-ready | `generationConfig.responseMimeType/responseSchema`; one internal schema smoke passed |
+| Structured output | Gemini-supported JSON Schema subset | Gemini-supported JSON Schema subset | fixture-ready | fixture-ready | `generationConfig.responseMimeType/responseSchema`; unsupported keywords fail closed |
 | Unsupported content/tool types | 400 | 400 | fail closed | fail closed | Never silently discard semantic input |
 | Error status/retry semantics | yes | yes | yes | yes | Typed provider mapping; no generation replay |
 
@@ -38,7 +38,7 @@ The adapter classifies request fields into three categories:
    privacy-safe telemetry.
 3. Explicit rejection: semantically important fields that this beta cannot
    guarantee, including remote image URLs, files, unknown content parts,
-   non-function tools, unsupported structured-output formats, and
+   non-function tools, unsupported structured-output formats/schema keywords, and
    `parallel_tool_calls=false`.
 
 ## Tool continuation

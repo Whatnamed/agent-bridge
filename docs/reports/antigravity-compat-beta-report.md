@@ -41,10 +41,14 @@ The branch remains independent of `main`; no merge was performed.
   rather than silently dropped.
 - Structured output now maps `json_object` to
   `generationConfig.responseMimeType=application/json` and maps `json_schema`
-  to the same MIME type plus a preserved JSON schema. Explicit ordinary `text`
-  format remains normal text; unknown formats and malformed schemas fail
-  closed. The mapping was verified by offline tests and one internal tiny schema
-  probe.
+  to the same MIME type plus a validated Gemini-supported JSON Schema subset.
+  Explicit ordinary `text` format remains normal text; unknown formats,
+  unsupported schema keywords, and malformed schemas fail closed. The mapping
+  was verified by offline tests and one internal tiny schema probe.
+- Function tool parameters likewise accept only the subset currently expressible
+  by the CloudCode adapter (`type`, `description`, `properties`, `items`,
+  `required`, and string `enum`); unsupported schema keywords are rejected
+  before generation instead of being silently discarded.
 - The dashboard now has an independent Provider filter for All, Codex,
   Antigravity, and Unknown, including combined source/provider filtering.
 - The compatibility matrix and offline fixtures cover normal Responses, normal
