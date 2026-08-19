@@ -85,6 +85,49 @@ func TestAntigravitySequentialFunctionHistoryKeepsSeparateSteps(t *testing.T) {
 	}
 }
 
+func TestAntigravityPublicReasoningSummaryIsSafeToReplay(t *testing.T) {
+	request, err := buildAntigravityRequest(map[string]any{
+		"model": stableAntigravityModel,
+		"input": []any{
+			map[string]any{"role": "user", "content": "first"},
+			map[string]any{
+				"id": "rs_public", "type": "reasoning", "status": "completed",
+				"summary": []any{map[string]any{"type": "summary_text", "text": "public summary"}},
+			},
+			map[string]any{"role": "user", "content": "continue"},
+		},
+	}, stableAntigravityModel, "projects/test-project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(request.Request.Contents) != 2 || request.Request.Contents[0].Parts[0].Text != "first" || request.Request.Contents[1].Parts[0].Text != "continue" {
+		t.Fatalf("summary replay contents = %#v", request.Request.Contents)
+	}
+	for _, content := range request.Request.Contents {
+		for _, part := range content.Parts {
+			if part.EncryptedContent != "" {
+				t.Fatalf("public summary became encrypted content: %#v", request.Request.Contents)
+			}
+		}
+	}
+}
+
+func TestAntigravityPrivateReasoningContentRemainsExplicit(t *testing.T) {
+	request, err := buildAntigravityRequest(map[string]any{
+		"model": stableAntigravityModel,
+		"input": []any{
+			map[string]any{"role": "user", "content": "continue"},
+			map[string]any{"type": "reasoning", "encrypted_content": "provider-private"},
+		},
+	}, stableAntigravityModel, "projects/test-project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(request.Request.Contents) != 2 || request.Request.Contents[1].Role != "model" || request.Request.Contents[1].Parts[0].EncryptedContent != "provider-private" {
+		t.Fatalf("private reasoning content = %#v", request.Request.Contents)
+	}
+}
+
 func TestAntigravityOldOpaqueIDHistoryRemainsCompatible(t *testing.T) {
 	first := encodeThoughtSignatureToolCallID("old-1", "old-sig")
 	second := encodeThoughtSignatureToolCallID("old-2", "old-sig-2")

@@ -12,7 +12,7 @@ metadata only; runtime translation never branches on ZCode or DSH.
 | Normal text | yes | yes | yes | yes | Translate to user/model text parts |
 | System/developer instructions | yes | yes | yes | yes | Translate to `systemInstruction` text |
 | Multi-turn history | yes | yes | yes | yes | Reconstruct canonical history from request data |
-| Reasoning summaries | yes | yes | yes | yes | Preserve public summaries; private encrypted content is required when supplied |
+| Reasoning summaries | yes | yes | yes | yes | Replay-safe public summaries are ignored; supplied private encrypted content is forwarded explicitly |
 | Streaming | yes | yes | yes | yes | Canonical Responses events, then Chat chunks |
 | Non-streaming | yes | yes | yes | yes | Collect the same canonical stream |
 | Single function call | yes | yes | yes | yes | Opaque call ID carries the signature when needed |

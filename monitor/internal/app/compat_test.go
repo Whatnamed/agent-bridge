@@ -214,7 +214,7 @@ func TestPrepareResponseNormalizesReasoningAndDefaults(t *testing.T) {
 		t.Fatalf("defaults = %#v", got)
 	}
 	input := sliceAny(got["input"])
-	if len(input) != 2 || mapAny(input[0])["type"] != "reasoning" || mapAny(input[1])["encrypted_content"] != "cipher" {
+	if len(input) != 2 || mapAny(input[0])["type"] != "reasoning_summary" || mapAny(input[1])["encrypted_content"] != "cipher" {
 		t.Fatalf("input = %#v", input)
 	}
 }

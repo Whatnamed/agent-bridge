@@ -196,6 +196,12 @@ func antigravityContents(input []any) ([]cloudcode.Content, []cloudcode.ContentP
 				return nil, nil, errors.New("Antigravity reasoning input requires encrypted content")
 			}
 
+		case "reasoning_summary":
+			// Public summaries are not provider-private Gemini state. They are
+			// replay-safe metadata emitted by this bridge and must not become a
+			// synthetic CloudCode part.
+			continue
+
 		case "input_text", "text", "output_text":
 			if err := flushPending(); err != nil {
 				return nil, nil, err

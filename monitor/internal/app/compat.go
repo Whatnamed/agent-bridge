@@ -127,7 +127,17 @@ func normalizeInputItem(value any) any {
 	}
 	switch item["type"] {
 	case "reasoning":
-		return map[string]any{"type": "reasoning", "encrypted_content": item["encrypted_content"], "summary": sliceAny(item["summary"])}
+		encrypted := firstMapString(item, "encrypted_content", "encryptedContent")
+		if encrypted == "" {
+			// A public reasoning summary emitted by this bridge is useful for
+			// display, but it is not Gemini private state. Keep an explicit
+			// internal marker so replay can ignore it instead of treating it as
+			// an invalid encrypted reasoning part.
+			if _, hasSummary := item["summary"]; hasSummary {
+				return map[string]any{"type": "reasoning_summary"}
+			}
+		}
+		return map[string]any{"type": "reasoning", "encrypted_content": encrypted, "summary": sliceAny(item["summary"])}
 	case "message":
 		if item["role"] == "assistant" {
 			content := item["content"]

@@ -49,6 +49,10 @@ The branch remains independent of `main`; no merge was performed.
   Antigravity, and Unknown, including combined source/provider filtering.
 - The compatibility matrix and offline fixtures cover normal Responses, normal
   Chat, ZCode tool history, and DSH Chat tool history.
+- Public reasoning summary items emitted by the Bridge are safe to replay: they
+  are ignored as display metadata rather than being misclassified as Gemini
+  private encrypted state. Provider-private encrypted reasoning remains an
+  explicit, separate input path.
 
 ## Thought-signature transport
 
