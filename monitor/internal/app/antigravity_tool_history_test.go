@@ -87,13 +87,14 @@ func TestAntigravitySequentialFunctionHistoryKeepsSeparateSteps(t *testing.T) {
 
 func TestAntigravityOldOpaqueIDHistoryRemainsCompatible(t *testing.T) {
 	first := encodeThoughtSignatureToolCallID("old-1", "old-sig")
+	second := encodeThoughtSignatureToolCallID("old-2", "old-sig-2")
 	request, err := buildAntigravityRequest(map[string]any{
 		"model": stableAntigravityModel,
 		"input": []any{
 			map[string]any{"type": "function_call", "call_id": first, "name": "one", "arguments": `{}`},
-			map[string]any{"type": "function_call", "call_id": "old-2", "name": "two", "arguments": `{}`},
+			map[string]any{"type": "function_call", "call_id": second, "name": "two", "arguments": `{}`},
 			map[string]any{"type": "function_call_output", "call_id": first, "output": "one"},
-			map[string]any{"type": "function_call_output", "call_id": "old-2", "output": "two"},
+			map[string]any{"type": "function_call_output", "call_id": second, "output": "two"},
 		},
 	}, stableAntigravityModel, "projects/test-project")
 	if err != nil {
@@ -119,6 +120,16 @@ func TestFunctionCallTransportV2RejectsMalformedOrMismatchedEnvelope(t *testing.
 	}, stableAntigravityModel, "projects/test-project")
 	if err == nil || !strings.Contains(err.Error(), "incomplete") {
 		t.Fatalf("mismatched group was accepted: %v", err)
+	}
+}
+
+func TestAntigravityFunctionCallWithoutRecoverableSignatureFailsClosed(t *testing.T) {
+	_, err := buildAntigravityRequest(map[string]any{
+		"model": stableAntigravityModel,
+		"input": []any{map[string]any{"type": "function_call", "call_id": "raw-call", "name": "lookup", "arguments": `{}`}},
+	}, stableAntigravityModel, "projects/test-project")
+	if err == nil || !strings.Contains(err.Error(), "thought signature could not be recovered") {
+		t.Fatalf("signature-less function call was accepted: %v", err)
 	}
 }
 

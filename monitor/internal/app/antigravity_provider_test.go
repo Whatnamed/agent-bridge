@@ -155,6 +155,102 @@ func TestAntigravityControlPlaneCachesAndListsOnlyStableModels(t *testing.T) {
 	}
 }
 
+func TestAntigravityModelsExposeOnlyVerifiedGemini37Presets(t *testing.T) {
+	provider, _, closeServer := newTestAntigravityProvider(t, nil)
+	defer closeServer()
+	ids, err := provider.listModels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{stableAntigravityModel, gemini37LowModel, gemini37MediumModel} {
+		found := false
+		for _, got := range ids {
+			if got == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("verified preset %q missing from %#v", id, ids)
+		}
+	}
+	for _, id := range ids {
+		if strings.Contains(id, "tiered") || strings.HasPrefix(id, "chat_") || strings.HasPrefix(id, "tab_") || id == "gemini-internal-preview" {
+			t.Fatalf("unstable/internal model exposed: %q", id)
+		}
+	}
+}
+
+func TestAntigravityModelsUseProviderOwnership(t *testing.T) {
+	provider, _, closeServer := newTestAntigravityProvider(t, nil)
+	defer closeServer()
+	server := &server{
+		cfg:       config{},
+		backend:   testCodexBackend{},
+		providers: &providerRouter{codex: codexModelProvider{backend: testCodexBackend{}}, antigravity: provider},
+	}
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("models status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var document map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &document); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, raw := range sliceAny(document["data"]) {
+		model := mapAny(raw)
+		if isStableAntigravityModel(stringValue(model["id"])) {
+			if stringValue(model["owned_by"]) != antigravityProviderID {
+				t.Fatalf("model ownership = %#v", model)
+			}
+			seen[stringValue(model["id"])] = true
+		}
+	}
+	for _, id := range []string{gemini37LowModel, gemini37MediumModel, stableAntigravityModel} {
+		if !seen[id] {
+			t.Fatalf("model %q missing from /v1/models", id)
+		}
+	}
+}
+
+func TestAntigravityReasoningEffortMustMatchGemini37Preset(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		model   string
+		effort  string
+		wantErr bool
+	}{
+		{name: "low matches", model: gemini37LowModel, effort: "low"},
+		{name: "medium matches", model: gemini37MediumModel, effort: "medium"},
+		{name: "high matches", model: stableAntigravityModel, effort: "high"},
+		{name: "no explicit effort", model: stableAntigravityModel},
+		{name: "conflicting effort", model: stableAntigravityModel, effort: "low", wantErr: true},
+		{name: "unknown effort", model: stableAntigravityModel, effort: "minimal", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := map[string]any{"model": tc.model, "input": "hello"}
+			if tc.effort != "" {
+				payload["reasoning"] = map[string]any{"effort": tc.effort}
+			}
+			err := validateAntigravityReasoningPreset(payload)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr=%t", err, tc.wantErr)
+			}
+			if err == nil && tc.effort != "" {
+				request, buildErr := buildAntigravityRequest(payload, tc.model, "projects/test-project")
+				if buildErr != nil {
+					t.Fatal(buildErr)
+				}
+				if request.Request.GenerationConfig == nil || request.Request.GenerationConfig.ThinkingConfig == nil || request.Request.GenerationConfig.ThinkingConfig.ThinkingLevel != strings.ToUpper(tc.effort) {
+					t.Fatalf("thinking config = %#v", request.Request.GenerationConfig)
+				}
+			}
+		})
+	}
+}
+
 func TestProviderModelListKeepsCodexModelsWhenAntigravityCatalogIsUnavailable(t *testing.T) {
 	provider, _, closeServer := newTestAntigravityProvider(t, nil)
 	closeServer()
@@ -271,7 +367,7 @@ func TestAntigravityToolReasoningAndSignatureTranslation(t *testing.T) {
 		"model": stableAntigravityModel,
 		"input": []any{
 			map[string]any{"role": "user", "content": "continue"},
-			map[string]any{"type": "function_call", "call_id": "call-2", "name": "get_test_value", "arguments": `{"name":"smoke"}`},
+			map[string]any{"type": "function_call", "call_id": "call-2", "name": "get_test_value", "arguments": `{"name":"smoke"}`, "thought_signature": "signature-2"},
 			map[string]any{"type": "function_call_output", "call_id": "call-2", "output": "plain tool value"},
 		},
 	}
@@ -472,25 +568,12 @@ func TestAntigravityUnsupportedCapabilitiesReturnBadRequestBeforeStreaming(t *te
 			},
 		},
 		{
-			name: "responses input image",
-			path: "/v1/responses",
-			body: map[string]any{
-				"model": stableAntigravityModel, "stream": true,
-				"input": []any{map[string]any{"role": "user", "content": []any{
-					map[string]any{"type": "input_text", "text": "describe"},
-					map[string]any{"type": "input_image", "image_url": "data:image/png;base64,AA=="},
-				}}},
-			},
-		},
-		{
-			name: "chat image url",
+			name: "chat unknown response format",
 			path: "/v1/chat/completions",
 			body: map[string]any{
 				"model": stableAntigravityModel, "stream": true,
-				"messages": []any{map[string]any{"role": "user", "content": []any{
-					map[string]any{"type": "text", "text": "describe"},
-					map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,AA=="}},
-				}}},
+				"messages":        []any{map[string]any{"role": "user", "content": "hello"}},
+				"response_format": map[string]any{"type": "yaml"},
 			},
 		},
 		{
@@ -514,6 +597,16 @@ func TestAntigravityUnsupportedCapabilitiesReturnBadRequestBeforeStreaming(t *te
 			body: map[string]any{
 				"model": stableAntigravityModel, "stream": true,
 				"input": []any{map[string]any{"role": "user", "content": []any{
+					map[string]any{"type": "input_file", "file_id": "file_1"},
+				}}},
+			},
+		},
+		{
+			name: "chat unknown content part",
+			path: "/v1/chat/completions",
+			body: map[string]any{
+				"model": stableAntigravityModel, "stream": true,
+				"messages": []any{map[string]any{"role": "user", "content": []any{
 					map[string]any{"type": "input_file", "file_id": "file_1"},
 				}}},
 			},

@@ -130,7 +130,14 @@ func normalizeInputItem(value any) any {
 		return map[string]any{"type": "reasoning", "encrypted_content": item["encrypted_content"], "summary": sliceAny(item["summary"])}
 	case "message":
 		if item["role"] == "assistant" {
-			result := map[string]any{"role": "assistant", "content": messageText(item)}
+			content := item["content"]
+			switch value := content.(type) {
+			case map[string]any:
+				content = cloneMap(value)
+			case []any:
+				content = cloneSlice(value)
+			}
+			result := map[string]any{"role": "assistant", "content": content}
 			if item["phase"] != nil {
 				result["phase"] = item["phase"]
 			}
@@ -336,7 +343,14 @@ func chatToResponse(body map[string]any, model string) (map[string]any, error) {
 				}
 			}
 			result["text"] = mergeMap(mapAny(result["text"]), map[string]any{"format": f})
+		default:
+			// Preserve an unknown response format so a provider-specific
+			// validator can reject it instead of silently changing the
+			// requested output semantics.
+			result["text"] = mergeMap(mapAny(result["text"]), map[string]any{"format": cloneMap(format)})
 		}
+	} else if body["response_format"] != nil {
+		result["text"] = mergeMap(mapAny(result["text"]), map[string]any{"format": map[string]any{"type": "__invalid_response_format"}})
 	}
 	return result, nil
 }
@@ -409,6 +423,17 @@ func chatContent(value any) any {
 			parts = append(parts, map[string]any{"type": "input_image", "image_url": u})
 		case "input_image":
 			parts = append(parts, cloneMap(p))
+		case "output_text":
+			parts = append(parts, map[string]any{"type": "input_text", "text": stringValue(p["text"])})
+		default:
+			// Preserve the marker so an Antigravity request can reject it
+			// explicitly. Do not silently turn an unknown semantic part into a
+			// successful text-only request.
+			if p == nil {
+				parts = append(parts, map[string]any{"type": "__invalid_content_part"})
+			} else {
+				parts = append(parts, cloneMap(p))
+			}
 		}
 	}
 	return parts

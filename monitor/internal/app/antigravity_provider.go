@@ -796,6 +796,13 @@ func buildAntigravityRequest(payload map[string]any, model, project string) (clo
 	if generation := antigravityGenerationConfig(payload); generation != nil {
 		request.Request.GenerationConfig = generation
 	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		return cloudcode.GenerateRequest{}, fmt.Errorf("Antigravity request could not be encoded: %w", err)
+	}
+	if len(encoded) > maxAntigravityRequestJSONBytes {
+		return cloudcode.GenerateRequest{}, fmt.Errorf("Antigravity request exceeds the %d byte JSON limit", maxAntigravityRequestJSONBytes)
+	}
 	return request, nil
 }
 
@@ -833,9 +840,6 @@ func validateAntigravityPayload(payload map[string]any) error {
 		}
 		return fmt.Errorf("Antigravity does not support response_format %q", formatType)
 	}
-	if inputType := unsupportedAntigravityInputType(payload["input"]); inputType != "" {
-		return fmt.Errorf("Antigravity does not support %s input", inputType)
-	}
 	if _, _, err := antigravityContents(normalizeResponseInput(payload["input"])); err != nil {
 		return err
 	}
@@ -868,164 +872,6 @@ func validateAntigravityReasoningPreset(payload map[string]any) error {
 		}
 	}
 	return nil
-}
-
-func unsupportedAntigravityInputType(value any) string {
-	switch current := value.(type) {
-	case []any:
-		for _, item := range current {
-			if typ := unsupportedAntigravityInputType(item); typ != "" {
-				return typ
-			}
-		}
-	case map[string]any:
-		typ := strings.ToLower(strings.TrimSpace(stringValue(current["type"])))
-		switch typ {
-		case "image", "image_url", "input_image":
-			return typ
-		}
-		for _, child := range current {
-			if typ := unsupportedAntigravityInputType(child); typ != "" {
-				return typ
-			}
-		}
-	}
-	return ""
-}
-
-func antigravityContentsLegacy(input []any) ([]cloudcode.Content, []cloudcode.ContentPart, error) {
-	contents := make([]cloudcode.Content, 0, len(input))
-	systemParts := make([]cloudcode.ContentPart, 0)
-	functionNames, err := responseFunctionCallNames(input)
-	if err != nil {
-		return nil, nil, err
-	}
-	for _, raw := range input {
-		item := mapAny(raw)
-		if item == nil {
-			if text := strings.TrimSpace(stringValue(raw)); text != "" {
-				contents = append(contents, cloudcode.Content{Role: "user", Parts: []cloudcode.ContentPart{{Text: text}}})
-			} else if raw != nil {
-				return nil, nil, errors.New("Antigravity input supports text and known message/tool items only")
-			}
-			continue
-		}
-		typ := stringValue(item["type"])
-		switch typ {
-		case "function_call":
-			transportID := strings.TrimSpace(stringValue(valueOr(item["call_id"], item["id"])))
-			name := strings.TrimSpace(stringValue(item["name"]))
-			if transportID == "" || name == "" {
-				return nil, nil, errors.New("function_call must include call_id and name")
-			}
-			callID, transportSignature, err := decodeThoughtSignatureToolCallID(transportID)
-			if err != nil {
-				return nil, nil, err
-			}
-			args := mapValueFromJSON(item["arguments"])
-			part := cloudcode.ContentPart{FunctionCall: &cloudcode.FunctionCall{ID: callID, Name: name, Args: args}}
-			signature := firstMapString(item, "thought_signature", "thoughtSignature")
-			if transportSignature != "" {
-				if signature != "" && signature != transportSignature {
-					return nil, nil, errors.New("function_call thought signature does not match its transport id")
-				}
-				signature = transportSignature
-			}
-			if signature != "" {
-				part.ThoughtSignature = signature
-			}
-			contents = append(contents, cloudcode.Content{Role: "model", Parts: []cloudcode.ContentPart{part}})
-		case "function_call_output":
-			name, err := resolveResponseFunctionOutputName(item, functionNames)
-			if err != nil {
-				return nil, nil, err
-			}
-			callID, _, err := decodeThoughtSignatureToolCallID(stringValue(item["call_id"]))
-			if err != nil {
-				return nil, nil, err
-			}
-			response := functionResponseValue(item["output"])
-			contents = append(contents, cloudcode.Content{Role: "user", Parts: []cloudcode.ContentPart{{FunctionResponse: &cloudcode.FunctionResponse{ID: callID, Name: name, Response: response}}}})
-		case "reasoning":
-			if encrypted := firstMapString(item, "encrypted_content", "encryptedContent"); encrypted != "" {
-				contents = append(contents, cloudcode.Content{Role: "model", Parts: []cloudcode.ContentPart{{EncryptedContent: encrypted}}})
-			} else {
-				return nil, nil, errors.New("Antigravity reasoning input requires encrypted content")
-			}
-		case "input_text", "text", "output_text":
-			if _, ok := item["text"]; !ok {
-				return nil, nil, fmt.Errorf("Antigravity %s input must include text", typ)
-			}
-			role := "user"
-			if typ == "output_text" {
-				role = "model"
-			}
-			contents = append(contents, cloudcode.Content{Role: role, Parts: []cloudcode.ContentPart{{Text: stringValue(item["text"])}}})
-		case "message", "":
-			role := stringValue(item["role"])
-			if role == "system" || role == "developer" {
-				text, err := antigravityInstructionText(item["content"])
-				if err != nil {
-					return nil, nil, err
-				}
-				if text = strings.TrimSpace(text); text != "" {
-					systemParts = append(systemParts, cloudcode.ContentPart{Text: text})
-				}
-				continue
-			}
-			if role == "assistant" {
-				role = "model"
-			} else if role == "" || role == "user" {
-				role = "user"
-			} else {
-				return nil, nil, fmt.Errorf("unsupported Responses input role %q", role)
-			}
-			parts, err := antigravityTextParts(item["content"])
-			if err != nil {
-				return nil, nil, err
-			}
-			if len(parts) > 0 {
-				contentParts := make([]cloudcode.ContentPart, 0, len(parts))
-				for _, part := range parts {
-					contentParts = append(contentParts, cloudcode.ContentPart{Text: part})
-				}
-				contents = append(contents, cloudcode.Content{Role: role, Parts: contentParts})
-			}
-		default:
-			return nil, nil, fmt.Errorf("Antigravity does not support input item type %q", typ)
-		}
-	}
-	if len(contents) == 0 {
-		return nil, nil, errors.New("Antigravity request input is empty")
-	}
-	return contents, systemParts, nil
-}
-
-func antigravityTextParts(value any) ([]string, error) {
-	if value == nil {
-		return nil, nil
-	}
-	if text, ok := value.(string); ok {
-		return []string{text}, nil
-	}
-	rawParts, ok := value.([]any)
-	if !ok {
-		return nil, errors.New("Antigravity message content supports text parts only")
-	}
-	parts := make([]string, 0, len(rawParts))
-	for _, raw := range rawParts {
-		part := mapAny(raw)
-		if part == nil {
-			return nil, errors.New("Antigravity message content supports text parts only")
-		}
-		switch typ := stringValue(part["type"]); typ {
-		case "input_text", "text", "output_text":
-			parts = append(parts, stringValue(part["text"]))
-		default:
-			return nil, fmt.Errorf("Antigravity does not support input content type %q", typ)
-		}
-	}
-	return parts, nil
 }
 
 func antigravityInstructionText(value any) (string, error) {

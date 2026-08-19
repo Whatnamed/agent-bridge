@@ -124,6 +124,9 @@ func antigravityContents(input []any) ([]cloudcode.Content, []cloudcode.ContentP
 				}
 				signature = decoded.Signature
 			}
+			if decoded.Version == 0 && signature == "" {
+				return nil, nil, errors.New("function_call thought signature could not be recovered")
+			}
 			part := cloudcode.ContentPart{FunctionCall: &cloudcode.FunctionCall{ID: decoded.CallID, Name: name, Args: mapValueFromJSON(item["arguments"])}}
 			part.ThoughtSignature = signature
 			pendingCalls.parts = append(pendingCalls.parts, part)
@@ -173,6 +176,16 @@ func antigravityContents(input []any) ([]cloudcode.Content, []cloudcode.ContentP
 			pendingOutputs.parts = append(pendingOutputs.parts, cloudcode.ContentPart{FunctionResponse: &cloudcode.FunctionResponse{ID: decoded.CallID, Name: name, Response: functionResponseValue(item["output"])}})
 			pendingOutputs.calls = append(pendingOutputs.calls, antigravityFunctionCallRef{decoded: decoded, name: name})
 
+		case "input_image":
+			if err := flushPending(); err != nil {
+				return nil, nil, err
+			}
+			part, err := antigravityImageContentPart(item)
+			if err != nil {
+				return nil, nil, err
+			}
+			contents = append(contents, cloudcode.Content{Role: "user", Parts: []cloudcode.ContentPart{part}})
+
 		case "reasoning":
 			if err := flushPending(); err != nil {
 				return nil, nil, err
@@ -221,16 +234,12 @@ func antigravityContents(input []any) ([]cloudcode.Content, []cloudcode.ContentP
 			} else {
 				return nil, nil, fmt.Errorf("unsupported Responses input role %q", role)
 			}
-			parts, err := antigravityTextParts(item["content"])
+			parts, err := antigravityMessageParts(item["content"])
 			if err != nil {
 				return nil, nil, err
 			}
 			if len(parts) > 0 {
-				contentParts := make([]cloudcode.ContentPart, 0, len(parts))
-				for _, part := range parts {
-					contentParts = append(contentParts, cloudcode.ContentPart{Text: part})
-				}
-				contents = append(contents, cloudcode.Content{Role: role, Parts: contentParts})
+				contents = append(contents, cloudcode.Content{Role: role, Parts: parts})
 			}
 
 		default:
