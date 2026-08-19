@@ -127,9 +127,6 @@ func normalizeInputItem(value any) any {
 	}
 	switch item["type"] {
 	case "reasoning":
-		if stringValue(item["encrypted_content"]) == "" {
-			return nil
-		}
 		return map[string]any{"type": "reasoning", "encrypted_content": item["encrypted_content"], "summary": sliceAny(item["summary"])}
 	case "message":
 		if item["role"] == "assistant" {
@@ -190,12 +187,13 @@ func chatToResponse(body map[string]any, model string) (map[string]any, error) {
 			if role == "function" && rawCallID == "" {
 				rawCallID = stringValue(msg["name"])
 			}
-			callID, _, err := decodeThoughtSignatureToolCallID(rawCallID)
+			decoded, err := decodeFunctionCallTransportID(rawCallID)
 			if err != nil {
 				return nil, err
 			}
+			callID := decoded.CallID
 			name := strings.TrimSpace(stringValue(msg["name"]))
-			if mapped := functionNames[callID]; mapped != "" {
+			if mapped := firstNonEmpty(functionNames[rawCallID], functionNames[callID]); mapped != "" {
 				if name != "" && name != mapped {
 					return nil, fmt.Errorf("tool output name does not match its assistant tool call")
 				}
@@ -204,7 +202,7 @@ func chatToResponse(body map[string]any, model string) (map[string]any, error) {
 			if name == "" {
 				return nil, fmt.Errorf("tool output function name could not be resolved")
 			}
-			output := map[string]any{"type": "function_call_output", "call_id": callID, "name": name, "output": contentText(msg["content"])}
+			output := map[string]any{"type": "function_call_output", "call_id": rawCallID, "name": name, "output": contentText(msg["content"])}
 			input = append(input, output)
 		case "assistant":
 			if fc := mapAny(msg["function_call"]); fc != nil {
@@ -213,18 +211,20 @@ func chatToResponse(body map[string]any, model string) (map[string]any, error) {
 					return nil, fmt.Errorf("assistant function_call must include name")
 				}
 				rawCallID := stringValue(valueOr(fc["id"], fc["name"]))
-				callID, signature, err := decodeThoughtSignatureToolCallID(rawCallID)
+				decoded, err := decodeFunctionCallTransportID(rawCallID)
 				if err != nil {
 					return nil, err
 				}
-				if explicit := firstMapString(fc, "thought_signature", "thoughtSignature"); explicit != "" {
+				callID, signature := decoded.CallID, decoded.Signature
+				if explicit := chatToolCallThoughtSignature(nil, fc); explicit != "" {
 					if signature != "" && signature != explicit {
 						return nil, fmt.Errorf("assistant function_call thought signature does not match its transport id")
 					}
 					signature = explicit
 				}
 				functionNames[callID] = name
-				entry := map[string]any{"type": "function_call", "call_id": callID, "name": name, "arguments": valueOr(fc["arguments"], "{}")}
+				functionNames[rawCallID] = name
+				entry := map[string]any{"type": "function_call", "call_id": rawCallID, "name": name, "arguments": valueOr(fc["arguments"], "{}")}
 				if signature != "" {
 					entry["thought_signature"] = signature
 				}
@@ -241,18 +241,20 @@ func chatToResponse(body map[string]any, model string) (map[string]any, error) {
 					return nil, fmt.Errorf("assistant tool_call must include function name")
 				}
 				rawCallID := stringValue(tc["id"])
-				callID, signature, err := decodeThoughtSignatureToolCallID(rawCallID)
+				decoded, err := decodeFunctionCallTransportID(rawCallID)
 				if err != nil {
 					return nil, err
 				}
-				if explicit := firstMapString(fn, "thought_signature", "thoughtSignature"); explicit != "" {
+				callID, signature := decoded.CallID, decoded.Signature
+				if explicit := chatToolCallThoughtSignature(tc, fn); explicit != "" {
 					if signature != "" && signature != explicit {
 						return nil, fmt.Errorf("assistant tool_call thought signature does not match its transport id")
 					}
 					signature = explicit
 				}
 				functionNames[callID] = name
-				entry := map[string]any{"type": "function_call", "call_id": callID, "name": name, "arguments": valueOr(fn["arguments"], "{}")}
+				functionNames[rawCallID] = name
+				entry := map[string]any{"type": "function_call", "call_id": rawCallID, "name": name, "arguments": valueOr(fn["arguments"], "{}")}
 				if signature != "" {
 					entry["thought_signature"] = signature
 				}
@@ -352,6 +354,25 @@ func chatToolChoice(value any) any {
 		return map[string]any{"type": "function", "name": fn["name"]}
 	}
 	return value
+}
+
+func chatToolCallThoughtSignature(toolCall, function map[string]any) string {
+	for _, source := range []map[string]any{toolCall, function} {
+		if source == nil {
+			continue
+		}
+		if signature := firstMapString(source, "thought_signature", "thoughtSignature"); signature != "" {
+			return signature
+		}
+		if extra := mapAny(source["extra_content"]); extra != nil {
+			if google := mapAny(extra["google"]); google != nil {
+				if signature := firstMapString(google, "thought_signature", "thoughtSignature"); signature != "" {
+					return signature
+				}
+			}
+		}
+	}
+	return ""
 }
 func chatFunctionChoice(value any) any {
 	m := mapAny(value)
@@ -480,7 +501,11 @@ func responseToChat(response map[string]any, fallback string, legacy bool, n int
 				legacyCall = fn
 			}
 		} else {
-			toolCalls = append(toolCalls, map[string]any{"id": functionCallTransportID(item), "type": "function", "function": fn})
+			toolCall := map[string]any{"id": functionCallTransportID(item), "type": "function", "function": fn}
+			if signature := firstMapString(item, "thought_signature", "thoughtSignature"); signature != "" {
+				toolCall["extra_content"] = map[string]any{"google": map[string]any{"thought_signature": signature}}
+			}
+			toolCalls = append(toolCalls, toolCall)
 		}
 	}
 	message := map[string]any{"role": "assistant", "content": responseText(response)}

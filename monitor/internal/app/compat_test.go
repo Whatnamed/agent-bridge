@@ -82,11 +82,11 @@ func TestChatToolContinuationPreservesFunctionNameAndThoughtSignature(t *testing
 		t.Fatalf("converted input = %#v", input)
 	}
 	call := mapAny(input[0])
-	if call["call_id"] != "call-1" || call["name"] != "get_test_value" || call["thought_signature"] != "signature-1" {
+	if call["call_id"] != transportID || call["name"] != "get_test_value" || call["thought_signature"] != "signature-1" {
 		t.Fatalf("converted function call = %#v", call)
 	}
 	output := mapAny(input[1])
-	if output["call_id"] != "call-1" || output["name"] != "get_test_value" {
+	if output["call_id"] != transportID || output["name"] != "get_test_value" {
 		t.Fatalf("converted function output = %#v", output)
 	}
 	legacyCompletion := responseToChat(response, "fallback", true, 1)
@@ -214,7 +214,7 @@ func TestPrepareResponseNormalizesReasoningAndDefaults(t *testing.T) {
 		t.Fatalf("defaults = %#v", got)
 	}
 	input := sliceAny(got["input"])
-	if len(input) != 1 || mapAny(input[0])["encrypted_content"] != "cipher" {
+	if len(input) != 2 || mapAny(input[0])["type"] != "reasoning" || mapAny(input[1])["encrypted_content"] != "cipher" {
 		t.Fatalf("input = %#v", input)
 	}
 }

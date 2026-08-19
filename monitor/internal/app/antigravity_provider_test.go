@@ -23,6 +23,10 @@ type fakeAntigravityCloudCode struct {
 	streamCalls    int
 	generateBodies []map[string]any
 	streamEvents   []string
+	streamStatus   int
+	retryAfter     string
+	loadStatus     int
+	modelStatus    int
 }
 
 func newFakeAntigravityCloudCode(t *testing.T, events []string) (*fakeAntigravityCloudCode, *httptest.Server) {
@@ -32,18 +36,40 @@ func newFakeAntigravityCloudCode(t *testing.T, events []string) (*fakeAntigravit
 		switch r.URL.Path {
 		case "/v1internal:loadCodeAssist":
 			fake.mu.Lock()
+			loadStatus := fake.loadStatus
 			fake.loadCalls++
 			fake.mu.Unlock()
+			if loadStatus != 0 {
+				w.WriteHeader(loadStatus)
+				return
+			}
 			writeFakeJSON(w, map[string]any{"cloudaicompanionProject": "projects/test-project", "gcpManaged": false})
 		case "/v1internal:fetchAvailableModels":
 			fake.mu.Lock()
+			modelStatus := fake.modelStatus
 			fake.modelCalls++
 			fake.mu.Unlock()
+			if modelStatus != 0 {
+				w.WriteHeader(modelStatus)
+				return
+			}
 			writeFakeJSON(w, map[string]any{"models": map[string]any{
+				gemini37LowModel:          map[string]any{"displayName": "Gemini Flash Low"},
+				gemini37MediumModel:       map[string]any{"displayName": "Gemini Flash Medium"},
 				stableAntigravityModel:    map[string]any{"displayName": "Gemini Flash High"},
 				"gemini-internal-preview": map[string]any{"displayName": "internal"},
 			}, "defaultAgentModelId": stableAntigravityModel})
 		case "/v1internal:streamGenerateContent":
+			fake.mu.Lock()
+			streamStatus, retryAfter := fake.streamStatus, fake.retryAfter
+			fake.mu.Unlock()
+			if streamStatus != 0 {
+				if retryAfter != "" {
+					w.Header().Set("Retry-After", retryAfter)
+				}
+				w.WriteHeader(streamStatus)
+				return
+			}
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
 				http.Error(w, "read failed", http.StatusBadRequest)
@@ -114,7 +140,7 @@ func TestAntigravityControlPlaneCachesAndListsOnlyStableModels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(first) != 1 || first[0] != stableAntigravityModel || len(second) != 1 || second[0] != stableAntigravityModel {
+	if len(first) != 3 || first[0] != stableAntigravityModel || first[1] != gemini37LowModel || first[2] != gemini37MediumModel || len(second) != 3 || second[0] != stableAntigravityModel || second[1] != gemini37LowModel || second[2] != gemini37MediumModel {
 		t.Fatalf("stable model list = %#v / %#v", first, second)
 	}
 	resolution, err := provider.resolveModel(ctx, stableAntigravityModel)
@@ -144,7 +170,7 @@ func TestAntigravityModelResolutionFailsClosedWithoutGeneration(t *testing.T) {
 	defer closeServer()
 	router := &providerRouter{codex: codexModelProvider{backend: testCodexBackend{}}, antigravity: provider}
 	s := &server{cfg: config{}, backend: testCodexBackend{}, providers: router, responses: newResponseStore(5), chats: newChatStore(5)}
-	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gemini-3.7-flash-low","input":"hello"}`))
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gemini-3.7-flash-tiered","input":"hello"}`))
 	response := httptest.NewRecorder()
 	s.ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "no fallback") {

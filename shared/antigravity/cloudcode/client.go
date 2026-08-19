@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -44,6 +45,7 @@ type Client struct {
 type HTTPError struct {
 	Operation  string
 	StatusCode int
+	RetryAfter string
 }
 
 func (e *HTTPError) Error() string {
@@ -197,7 +199,7 @@ func (c *Client) jsonRequest(ctx context.Context, method, path string, body []by
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64*1024))
-		return nil, &HTTPError{Operation: path, StatusCode: response.StatusCode}
+		return nil, &HTTPError{Operation: path, StatusCode: response.StatusCode, RetryAfter: safeRetryAfter(response.Header.Get("Retry-After"))}
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, 4*1024*1024))
 	if err != nil {
@@ -273,7 +275,7 @@ func (c *Client) StreamGenerateContent(ctx context.Context, request GenerateRequ
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		_ = response.Body.Close()
-		return nil, &HTTPError{Operation: "streamGenerateContent", StatusCode: response.StatusCode}
+		return nil, &HTTPError{Operation: "streamGenerateContent", StatusCode: response.StatusCode, RetryAfter: safeRetryAfter(response.Header.Get("Retry-After"))}
 	}
 	return &Stream{
 		response:           response,
@@ -357,7 +359,7 @@ func parseEvent(data []byte) (Event, error) {
 			candidate.Role = stringValue(content["role"])
 		}
 		parts, _ := content["parts"].([]any)
-		for _, rawPart := range parts {
+		for partIndex, rawPart := range parts {
 			partMap, ok := rawPart.(map[string]any)
 			if !ok {
 				continue
@@ -369,9 +371,11 @@ func parseEvent(data []byte) (Event, error) {
 			}
 			if callMap, ok := firstMap(partMap, "functionCall", "function_call"); ok {
 				part.FunctionCall = &FunctionCall{
-					ID:   firstString(callMap, "id", "callId", "call_id"),
-					Name: firstString(callMap, "name"),
-					Args: mapValue(callMap, "args", "arguments"),
+					ID:               firstString(callMap, "id", "callId", "call_id"),
+					Name:             firstString(callMap, "name"),
+					Args:             mapValue(callMap, "args", "arguments"),
+					ThoughtSignature: part.ThoughtSignature,
+					PartIndex:        partIndex,
 				}
 				event.FunctionCalls = append(event.FunctionCalls, *part.FunctionCall)
 			}
@@ -466,6 +470,18 @@ func firstInt(source map[string]any, keys ...string) int64 {
 }
 
 var ErrTruncatedStream = errors.New("truncated CloudCode SSE stream")
+
+func safeRetryAfter(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil || seconds < 0 || seconds > 86400 {
+		return ""
+	}
+	return strconv.Itoa(seconds)
+}
 
 type ModelResolution struct {
 	RequestedModel      string

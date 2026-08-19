@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +19,15 @@ import (
 const (
 	antigravityProviderID  = "antigravity"
 	stableAntigravityModel = "gemini-3.7-flash-high"
+	gemini37LowModel       = "gemini-3.7-flash-low"
+	gemini37MediumModel    = "gemini-3.7-flash-medium"
+)
+
+const (
+	antigravityStateDisabled = "disabled"
+	antigravityStateWarming  = "warming"
+	antigravityStateReady    = "ready"
+	antigravityStateDegraded = "degraded"
 )
 
 type antigravityProvider struct {
@@ -30,6 +41,11 @@ type antigravityProvider struct {
 	catalog        cloudcode.ModelsResponse
 	catalogExpires time.Time
 	tokenExpiry    time.Time
+	state          string
+	lastRefresh    time.Time
+	lastErrorClass string
+	lastErrorAt    time.Time
+	prewarmOnce    sync.Once
 }
 
 func newAntigravityProvider(cfg config) (*antigravityProvider, error) {
@@ -55,6 +71,7 @@ func newAntigravityProvider(cfg config) (*antigravityProvider, error) {
 		tokenManager: manager,
 		client:       client,
 		catalog:      cloudcode.ModelsResponse{Models: map[string]cloudcode.AvailableModel{}},
+		state:        antigravityStateWarming,
 	}, nil
 }
 
@@ -76,6 +93,7 @@ func (p *antigravityProvider) listModels(ctx context.Context) ([]string, error) 
 			ids = append(ids, id)
 		}
 	}
+	sort.Strings(ids)
 	return uniqueModelIDs(ids), nil
 }
 
@@ -98,9 +116,11 @@ func (p *antigravityProvider) ensureControlPlane(ctx context.Context) error {
 	projectFresh := p.project != "" && now.Before(p.projectExpires)
 	catalogFresh := len(p.catalog.Models) > 0 && now.Before(p.catalogExpires)
 	if projectFresh && catalogFresh {
+		p.state = antigravityStateReady
 		p.mu.Unlock()
 		return nil
 	}
+	p.state = antigravityStateWarming
 	// Keep control-plane refreshes serialized. This is deliberately outside the
 	// generation hot path once the TTLs are warm, while avoiding duplicate
 	// loadCodeAssist/fetchAvailableModels requests during startup bursts.
@@ -108,14 +128,14 @@ func (p *antigravityProvider) ensureControlPlane(ctx context.Context) error {
 	if !projectFresh {
 		loaded, err := p.client.LoadCodeAssist(ctx)
 		if err != nil {
-			return &backendError{502, "Antigravity loadCodeAssist failed."}
+			return p.controlPlaneFailureLocked(antigravityProviderError(ctx, "loadCodeAssist", err))
 		}
 		project := strings.TrimSpace(p.cfg.AntigravityProject)
 		if project == "" {
 			project = strings.TrimSpace(loaded.CloudAICompanionProject)
 		}
 		if project == "" {
-			return &backendError{502, "Antigravity loadCodeAssist did not return a verified project."}
+			return p.controlPlaneFailureLocked(antigravityProviderStaticError(ctx, "loadCodeAssist", "Antigravity loadCodeAssist did not return a verified project.", "provider_control_plane", true))
 		}
 		p.project = project
 		p.projectExpires = now.Add(p.projectTTL())
@@ -124,7 +144,7 @@ func (p *antigravityProvider) ensureControlPlane(ctx context.Context) error {
 	if !catalogFresh {
 		catalog, err := p.client.FetchAvailableModels(ctx)
 		if err != nil {
-			return &backendError{502, "Antigravity fetchAvailableModels failed."}
+			return p.controlPlaneFailureLocked(antigravityProviderError(ctx, "fetchAvailableModels", err))
 		}
 		p.catalog = catalog
 		p.catalogExpires = now.Add(p.catalogTTL())
@@ -133,7 +153,70 @@ func (p *antigravityProvider) ensureControlPlane(ctx context.Context) error {
 	if err == nil {
 		p.tokenExpiry = status.Expiry
 	}
+	p.state = antigravityStateReady
+	p.lastRefresh = time.Now()
+	p.lastErrorClass = ""
+	p.lastErrorAt = time.Time{}
 	return nil
+}
+
+func (p *antigravityProvider) controlPlaneFailure(err error) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.controlPlaneFailureLocked(err)
+}
+
+func (p *antigravityProvider) controlPlaneFailureLocked(err error) error {
+	p.state = antigravityStateDegraded
+	p.lastErrorAt = time.Now()
+	var providerErr *providerBackendError
+	if errors.As(err, &providerErr) && providerErr.ErrorClass != "" {
+		p.lastErrorClass = providerErr.ErrorClass
+	} else {
+		p.lastErrorClass = "provider_control_plane"
+	}
+	return err
+}
+
+func (p *antigravityProvider) prewarm(parent context.Context) {
+	if p == nil {
+		return
+	}
+	p.prewarmOnce.Do(func() {
+		timeout := p.cfg.Timeout
+		if timeout <= 0 || timeout > 20*time.Second {
+			timeout = 20 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(parent, timeout)
+		defer cancel()
+		_ = p.ensureControlPlane(ctx)
+	})
+}
+
+func (p *antigravityProvider) diagnostics() map[string]any {
+	if p == nil {
+		return map[string]any{"status": antigravityStateDisabled}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	result := map[string]any{
+		"status":            valueOr(p.state, antigravityStateWarming),
+		"catalog_size":      len(p.catalog.Models),
+		"project_available": p.project != "",
+	}
+	if !p.lastRefresh.IsZero() {
+		result["last_refresh"] = p.lastRefresh.UTC()
+	}
+	if !p.tokenExpiry.IsZero() {
+		result["oauth_token_expiry"] = p.tokenExpiry.UTC()
+	}
+	if p.lastErrorClass != "" {
+		result["last_error_class"] = p.lastErrorClass
+	}
+	if !p.lastErrorAt.IsZero() {
+		result["last_error_at"] = p.lastErrorAt.UTC()
+	}
+	return result
 }
 
 func (p *antigravityProvider) catalogTTL() time.Duration {
@@ -169,7 +252,12 @@ func (p *antigravityProvider) oauthExpiry() time.Time {
 }
 
 func isStableAntigravityModel(model string) bool {
-	return strings.TrimSpace(model) == stableAntigravityModel
+	switch strings.TrimSpace(model) {
+	case gemini37LowModel, gemini37MediumModel, stableAntigravityModel:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *antigravityProvider) stream(ctx context.Context, payload map[string]any, fn func(map[string]any) error) error {
@@ -198,14 +286,103 @@ func (p *antigravityProvider) stream(ctx context.Context, payload map[string]any
 	}
 	stream, err := p.client.StreamGenerateContent(ctx, request)
 	if err != nil {
-		var httpErr *cloudcode.HTTPError
-		if errors.As(err, &httpErr) {
-			return &backendError{502, fmt.Sprintf("Antigravity streamGenerateContent failed (upstream HTTP %d).", httpErr.StatusCode)}
-		}
-		return &backendError{502, "Antigravity streamGenerateContent failed."}
+		return antigravityProviderError(ctx, "streamGenerateContent", err)
 	}
 	defer stream.Close()
 	return p.emitCanonicalStream(ctx, stream, resolution.ActualUpstreamModel, fn)
+}
+
+func antigravityProviderStaticError(ctx context.Context, operation, message, class string, retryable bool) error {
+	err := &providerBackendError{
+		Status: 502, Message: message, ErrorType: "api_error", Code: "provider_error",
+		Provider: antigravityProviderID, Operation: operation, ErrorClass: class, Retryable: retryable,
+	}
+	if observer := telemetryFromContext(ctx); observer != nil {
+		observer.observeProviderError(err)
+	}
+	return err
+}
+
+func antigravityProviderError(ctx context.Context, operation string, cause error) error {
+	if cause == nil {
+		return antigravityProviderStaticError(ctx, operation, "Antigravity provider request failed.", "provider_error", true)
+	}
+	if errors.Is(cause, context.Canceled) {
+		return cause
+	}
+	result := &providerBackendError{
+		Status: 502, Message: "Antigravity provider transport failed.", ErrorType: "api_error", Code: "provider_transport_error",
+		Provider: antigravityProviderID, Operation: operation, ErrorClass: "provider_transport_error", Retryable: true, Cause: cause,
+	}
+	var httpErr *cloudcode.HTTPError
+	if errors.As(cause, &httpErr) {
+		result.UpstreamStatus = httpErr.StatusCode
+		result.RetryAfter = httpErr.RetryAfter
+		switch httpErr.StatusCode {
+		case http.StatusBadRequest, http.StatusUnprocessableEntity:
+			result.Status = http.StatusBadRequest
+			result.Message = fmt.Sprintf("Antigravity provider rejected the request (upstream HTTP %d).", httpErr.StatusCode)
+			result.ErrorType = "invalid_request_error"
+			result.Code = "provider_invalid_request"
+			result.ErrorClass = "provider_invalid_request"
+			result.Retryable = false
+		case http.StatusUnauthorized:
+			result.Status = http.StatusUnauthorized
+			result.Message = "Antigravity provider authentication failed."
+			result.ErrorType = "authentication_error"
+			result.Code = "provider_authentication"
+			result.ErrorClass = "provider_authentication"
+			result.Retryable = false
+		case http.StatusForbidden:
+			result.Status = http.StatusForbidden
+			result.Message = "Antigravity provider permission was denied."
+			result.ErrorType = "permission_error"
+			result.Code = "provider_permission"
+			result.ErrorClass = "provider_permission"
+			result.Retryable = false
+		case http.StatusTooManyRequests:
+			result.Status = http.StatusTooManyRequests
+			result.Message = "Antigravity provider rate limited the request."
+			result.ErrorType = "rate_limit_error"
+			result.Code = "provider_rate_limit"
+			result.ErrorClass = "provider_rate_limit"
+			result.Retryable = true
+		default:
+			if httpErr.StatusCode >= 500 && httpErr.StatusCode <= 599 {
+				result.Status = httpErr.StatusCode
+				if result.Status != http.StatusBadGateway && result.Status != http.StatusServiceUnavailable && result.Status != http.StatusGatewayTimeout {
+					result.Status = http.StatusBadGateway
+				}
+				result.Message = fmt.Sprintf("Antigravity provider upstream failed (upstream HTTP %d).", httpErr.StatusCode)
+				result.Code = "provider_upstream_error"
+				result.ErrorClass = "provider_upstream_error"
+				result.Retryable = true
+			} else {
+				result.Message = fmt.Sprintf("Antigravity provider returned an unexpected HTTP status (upstream HTTP %d).", httpErr.StatusCode)
+				result.Code = "provider_http_error"
+				result.ErrorClass = "provider_http_error"
+				result.Retryable = false
+			}
+		}
+	} else {
+		var networkErr net.Error
+		if errors.Is(cause, context.DeadlineExceeded) || (errors.As(cause, &networkErr) && networkErr.Timeout()) {
+			result.Status = http.StatusGatewayTimeout
+			result.Message = "Antigravity provider request timed out."
+			result.Code = "provider_timeout"
+			result.ErrorClass = "provider_timeout"
+			result.Retryable = true
+		} else if errors.Is(cause, cloudcode.ErrTruncatedStream) {
+			result.Message = "Antigravity provider stream ended before a trusted terminal event."
+			result.Code = "provider_stream_truncated"
+			result.ErrorClass = "provider_stream_truncated"
+			result.Retryable = true
+		}
+	}
+	if observer := telemetryFromContext(ctx); observer != nil {
+		observer.observeProviderError(result)
+	}
+	return result
 }
 
 func (p *antigravityProvider) collect(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -228,7 +405,7 @@ func (p *antigravityProvider) collect(ctx context.Context, payload map[string]an
 		case "response.completed", "response.incomplete", "response.failed":
 			completed = cloneMap(mapAny(event["response"]))
 			if event["type"] == "response.failed" && completed == nil {
-				return &backendError{502, "Antigravity response failed."}
+				return antigravityProviderStaticError(ctx, "streamGenerateContent", "Antigravity provider returned a failed response.", "provider_response_failed", true)
 			}
 		}
 		return nil
@@ -278,10 +455,11 @@ func (p *antigravityProvider) emitCanonicalStream(ctx context.Context, stream *c
 	functionArguments := make(map[string]string)
 	var messageItem map[string]any
 	var reasoningItem map[string]any
+	functionGroupSequence := 0
 	for {
 		event, err := stream.Next()
 		if err != nil {
-			return err
+			return antigravityProviderError(ctx, "streamGenerateContent", err)
 		}
 		if event.Usage.HasData() {
 			usage.Merge(event.Usage)
@@ -337,60 +515,84 @@ func (p *antigravityProvider) emitCanonicalStream(ctx context.Context, stream *c
 				return err
 			}
 		}
-		for _, call := range event.FunctionCalls {
-			callID := strings.TrimSpace(call.ID)
-			if callID == "" {
-				callID = newID("call")
-			}
-			call.Name = strings.TrimSpace(call.Name)
-			if call.Name == "" {
-				return errors.New("Antigravity function call did not include a name")
-			}
-			key := callID + "\x00" + call.Name
-			arguments := "{}"
-			if call.Args != nil {
-				encoded, err := json.Marshal(call.Args)
-				if err != nil {
-					return fmt.Errorf("encode Antigravity function call arguments: %w", err)
-				}
-				arguments = string(encoded)
-			}
-			if _, seen := functionKeys[key]; seen {
-				for _, item := range items {
-					existingCallID, _, decodeErr := decodeThoughtSignatureToolCallID(stringValue(item["call_id"]))
-					if decodeErr != nil {
-						return decodeErr
-					}
-					if existingCallID == callID && stringValue(item["name"]) == call.Name {
-						functionArguments[stringValue(item["id"])] = arguments
-						if stringValue(item["thought_signature"]) == "" {
-							if signature := functionThoughtSignature(event, call); signature != "" {
-								item["thought_signature"] = signature
-							}
-						}
-						break
-					}
-				}
+		for _, calls := range functionCallGroups(event) {
+			groupSize := len(calls)
+			if groupSize == 0 {
 				continue
 			}
-			functionKeys[key] = struct{}{}
-			signature := functionThoughtSignature(event, call)
-			transportID := encodeThoughtSignatureToolCallID(callID, signature)
-			item := map[string]any{
-				"id": transportID, "type": "function_call", "status": "in_progress", "call_id": transportID,
-				"name": call.Name, "arguments": "",
+			stepID := ""
+			if groupSize > 1 {
+				stepID = fmt.Sprintf("%s:%d", responseID, functionGroupSequence)
 			}
-			if signature != "" {
-				item["thought_signature"] = signature
-			}
-			items = append(items, item)
-			outputIndex := len(items) - 1
-			functionArguments[transportID] = arguments
-			if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": cloneMap(item)}); err != nil {
-				return err
-			}
-			if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.function_call_arguments.delta", "output_index": outputIndex, "item_id": transportID, "delta": arguments}); err != nil {
-				return err
+			functionGroupSequence++
+			for partIndex, call := range calls {
+				callID := strings.TrimSpace(call.ID)
+				if callID == "" {
+					callID = newID("call")
+				}
+				call.Name = strings.TrimSpace(call.Name)
+				if call.Name == "" {
+					return errors.New("Antigravity function call did not include a name")
+				}
+				key := callID + "\x00" + call.Name
+				arguments := "{}"
+				if call.Args != nil {
+					encoded, err := json.Marshal(call.Args)
+					if err != nil {
+						return fmt.Errorf("encode Antigravity function call arguments: %w", err)
+					}
+					arguments = string(encoded)
+				}
+				if _, seen := functionKeys[key]; seen {
+					found := false
+					for _, item := range items {
+						existingCallID, _, decodeErr := decodeThoughtSignatureToolCallID(stringValue(item["call_id"]))
+						if decodeErr != nil {
+							return decodeErr
+						}
+						if existingCallID == callID && stringValue(item["name"]) == call.Name {
+							found = true
+							signature := strings.TrimSpace(call.ThoughtSignature)
+							if signature != "" {
+								existingSignature := firstMapString(item, "thought_signature", "thoughtSignature")
+								if existingSignature == "" {
+									return errors.New("Antigravity function call signature arrived after its transport id was emitted")
+								}
+								if existingSignature != signature {
+									return errors.New("Antigravity function call thought signature changed for an existing call")
+								}
+							}
+							functionArguments[stringValue(item["id"])] = arguments
+							break
+						}
+					}
+					if !found {
+						return errors.New("Antigravity function call identity changed during streaming")
+					}
+					continue
+				}
+				functionKeys[key] = struct{}{}
+				signature := strings.TrimSpace(call.ThoughtSignature)
+				transportID := encodeFunctionCallTransportID(callID, signature, stepID, partIndex, groupSize)
+				if groupSize > 1 && !strings.HasPrefix(transportID, functionCallTransportV2Prefix) {
+					return errors.New("Antigravity parallel function call transport envelope could not be created")
+				}
+				item := map[string]any{
+					"id": transportID, "type": "function_call", "status": "in_progress", "call_id": transportID,
+					"name": call.Name, "arguments": "",
+				}
+				if signature != "" {
+					item["thought_signature"] = signature
+				}
+				items = append(items, item)
+				outputIndex := len(items) - 1
+				functionArguments[transportID] = arguments
+				if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": cloneMap(item)}); err != nil {
+					return err
+				}
+				if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.function_call_arguments.delta", "output_index": outputIndex, "item_id": transportID, "delta": arguments}); err != nil {
+					return err
+				}
 			}
 		}
 		if event.Done {
@@ -469,18 +671,32 @@ func emitAntigravityEvent(ctx context.Context, fn func(map[string]any) error, ev
 	return fn(event)
 }
 
-func functionThoughtSignature(event cloudcode.Event, call cloudcode.FunctionCall) string {
+func functionThoughtSignature(_ cloudcode.Event, call cloudcode.FunctionCall) string {
+	return strings.TrimSpace(call.ThoughtSignature)
+}
+
+func functionCallGroups(event cloudcode.Event) [][]cloudcode.FunctionCall {
+	groups := make([][]cloudcode.FunctionCall, 0)
 	for _, candidate := range event.Candidates {
+		group := make([]cloudcode.FunctionCall, 0)
 		for _, part := range candidate.Parts {
-			if part.FunctionCall != nil && part.FunctionCall.Name == call.Name && (part.FunctionCall.ID == "" || part.FunctionCall.ID == call.ID) && part.ThoughtSignature != "" {
-				return part.ThoughtSignature
+			if part.FunctionCall == nil {
+				continue
 			}
+			call := *part.FunctionCall
+			if call.ThoughtSignature == "" {
+				call.ThoughtSignature = part.ThoughtSignature
+			}
+			group = append(group, call)
+		}
+		if len(group) > 0 {
+			groups = append(groups, group)
 		}
 	}
-	if len(event.ThoughtSignatures) > 0 {
-		return event.ThoughtSignatures[0]
+	if len(groups) == 0 && len(event.FunctionCalls) > 0 {
+		groups = append(groups, append([]cloudcode.FunctionCall(nil), event.FunctionCalls...))
 	}
-	return ""
+	return groups
 }
 
 func indexOfItem(items []map[string]any, wanted map[string]any) int {
@@ -584,6 +800,9 @@ func buildAntigravityRequest(payload map[string]any, model, project string) (clo
 }
 
 func validateAntigravityPayload(payload map[string]any) error {
+	if err := validateAntigravityReasoningPreset(payload); err != nil {
+		return err
+	}
 	if parallel, ok := payload["parallel_tool_calls"]; ok && parallel != nil {
 		if enabled, ok := parallel.(bool); ok && !enabled {
 			return errors.New("Antigravity does not support parallel_tool_calls=false")
@@ -629,6 +848,28 @@ func validateAntigravityPayload(payload map[string]any) error {
 	return nil
 }
 
+func validateAntigravityReasoningPreset(payload map[string]any) error {
+	reasoning := mapAny(payload["reasoning"])
+	if reasoning == nil {
+		return nil
+	}
+	effort := strings.ToLower(strings.TrimSpace(stringValue(reasoning["effort"])))
+	if effort == "" {
+		return nil
+	}
+	if effort != "low" && effort != "medium" && effort != "high" {
+		return fmt.Errorf("Antigravity does not support reasoning effort %q", effort)
+	}
+	model := strings.TrimSpace(stringValue(payload["model"]))
+	if strings.HasSuffix(model, "-low") || strings.HasSuffix(model, "-medium") || strings.HasSuffix(model, "-high") {
+		suffix := model[strings.LastIndex(model, "-")+1:]
+		if effort != suffix {
+			return fmt.Errorf("Antigravity reasoning effort %q conflicts with model preset %q", effort, model)
+		}
+	}
+	return nil
+}
+
 func unsupportedAntigravityInputType(value any) string {
 	switch current := value.(type) {
 	case []any:
@@ -652,7 +893,7 @@ func unsupportedAntigravityInputType(value any) string {
 	return ""
 }
 
-func antigravityContents(input []any) ([]cloudcode.Content, []cloudcode.ContentPart, error) {
+func antigravityContentsLegacy(input []any) ([]cloudcode.Content, []cloudcode.ContentPart, error) {
 	contents := make([]cloudcode.Content, 0, len(input))
 	systemParts := make([]cloudcode.ContentPart, 0)
 	functionNames, err := responseFunctionCallNames(input)

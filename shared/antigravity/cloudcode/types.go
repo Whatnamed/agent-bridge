@@ -49,8 +49,14 @@ type ContentPart struct {
 	Thought          bool              `json:"thought,omitempty"`
 	ThoughtSignature string            `json:"thoughtSignature,omitempty"`
 	EncryptedContent string            `json:"encryptedContent,omitempty"`
+	InlineData       *InlineData       `json:"inlineData,omitempty"`
 	FunctionCall     *FunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *FunctionResponse `json:"functionResponse,omitempty"`
+}
+
+type InlineData struct {
+	MimeType string `json:"mimeType,omitempty"`
+	Data     string `json:"data,omitempty"`
 }
 
 type Content struct {
@@ -67,6 +73,12 @@ type FunctionCall struct {
 	ID   string         `json:"id,omitempty"`
 	Name string         `json:"name,omitempty"`
 	Args map[string]any `json:"args,omitempty"`
+
+	// ThoughtSignature and PartIndex are parser metadata. They identify the
+	// exact candidate part that produced this call; they are not fields of the
+	// nested functionCall object sent back to CloudCode.
+	ThoughtSignature string `json:"-"`
+	PartIndex        int    `json:"-"`
 }
 
 type FunctionResponse struct {
