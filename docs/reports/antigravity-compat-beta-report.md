@@ -57,6 +57,11 @@ The branch remains independent of `main`; no merge was performed.
   are ignored as display metadata rather than being misclassified as Gemini
   private encrypted state. Provider-private encrypted reasoning remains an
   explicit, separate input path.
+- One tiny live parallel-function smoke was run against the direct CloudCode
+  endpoint using the existing formal credential. It returned a valid grouped
+  tool response and the v2 envelope checks passed; no prompt/output/token or
+  signature data was logged. Split-SSE grouping remains covered by the offline
+  fixture so the adapter does not depend on upstream chunk boundaries.
 
 ## Thought-signature transport
 
