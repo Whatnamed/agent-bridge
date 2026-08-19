@@ -109,6 +109,12 @@ func TestModernChatToolDeltaUsesTransportIDWithoutNonstandardFunctionField(t *te
 	if fn := mapAny(toolCall["function"]); fn["thought_signature"] != nil {
 		t.Fatalf("stream modern function leaked thought signature: %#v", fn)
 	}
+	if got := functionCallTransportID(map[string]any{
+		"id": stringValue(toolCall["id"]), "call_id": stringValue(toolCall["id"]),
+		"thought_signature": "signature-1",
+	}); got != stringValue(toolCall["id"]) {
+		t.Fatalf("already encoded tool id was wrapped again: got %q want %q", got, toolCall["id"])
+	}
 	legacy := toolDelta(item, 0, "", true, true)
 	if mapAny(legacy["function_call"])["thought_signature"] != "signature-1" {
 		t.Fatalf("legacy stream function_call lost thought signature: %#v", legacy)
