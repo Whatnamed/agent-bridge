@@ -379,6 +379,13 @@ func (s *server) createResponse(w http.ResponseWriter, r *http.Request) {
 		writeBackendError(w, err)
 		return
 	}
+	if err := validateProviderPayload(provider, downstream); err != nil {
+		if observer := telemetryFromContext(r.Context()); observer != nil {
+			observer.observeStreamError()
+		}
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", nil, nil)
+		return
+	}
 	if boolValue(body["stream"]) {
 		s.streamResponse(w, r, provider, prepared, downstream, previous)
 		return
@@ -648,6 +655,13 @@ func (s *server) chatCollection(w http.ResponseWriter, r *http.Request) {
 		writeBackendError(w, err)
 		return
 	}
+	if err := validateProviderPayload(provider, responsePayload); err != nil {
+		if observer := telemetryFromContext(r.Context()); observer != nil {
+			observer.observeStreamError()
+		}
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", nil, nil)
+		return
+	}
 	legacy := body["functions"] != nil || body["function_call"] != nil
 	if boolValue(body["stream"]) {
 		s.streamChat(w, r, provider, responsePayload, body, legacy)
@@ -694,6 +708,37 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, provider mod
 	includeUsage := boolValue(mapAny(body["stream_options"])["include_usage"])
 	var outputs []any
 	emitted := map[int]string{}
+	toolIndexesByOutput := map[int]int{}
+	toolIndexesByItem := map[string]int{}
+	nextToolIndex := 0
+	assignToolIndex := func(outputIndex int, itemID string) int {
+		if index, ok := toolIndexesByOutput[outputIndex]; ok {
+			if itemID != "" {
+				toolIndexesByItem[itemID] = index
+			}
+			return index
+		}
+		if itemID != "" {
+			if index, ok := toolIndexesByItem[itemID]; ok {
+				toolIndexesByOutput[outputIndex] = index
+				return index
+			}
+		}
+		index := nextToolIndex
+		nextToolIndex++
+		toolIndexesByOutput[outputIndex] = index
+		if itemID != "" {
+			toolIndexesByItem[itemID] = index
+		}
+		return index
+	}
+	lookupToolIndex := func(outputIndex int, itemID string) (int, bool) {
+		if index, ok := toolIndexesByOutput[outputIndex]; ok {
+			return index, true
+		}
+		index, ok := toolIndexesByItem[itemID]
+		return index, ok
+	}
 	emit := func(v map[string]any) {
 		if observer := telemetryFromContext(r.Context()); observer != nil {
 			observer.observeDownstreamEvent(v)
@@ -725,20 +770,25 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, provider mod
 			item := mapAny(event["item"])
 			if item != nil && item["type"] == "function_call" {
 				role()
-				idx := intValue(event["output_index"])
-				emitted[idx] = ""
-				emit(chatChunk(state, toolDelta(item, idx, "", true, legacy), nil, nil, nil))
+				outputIndex := intValue(event["output_index"])
+				chatIndex := assignToolIndex(outputIndex, stringValue(item["id"]))
+				emitted[outputIndex] = ""
+				emit(chatChunk(state, toolDelta(item, chatIndex, "", true, legacy), nil, nil, nil))
 			}
 		case "response.function_call_arguments.delta":
 			role()
-			idx := intValue(event["output_index"])
+			outputIndex := intValue(event["output_index"])
+			chatIndex, ok := lookupToolIndex(outputIndex, stringValue(event["item_id"]))
+			if !ok {
+				return fmt.Errorf("function call arguments delta has no matching output item")
+			}
 			delta := stringValue(event["delta"])
-			emitted[idx] += delta
+			emitted[outputIndex] += delta
 			var d map[string]any
 			if legacy {
 				d = map[string]any{"function_call": map[string]any{"arguments": delta}}
 			} else {
-				d = map[string]any{"tool_calls": []any{map[string]any{"index": idx, "function": map[string]any{"arguments": delta}}}}
+				d = map[string]any{"tool_calls": []any{map[string]any{"index": chatIndex, "function": map[string]any{"arguments": delta}}}}
 			}
 			emit(chatChunk(state, d, nil, nil, nil))
 		case "response.output_item.done":
@@ -746,11 +796,15 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, provider mod
 			if item != nil {
 				outputs = append(outputs, item)
 				if item["type"] == "function_call" {
-					idx := intValue(event["output_index"])
-					if _, ok := emitted[idx]; !ok {
+					outputIndex := intValue(event["output_index"])
+					chatIndex, ok := lookupToolIndex(outputIndex, stringValue(item["id"]))
+					if !ok {
+						chatIndex = assignToolIndex(outputIndex, stringValue(item["id"]))
+					}
+					if _, ok := emitted[outputIndex]; !ok {
 						role()
-						emitted[idx] = stringValue(item["arguments"])
-						emit(chatChunk(state, toolDelta(item, idx, emitted[idx], true, legacy), nil, nil, nil))
+						emitted[outputIndex] = stringValue(item["arguments"])
+						emit(chatChunk(state, toolDelta(item, chatIndex, emitted[outputIndex], true, legacy), nil, nil, nil))
 					}
 				} else if item["type"] == "message" && !state.SawText {
 					if text := messageText(item); text != "" {

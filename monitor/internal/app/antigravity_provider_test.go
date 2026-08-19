@@ -303,10 +303,36 @@ func TestAntigravityToolStreamProducesFunctionCallResponse(t *testing.T) {
 	for _, event := range received {
 		types = append(types, stringValue(event["type"]))
 	}
-	for _, expected := range []string{"response.output_item.added", "response.function_call_arguments.delta", "response.function_call_arguments.done", "response.output_item.done", "response.completed"} {
-		if !containsEventType(types, expected) {
-			t.Fatalf("function stream omitted %q: %#v", expected, types)
+	wantTypes := []string{
+		"response.created", "response.in_progress", "response.output_item.added",
+		"response.function_call_arguments.delta", "response.function_call_arguments.done",
+		"response.output_item.done", "response.completed",
+	}
+	if len(types) != len(wantTypes) {
+		t.Fatalf("function event sequence = %#v, want %#v", types, wantTypes)
+	}
+	for i, expected := range wantTypes {
+		if types[i] != expected {
+			t.Fatalf("function event sequence = %#v, want %#v", types, wantTypes)
 		}
+	}
+	done := received[4]
+	if done["name"] != "get_test_value" || done["item_id"] != "call-1" || done["arguments"] != `{"name":"smoke"}` {
+		t.Fatalf("function arguments done = %#v", done)
+	}
+}
+
+func TestAntigravityExplicitTextFormatRemainsOrdinaryText(t *testing.T) {
+	request, err := buildAntigravityRequest(map[string]any{
+		"model": stableAntigravityModel,
+		"input": []any{map[string]any{"role": "user", "content": "hello"}},
+		"text":  map[string]any{"format": map[string]any{"type": "text"}},
+	}, stableAntigravityModel, "projects/test-project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(request.Request.Contents) != 1 || request.Request.Contents[0].Parts[0].Text != "hello" {
+		t.Fatalf("request contents = %#v", request.Request.Contents)
 	}
 }
 
@@ -326,20 +352,143 @@ func TestAntigravityTextStreamUsesCanonicalLifecycle(t *testing.T) {
 	for _, event := range received {
 		types = append(types, stringValue(event["type"]))
 	}
-	for _, expected := range []string{"response.output_item.added", "response.content_part.added", "response.output_text.delta", "response.output_text.done", "response.content_part.done", "response.output_item.done", "response.completed"} {
-		if !containsEventType(types, expected) {
-			t.Fatalf("text stream omitted %q: %#v", expected, types)
+	wantTypes := []string{
+		"response.created", "response.in_progress", "response.output_item.added", "response.content_part.added",
+		"response.output_text.delta", "response.output_text.done", "response.content_part.done",
+		"response.output_item.done", "response.completed",
+	}
+	if len(types) != len(wantTypes) {
+		t.Fatalf("text event sequence = %#v, want %#v", types, wantTypes)
+	}
+	for i, expected := range wantTypes {
+		if types[i] != expected {
+			t.Fatalf("text event sequence = %#v, want %#v", types, wantTypes)
 		}
+	}
+	addedItem := mapAny(received[2]["item"])
+	if len(sliceAny(addedItem["content"])) != 0 || addedItem["status"] != "in_progress" {
+		t.Fatalf("output item added payload = %#v", received[2])
+	}
+	partAdded := mapAny(received[3]["part"])
+	if partAdded["type"] != "output_text" || partAdded["text"] != "" || received[3]["content_index"] != 0 {
+		t.Fatalf("content part added payload = %#v", received[3])
+	}
+	if received[4]["delta"] != "hello" || received[5]["text"] != "hello" {
+		t.Fatalf("text delta/done payloads = %#v / %#v", received[4], received[5])
+	}
+	partDone := mapAny(received[6]["part"])
+	if partDone["type"] != "output_text" || partDone["text"] != "hello" {
+		t.Fatalf("content part done payload = %#v", received[6])
+	}
+	doneItem := mapAny(received[7]["item"])
+	if doneItem["status"] != "completed" || len(sliceAny(doneItem["content"])) != 1 || messageText(doneItem) != "hello" {
+		t.Fatalf("output item done payload = %#v", received[7])
 	}
 }
 
-func containsEventType(values []string, wanted string) bool {
-	for _, value := range values {
-		if value == wanted {
-			return true
-		}
+func TestAntigravityUnsupportedCapabilitiesReturnBadRequestBeforeStreaming(t *testing.T) {
+	provider, fake, closeServer := newTestAntigravityProvider(t, []string{`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"must not run"}]},"finishReason":"STOP"}]}}`})
+	defer closeServer()
+	router := &providerRouter{codex: codexModelProvider{backend: testCodexBackend{}}, antigravity: provider}
+	s := &server{cfg: config{}, backend: testCodexBackend{}, providers: router, responses: newResponseStore(5), chats: newChatStore(5)}
+	tests := []struct {
+		name string
+		path string
+		body map[string]any
+	}{
+		{
+			name: "responses json schema",
+			path: "/v1/responses",
+			body: map[string]any{
+				"model": stableAntigravityModel, "stream": true, "input": "hello",
+				"text": map[string]any{"format": map[string]any{"type": "json_schema"}},
+			},
+		},
+		{
+			name: "chat json object",
+			path: "/v1/chat/completions",
+			body: map[string]any{
+				"model": stableAntigravityModel, "stream": true,
+				"messages":        []any{map[string]any{"role": "user", "content": "hello"}},
+				"response_format": map[string]any{"type": "json_object"},
+			},
+		},
+		{
+			name: "responses input image",
+			path: "/v1/responses",
+			body: map[string]any{
+				"model": stableAntigravityModel, "stream": true,
+				"input": []any{map[string]any{"role": "user", "content": []any{
+					map[string]any{"type": "input_text", "text": "describe"},
+					map[string]any{"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+				}}},
+			},
+		},
+		{
+			name: "chat image url",
+			path: "/v1/chat/completions",
+			body: map[string]any{
+				"model": stableAntigravityModel, "stream": true,
+				"messages": []any{map[string]any{"role": "user", "content": []any{
+					map[string]any{"type": "text", "text": "describe"},
+					map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,AA=="}},
+				}}},
+			},
+		},
+		{
+			name: "parallel tool calls false",
+			path: "/v1/responses",
+			body: map[string]any{
+				"model": stableAntigravityModel, "stream": true, "input": "hello", "parallel_tool_calls": false,
+			},
+		},
+		{
+			name: "unknown input item",
+			path: "/v1/responses",
+			body: map[string]any{
+				"model": stableAntigravityModel, "stream": true,
+				"input": []any{map[string]any{"type": "input_file", "file_id": "file_1"}},
+			},
+		},
+		{
+			name: "unknown content part",
+			path: "/v1/responses",
+			body: map[string]any{
+				"model": stableAntigravityModel, "stream": true,
+				"input": []any{map[string]any{"role": "user", "content": []any{
+					map[string]any{"type": "input_file", "file_id": "file_1"},
+				}}},
+			},
+		},
+		{
+			name: "non function tool",
+			path: "/v1/responses",
+			body: map[string]any{
+				"model": stableAntigravityModel, "stream": true, "input": "hello",
+				"tools": []any{map[string]any{"type": "web_search"}},
+			},
+		},
 	}
-	return false
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(tc.body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(string(body)))
+			response := httptest.NewRecorder()
+			s.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "does not support") {
+				t.Fatalf("response = %d %s", response.Code, response.Body.String())
+			}
+		})
+	}
+	fake.mu.Lock()
+	streamCalls := fake.streamCalls
+	fake.mu.Unlock()
+	if streamCalls != 0 {
+		t.Fatalf("unsupported requests reached generation = %d", streamCalls)
+	}
 }
 
 func TestAntigravitySystemDeveloperAndToolChoiceAreExplicitlyTranslated(t *testing.T) {

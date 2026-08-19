@@ -17,6 +17,18 @@ type modelProvider interface {
 	listModels(context.Context) ([]string, error)
 }
 
+type requestPayloadValidator interface {
+	validatePayload(map[string]any) error
+}
+
+func validateProviderPayload(provider modelProvider, payload map[string]any) error {
+	validator, ok := provider.(requestPayloadValidator)
+	if !ok {
+		return nil
+	}
+	return validator.validatePayload(payload)
+}
+
 type codexModelProvider struct {
 	backend codexBackend
 }

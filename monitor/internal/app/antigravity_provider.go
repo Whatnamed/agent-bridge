@@ -60,6 +60,10 @@ func newAntigravityProvider(cfg config) (*antigravityProvider, error) {
 
 func (p *antigravityProvider) ID() string { return antigravityProviderID }
 
+func (p *antigravityProvider) validatePayload(payload map[string]any) error {
+	return validateAntigravityPayload(payload)
+}
+
 func (p *antigravityProvider) listModels(ctx context.Context) ([]string, error) {
 	if err := p.ensureControlPlane(ctx); err != nil {
 		return nil, err
@@ -308,15 +312,17 @@ func (p *antigravityProvider) emitCanonicalStream(ctx context.Context, stream *c
 		if event.Text != "" {
 			text.WriteString(event.Text)
 			if messageItem == nil {
-				messageItem = map[string]any{"id": newID("msg"), "type": "message", "role": "assistant", "status": "in_progress", "phase": "final_answer", "content": []any{map[string]any{"type": "output_text", "text": "", "annotations": []any{}, "logprobs": []any{}}}}
+				messageItem = map[string]any{"id": newID("msg"), "type": "message", "role": "assistant", "status": "in_progress", "phase": "final_answer", "content": []any{}}
 				items = append(items, messageItem)
 				outputIndex := len(items) - 1
 				if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": cloneMap(messageItem)}); err != nil {
 					return err
 				}
+				part := map[string]any{"type": "output_text", "text": "", "annotations": []any{}, "logprobs": []any{}}
+				messageItem["content"] = []any{part}
 				if err := emitAntigravityEvent(ctx, fn, map[string]any{
 					"type": "response.content_part.added", "output_index": outputIndex, "item_id": messageItem["id"], "content_index": 0,
-					"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}, "logprobs": []any{}},
+					"part": cloneMap(part),
 				}); err != nil {
 					return err
 				}
@@ -422,7 +428,7 @@ func (p *antigravityProvider) emitCanonicalStream(ctx context.Context, stream *c
 			item["arguments"] = arguments
 			item["status"] = "completed"
 			if err := emitAntigravityEvent(ctx, fn, map[string]any{
-				"type": "response.function_call_arguments.done", "output_index": outputIndex, "item_id": item["id"], "arguments": arguments,
+				"type": "response.function_call_arguments.done", "output_index": outputIndex, "item_id": item["id"], "name": item["name"], "arguments": arguments,
 			}); err != nil {
 				return err
 			}
@@ -514,6 +520,9 @@ func antigravityUsage(usage cloudcode.Usage) map[string]any {
 }
 
 func buildAntigravityRequest(payload map[string]any, model, project string) (cloudcode.GenerateRequest, error) {
+	if err := validateAntigravityPayload(payload); err != nil {
+		return cloudcode.GenerateRequest{}, err
+	}
 	requestID, err := cloudcode.NewRequestID()
 	if err != nil {
 		return cloudcode.GenerateRequest{}, err
@@ -531,7 +540,7 @@ func buildAntigravityRequest(payload map[string]any, model, project string) (clo
 		RequestID:    requestID,
 		Request:      cloudcode.InternalRequest{SessionID: sessionID},
 	}
-	contents, inlineSystemParts, err := antigravityContents(sliceAny(payload["input"]))
+	contents, inlineSystemParts, err := antigravityContents(normalizeResponseInput(payload["input"]))
 	if err != nil {
 		return cloudcode.GenerateRequest{}, err
 	}
@@ -548,7 +557,11 @@ func buildAntigravityRequest(payload map[string]any, model, project string) (clo
 	if len(instructionParts) > 0 {
 		request.Request.SystemInstruction = &cloudcode.SystemInstruction{Role: "user", Parts: instructionParts}
 	}
-	request.Request.Tools = antigravityTools(sliceAny(payload["tools"]))
+	tools, err := antigravityTools(payload["tools"])
+	if err != nil {
+		return cloudcode.GenerateRequest{}, err
+	}
+	request.Request.Tools = tools
 	toolConfig, err := antigravityToolConfig(payload["tool_choice"])
 	if err != nil {
 		return cloudcode.GenerateRequest{}, err
@@ -558,6 +571,75 @@ func buildAntigravityRequest(payload map[string]any, model, project string) (clo
 		request.Request.GenerationConfig = generation
 	}
 	return request, nil
+}
+
+func validateAntigravityPayload(payload map[string]any) error {
+	if parallel, ok := payload["parallel_tool_calls"]; ok && parallel != nil {
+		if enabled, ok := parallel.(bool); ok && !enabled {
+			return errors.New("Antigravity does not support parallel_tool_calls=false")
+		}
+	}
+	if text, ok := payload["text"].(map[string]any); ok {
+		if format, exists := text["format"]; exists && format != nil {
+			formatType := strings.TrimSpace(stringValue(mapAny(format)["type"]))
+			switch formatType {
+			case "text":
+				// Explicit text format is the ordinary Responses text mode.
+			case "json_schema", "json_object":
+				return fmt.Errorf("Antigravity does not support text.format %q", formatType)
+			case "":
+				return errors.New("Antigravity does not support text.format")
+			default:
+				return fmt.Errorf("Antigravity does not support text.format %q", formatType)
+			}
+		}
+	}
+	if raw, exists := payload["response_format"]; exists && raw != nil {
+		formatType := ""
+		if format := mapAny(raw); format != nil {
+			formatType = strings.TrimSpace(stringValue(format["type"]))
+		}
+		if formatType == "" {
+			return errors.New("Antigravity does not support response_format")
+		}
+		return fmt.Errorf("Antigravity does not support response_format %q", formatType)
+	}
+	if inputType := unsupportedAntigravityInputType(payload["input"]); inputType != "" {
+		return fmt.Errorf("Antigravity does not support %s input", inputType)
+	}
+	if _, _, err := antigravityContents(normalizeResponseInput(payload["input"])); err != nil {
+		return err
+	}
+	if _, err := antigravityInstructionText(payload["instructions"]); err != nil {
+		return err
+	}
+	if _, err := antigravityTools(payload["tools"]); err != nil {
+		return err
+	}
+	return nil
+}
+
+func unsupportedAntigravityInputType(value any) string {
+	switch current := value.(type) {
+	case []any:
+		for _, item := range current {
+			if typ := unsupportedAntigravityInputType(item); typ != "" {
+				return typ
+			}
+		}
+	case map[string]any:
+		typ := strings.ToLower(strings.TrimSpace(stringValue(current["type"])))
+		switch typ {
+		case "image", "image_url", "input_image":
+			return typ
+		}
+		for _, child := range current {
+			if typ := unsupportedAntigravityInputType(child); typ != "" {
+				return typ
+			}
+		}
+	}
+	return ""
 }
 
 func antigravityContents(input []any) ([]cloudcode.Content, []cloudcode.ContentPart, error) {
@@ -572,6 +654,8 @@ func antigravityContents(input []any) ([]cloudcode.Content, []cloudcode.ContentP
 		if item == nil {
 			if text := strings.TrimSpace(stringValue(raw)); text != "" {
 				contents = append(contents, cloudcode.Content{Role: "user", Parts: []cloudcode.ContentPart{{Text: text}}})
+			} else if raw != nil {
+				return nil, nil, errors.New("Antigravity input supports text and known message/tool items only")
 			}
 			continue
 		}
@@ -599,8 +683,19 @@ func antigravityContents(input []any) ([]cloudcode.Content, []cloudcode.ContentP
 		case "reasoning":
 			if encrypted := firstMapString(item, "encrypted_content", "encryptedContent"); encrypted != "" {
 				contents = append(contents, cloudcode.Content{Role: "model", Parts: []cloudcode.ContentPart{{EncryptedContent: encrypted}}})
+			} else {
+				return nil, nil, errors.New("Antigravity reasoning input requires encrypted content")
 			}
-		default:
+		case "input_text", "text", "output_text":
+			if _, ok := item["text"]; !ok {
+				return nil, nil, fmt.Errorf("Antigravity %s input must include text", typ)
+			}
+			role := "user"
+			if typ == "output_text" {
+				role = "model"
+			}
+			contents = append(contents, cloudcode.Content{Role: role, Parts: []cloudcode.ContentPart{{Text: stringValue(item["text"])}}})
+		case "message", "":
 			role := stringValue(item["role"])
 			if role == "system" || role == "developer" {
 				text, err := antigravityInstructionText(item["content"])
@@ -619,10 +714,19 @@ func antigravityContents(input []any) ([]cloudcode.Content, []cloudcode.ContentP
 			} else {
 				return nil, nil, fmt.Errorf("unsupported Responses input role %q", role)
 			}
-			text := responseInputText(item["content"])
-			if text != "" {
-				contents = append(contents, cloudcode.Content{Role: role, Parts: []cloudcode.ContentPart{{Text: text}}})
+			parts, err := antigravityTextParts(item["content"])
+			if err != nil {
+				return nil, nil, err
 			}
+			if len(parts) > 0 {
+				contentParts := make([]cloudcode.ContentPart, 0, len(parts))
+				for _, part := range parts {
+					contentParts = append(contentParts, cloudcode.ContentPart{Text: part})
+				}
+				contents = append(contents, cloudcode.Content{Role: role, Parts: contentParts})
+			}
+		default:
+			return nil, nil, fmt.Errorf("Antigravity does not support input item type %q", typ)
 		}
 	}
 	if len(contents) == 0 {
@@ -631,21 +735,31 @@ func antigravityContents(input []any) ([]cloudcode.Content, []cloudcode.ContentP
 	return contents, systemParts, nil
 }
 
-func responseInputText(value any) string {
-	if text, ok := value.(string); ok {
-		return text
+func antigravityTextParts(value any) ([]string, error) {
+	if value == nil {
+		return nil, nil
 	}
-	var result strings.Builder
-	for _, raw := range sliceAny(value) {
+	if text, ok := value.(string); ok {
+		return []string{text}, nil
+	}
+	rawParts, ok := value.([]any)
+	if !ok {
+		return nil, errors.New("Antigravity message content supports text parts only")
+	}
+	parts := make([]string, 0, len(rawParts))
+	for _, raw := range rawParts {
 		part := mapAny(raw)
 		if part == nil {
-			continue
+			return nil, errors.New("Antigravity message content supports text parts only")
 		}
-		if typ := stringValue(part["type"]); typ == "input_text" || typ == "text" || typ == "output_text" {
-			result.WriteString(stringValue(part["text"]))
+		switch typ := stringValue(part["type"]); typ {
+		case "input_text", "text", "output_text":
+			parts = append(parts, stringValue(part["text"]))
+		default:
+			return nil, fmt.Errorf("Antigravity does not support input content type %q", typ)
 		}
 	}
-	return result.String()
+	return parts, nil
 }
 
 func antigravityInstructionText(value any) (string, error) {
@@ -655,8 +769,12 @@ func antigravityInstructionText(value any) (string, error) {
 	if text, ok := value.(string); ok {
 		return text, nil
 	}
+	rawParts, ok := value.([]any)
+	if !ok {
+		return "", errors.New("Antigravity system/developer instructions support text parts only")
+	}
 	var result strings.Builder
-	for _, raw := range sliceAny(value) {
+	for _, raw := range rawParts {
 		part := mapAny(raw)
 		if part == nil {
 			return "", errors.New("Antigravity system/developer instructions support text parts only")
@@ -671,25 +789,35 @@ func antigravityInstructionText(value any) (string, error) {
 	return result.String(), nil
 }
 
-func antigravityTools(tools []any) []cloudcode.Tool {
+func antigravityTools(value any) ([]cloudcode.Tool, error) {
+	if value == nil {
+		return nil, nil
+	}
+	tools, ok := value.([]any)
+	if !ok {
+		return nil, errors.New("Antigravity tools must be an array")
+	}
 	result := make([]cloudcode.Tool, 0, len(tools))
 	for _, raw := range tools {
 		tool := mapAny(raw)
 		if tool == nil {
-			continue
+			return nil, errors.New("Antigravity tools must contain function definitions")
+		}
+		if toolType := strings.TrimSpace(stringValue(tool["type"])); toolType != "function" {
+			return nil, fmt.Errorf("Antigravity does not support tool type %q", toolType)
 		}
 		fn := mapAny(tool["function"])
-		if fn == nil && stringValue(tool["type"]) == "function" {
+		if fn == nil {
 			fn = tool
 		}
 		if fn == nil || strings.TrimSpace(stringValue(fn["name"])) == "" {
-			continue
+			return nil, errors.New("Antigravity function tools must include a name")
 		}
 		result = append(result, cloudcode.Tool{FunctionDeclarations: []cloudcode.FunctionDeclaration{{
 			Name: stringValue(fn["name"]), Description: stringValue(fn["description"]), Parameters: antigravitySchema(fn["parameters"]),
 		}}})
 	}
-	return result
+	return result, nil
 }
 
 func antigravityToolConfig(value any) (*cloudcode.ToolConfig, error) {

@@ -3,6 +3,7 @@ package app
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -12,6 +13,61 @@ import (
 	"strings"
 	"testing"
 )
+
+type scriptedModelProvider struct {
+	events []map[string]any
+}
+
+func (p scriptedModelProvider) ID() string { return "scripted" }
+func (p scriptedModelProvider) stream(_ context.Context, _ map[string]any, fn func(map[string]any) error) error {
+	for _, event := range p.events {
+		if err := fn(event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (scriptedModelProvider) collect(context.Context, map[string]any) (map[string]any, error) {
+	return nil, errors.New("scripted provider collect is not used")
+}
+func (scriptedModelProvider) listModels(context.Context) ([]string, error) {
+	return []string{"scripted"}, nil
+}
+
+func TestStreamChatMapsResponsesOutputIndexToChatToolIndex(t *testing.T) {
+	provider := scriptedModelProvider{events: []map[string]any{
+		{"type": "response.created", "response": map[string]any{"id": "resp_1", "model": "gemini-3.7-flash-high", "created_at": 1}},
+		{"type": "response.output_item.added", "output_index": 0, "item": map[string]any{"id": "rs_1", "type": "reasoning"}},
+		{"type": "response.output_item.added", "output_index": 1, "item": map[string]any{"id": "call_1", "type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": ""}},
+		{"type": "response.function_call_arguments.delta", "output_index": 1, "item_id": "call_1", "delta": `{"city":"Tokyo"}`},
+		{"type": "response.function_call_arguments.done", "output_index": 1, "item_id": "call_1", "name": "lookup", "arguments": `{"city":"Tokyo"}`},
+		{"type": "response.output_item.done", "output_index": 1, "item": map[string]any{"id": "call_1", "type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": `{"city":"Tokyo"}`}},
+		{"type": "response.completed", "response": map[string]any{"id": "resp_1", "model": "gemini-3.7-flash-high", "created_at": 1, "status": "completed"}},
+	}}
+	recorder := httptest.NewRecorder()
+	s := &server{}
+	s.streamChat(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), provider,
+		map[string]any{"model": "gemini-3.7-flash-high"}, map[string]any{"stream": true}, false)
+	var toolIndexes []int
+	for _, line := range strings.Split(recorder.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "data: ") || strings.TrimSpace(strings.TrimPrefix(line, "data: ")) == "[DONE]" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+			t.Fatal(err)
+		}
+		for _, rawChoice := range sliceAny(event["choices"]) {
+			delta := mapAny(mapAny(rawChoice)["delta"])
+			for _, rawCall := range sliceAny(delta["tool_calls"]) {
+				toolIndexes = append(toolIndexes, intValue(mapAny(rawCall)["index"]))
+			}
+		}
+	}
+	if len(toolIndexes) != 2 || toolIndexes[0] != 0 || toolIndexes[1] != 0 {
+		t.Fatalf("Chat tool indexes = %#v, want [0 0]; SSE = %s", toolIndexes, recorder.Body.String())
+	}
+}
 
 func TestAPIKeyProtectsV1ButNotHealth(t *testing.T) {
 	s := &server{cfg: config{APIKey: "expected-secret"}}
