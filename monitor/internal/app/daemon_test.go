@@ -91,9 +91,30 @@ func TestServerCommandArgsPreserveDaemonSettings(t *testing.T) {
 	cfg.APIKey = "must-not-be-command-line"
 	cfg.DropParams = []string{"temperature", "top_p"}
 	cfg.Verbose = true
+	cfg.AntigravityEnabled = true
+	cfg.AntigravityOAuthProfile = "antigravity"
+	cfg.AntigravityCredentialPath = `C:\Users\test\AppData\Local\AgentBridge\antigravity\oauth_creds.json`
+	cfg.AntigravityEndpoint = "https://cloudcode.example.test"
+	cfg.AntigravityProject = "projects/verified"
+	cfg.AntigravityCatalogTTL = 45 * time.Minute
+	cfg.AntigravityProjectTTL = 30 * time.Minute
+	cfg.CodexCollectorEnabled = true
+	cfg.CodexSessionsDir = `C:\Users\test\.codex\sessions`
+	cfg.CodexArchivedSessionsDir = `C:\Users\test\.codex\archived_sessions`
+	cfg.CodexImportDays = 30
+	cfg.CodexScanInterval = 60 * time.Second
 	args := serverCommandArgs("daemon-run", cfg)
 	joined := strings.Join(args, " ")
-	for _, expected := range []string{"daemon-run", "--host 127.0.0.2", "--port 19193", "--stop-timeout 10", "--drop-params temperature,top_p", "--verbose"} {
+	for _, expected := range []string{
+		"daemon-run", "--host 127.0.0.2", "--port 19193", "--stop-timeout 10", "--drop-params temperature,top_p", "--verbose",
+		"--antigravity-enabled true", "--antigravity-oauth-profile antigravity",
+		"--antigravity-credential-path " + cfg.AntigravityCredentialPath,
+		"--antigravity-endpoint " + cfg.AntigravityEndpoint,
+		"--antigravity-project " + cfg.AntigravityProject,
+		"--antigravity-catalog-ttl 2700", "--antigravity-project-ttl 1800",
+		"--codex-collector-enabled true", "--codex-sessions-dir " + cfg.CodexSessionsDir,
+		"--codex-archived-sessions-dir " + cfg.CodexArchivedSessionsDir, "--codex-import-days 30", "--codex-scan-interval 60",
+	} {
 		if !strings.Contains(joined, expected) {
 			t.Fatalf("args %q do not contain %q", joined, expected)
 		}

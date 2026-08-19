@@ -82,11 +82,12 @@ $ uv run --with openai python example.py
 This branch adds a local, read-only monitor to the Go runtime while preserving
 the v0.2.0 `/v1/responses` and `/v1/chat/completions` contract. The dashboard is
 embedded in the executable and is available at `http://127.0.0.1:18080/dashboard`
-when `dashboard.enabled` is true. It has Chinese Overview, Requests, and
-Diagnostics views, plus JSON endpoints under `/dashboard/api/`. Requests are
-read from retained JSONL history with a bounded recent in-memory timeline; the
-first page with newest sorting refreshes while visible, and later pages do not
-move automatically.
+when `dashboard.enabled` is true. It has Chinese Overview and Requests views,
+a synchronized ZCode/Codex/DSH/Unknown source filter, and a privacy-safe detail
+drawer, plus JSON endpoints under `/dashboard/api/`. Requests and Codex turns
+are read from retained JSONL summaries with a bounded recent in-memory timeline;
+the first page with newest sorting refreshes while visible, and later pages do
+not move automatically.
 
 Only real model workloads are recorded by default: `POST /v1/responses` and
 `POST /v1/chat/completions`. Health, models, and other compatibility routes are
@@ -126,6 +127,37 @@ $ sha256sum ./bin/openai-api-server-via-codex.exe
 The generated `bin/` directory and local telemetry directory are ignored by
 Git. See [docs/monitor.md](docs/monitor.md) for the route, schema, privacy,
 retention, and non-billed validation details.
+
+## Optional Direct OAuth Antigravity provider
+
+The Go monitor can route the explicitly verified user-facing model
+`gemini-3.7-flash-high` through the shared `../shared/antigravity` OAuth and
+CloudCode library. It remains opt-in so an existing Codex-only installation is
+unchanged:
+
+```toml
+[antigravity]
+enabled = true
+oauth_profile = "antigravity"
+# Omit credential_path to use the default:
+# %LOCALAPPDATA%/AgentBridge/antigravity/oauth_creds.json
+endpoint = "https://daily-cloudcode-pa.googleapis.com"
+catalog_ttl = 2700.0
+project_ttl = 1800.0
+```
+
+The production credential path is separate from the POC path. Create it only
+through an explicit browser OAuth + PKCE action, for example by passing
+`--credential-path` to the `agy-oauth-poc auth` command; the monitor never
+reads the installed AGY CLI Credential Manager and never prints token data.
+`loadCodeAssist` and `fetchAvailableModels` are control-plane calls cached by
+TTL. The generation hot path uses only `streamGenerateContent` and never
+silently maps an unknown model to a default or to another provider.
+
+The provider is implemented in this same monitor daemon and reuses the local
+OpenAI-compatible `/v1/responses`, `/v1/chat/completions`, and `/v1/models`
+routes. It does not start `agy.exe`, a second daemon, Node/CPA proxy, account
+pool, or another listener.
 
 <details>
 <summary><strong>Use Docker instead</strong></summary>

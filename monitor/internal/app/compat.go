@@ -46,6 +46,24 @@ func intValue(value any) int {
 	switch v := value.(type) {
 	case int:
 		return v
+	case int8:
+		return int(v)
+	case int16:
+		return int(v)
+	case int32:
+		return int(v)
+	case int64:
+		return int(v)
+	case uint:
+		return int(v)
+	case uint8:
+		return int(v)
+	case uint16:
+		return int(v)
+	case uint32:
+		return int(v)
+	case uint64:
+		return int(v)
 	case float64:
 		return int(v)
 	case json.Number:
@@ -122,9 +140,20 @@ func normalizeInputItem(value any) any {
 			return result
 		}
 	case "function_call":
-		return map[string]any{"type": "function_call", "call_id": valueOr(item["call_id"], item["id"]), "name": item["name"], "arguments": valueOr(item["arguments"], "{}")}
+		result := map[string]any{"type": "function_call", "call_id": valueOr(item["call_id"], item["id"]), "name": item["name"], "arguments": valueOr(item["arguments"], "{}")}
+		if signature := stringValue(valueOr(item["thought_signature"], item["thoughtSignature"])); signature != "" {
+			result["thought_signature"] = signature
+		}
+		return result
 	case "function_call_output":
-		return map[string]any{"type": "function_call_output", "call_id": valueOr(item["call_id"], "unknown"), "output": stringValue(item["output"])}
+		result := map[string]any{"type": "function_call_output", "output": item["output"]}
+		if item["call_id"] != nil {
+			result["call_id"] = item["call_id"]
+		}
+		if name := stringValue(item["name"]); name != "" {
+			result["name"] = name
+		}
+		return result
 	}
 	return cloneMap(item)
 }
@@ -140,10 +169,11 @@ func prepareResponse(body map[string]any, model string) map[string]any {
 	return result
 }
 
-func chatToResponse(body map[string]any, model string) map[string]any {
+func chatToResponse(body map[string]any, model string) (map[string]any, error) {
 	result := map[string]any{"model": valueOr(body["model"], model), "input": []any{}, "store": false}
 	var instructions []string
 	var input []any
+	functionNames := make(map[string]string)
 	for _, raw := range sliceAny(body["messages"]) {
 		msg := mapAny(raw)
 		if msg == nil {
@@ -156,17 +186,77 @@ func chatToResponse(body map[string]any, model string) map[string]any {
 				instructions = append(instructions, t)
 			}
 		case "tool", "function":
-			input = append(input, map[string]any{"type": "function_call_output", "call_id": valueOr(msg["tool_call_id"], valueOr(msg["name"], "unknown")), "output": contentText(msg["content"])})
+			rawCallID := stringValue(msg["tool_call_id"])
+			if role == "function" && rawCallID == "" {
+				rawCallID = stringValue(msg["name"])
+			}
+			callID, _, err := decodeThoughtSignatureToolCallID(rawCallID)
+			if err != nil {
+				return nil, err
+			}
+			name := strings.TrimSpace(stringValue(msg["name"]))
+			if mapped := functionNames[callID]; mapped != "" {
+				if name != "" && name != mapped {
+					return nil, fmt.Errorf("tool output name does not match its assistant tool call")
+				}
+				name = mapped
+			}
+			if name == "" {
+				return nil, fmt.Errorf("tool output function name could not be resolved")
+			}
+			output := map[string]any{"type": "function_call_output", "call_id": callID, "name": name, "output": contentText(msg["content"])}
+			input = append(input, output)
 		case "assistant":
 			if fc := mapAny(msg["function_call"]); fc != nil {
-				input = append(input, map[string]any{"type": "function_call", "call_id": valueOr(fc["name"], "function"), "name": fc["name"], "arguments": valueOr(fc["arguments"], "{}")})
+				name := strings.TrimSpace(stringValue(fc["name"]))
+				if name == "" {
+					return nil, fmt.Errorf("assistant function_call must include name")
+				}
+				rawCallID := stringValue(valueOr(fc["id"], fc["name"]))
+				callID, signature, err := decodeThoughtSignatureToolCallID(rawCallID)
+				if err != nil {
+					return nil, err
+				}
+				if explicit := firstMapString(fc, "thought_signature", "thoughtSignature"); explicit != "" {
+					if signature != "" && signature != explicit {
+						return nil, fmt.Errorf("assistant function_call thought signature does not match its transport id")
+					}
+					signature = explicit
+				}
+				functionNames[callID] = name
+				entry := map[string]any{"type": "function_call", "call_id": callID, "name": name, "arguments": valueOr(fc["arguments"], "{}")}
+				if signature != "" {
+					entry["thought_signature"] = signature
+				}
+				input = append(input, entry)
 			}
 			for _, tcRaw := range sliceAny(msg["tool_calls"]) {
 				tc := mapAny(tcRaw)
 				fn := mapAny(tc["function"])
-				if fn != nil {
-					input = append(input, map[string]any{"type": "function_call", "call_id": tc["id"], "name": fn["name"], "arguments": valueOr(fn["arguments"], "{}")})
+				if fn == nil {
+					return nil, fmt.Errorf("assistant tool_call must include function details")
 				}
+				name := strings.TrimSpace(stringValue(fn["name"]))
+				if name == "" {
+					return nil, fmt.Errorf("assistant tool_call must include function name")
+				}
+				rawCallID := stringValue(tc["id"])
+				callID, signature, err := decodeThoughtSignatureToolCallID(rawCallID)
+				if err != nil {
+					return nil, err
+				}
+				if explicit := firstMapString(fn, "thought_signature", "thoughtSignature"); explicit != "" {
+					if signature != "" && signature != explicit {
+						return nil, fmt.Errorf("assistant tool_call thought signature does not match its transport id")
+					}
+					signature = explicit
+				}
+				functionNames[callID] = name
+				entry := map[string]any{"type": "function_call", "call_id": callID, "name": name, "arguments": valueOr(fn["arguments"], "{}")}
+				if signature != "" {
+					entry["thought_signature"] = signature
+				}
+				input = append(input, entry)
 			}
 			if text := contentText(msg["content"]); text != "" || len(sliceAny(msg["tool_calls"])) == 0 {
 				input = append(input, map[string]any{"role": "assistant", "content": text})
@@ -246,7 +336,7 @@ func chatToResponse(body map[string]any, model string) map[string]any {
 			result["text"] = mergeMap(mapAny(result["text"]), map[string]any{"format": f})
 		}
 	}
-	return result
+	return result, nil
 }
 
 func chatToolChoice(value any) any {
@@ -256,6 +346,9 @@ func chatToolChoice(value any) any {
 	}
 	if m["type"] == "function" {
 		fn := mapAny(m["function"])
+		if fn == nil {
+			return value
+		}
 		return map[string]any{"type": "function", "name": fn["name"]}
 	}
 	return value
@@ -379,12 +472,15 @@ func responseToChat(response map[string]any, fallback string, legacy bool, n int
 			continue
 		}
 		fn := map[string]any{"name": stringValue(item["name"]), "arguments": stringValue(item["arguments"])}
+		if signature := firstMapString(item, "thought_signature", "thoughtSignature"); signature != "" {
+			fn["thought_signature"] = signature
+		}
 		if legacy {
 			if legacyCall == nil {
 				legacyCall = fn
 			}
 		} else {
-			toolCalls = append(toolCalls, map[string]any{"id": stringValue(valueOr(item["call_id"], item["id"])), "type": "function", "function": fn})
+			toolCalls = append(toolCalls, map[string]any{"id": functionCallTransportID(item), "type": "function", "function": fn})
 		}
 	}
 	message := map[string]any{"role": "assistant", "content": responseText(response)}
@@ -418,7 +514,14 @@ func responseToChat(response map[string]any, fallback string, legacy bool, n int
 	if created == 0 {
 		created = int(time.Now().Unix())
 	}
-	return map[string]any{"id": id, "object": "chat.completion", "created": created, "model": stringValue(valueOr(response["model"], fallback)), "choices": choices, "usage": map[string]any{"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}}
+	chatUsage := map[string]any{"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+	if details := mapAny(usage["input_tokens_details"]); intValue(details["cached_tokens"]) != 0 {
+		chatUsage["prompt_tokens_details"] = map[string]any{"cached_tokens": intValue(details["cached_tokens"])}
+	}
+	if details := mapAny(usage["output_tokens_details"]); intValue(details["reasoning_tokens"]) != 0 {
+		chatUsage["completion_tokens_details"] = map[string]any{"reasoning_tokens": intValue(details["reasoning_tokens"])}
+	}
+	return map[string]any{"id": id, "object": "chat.completion", "created": created, "model": stringValue(valueOr(response["model"], fallback)), "choices": choices, "usage": chatUsage}
 }
 
 func responseContext(response map[string]any) []any {
@@ -427,7 +530,11 @@ func responseContext(response map[string]any) []any {
 		item := mapAny(raw)
 		switch item["type"] {
 		case "function_call":
-			result = append(result, map[string]any{"type": "function_call", "call_id": valueOr(item["call_id"], item["id"]), "name": item["name"], "arguments": valueOr(item["arguments"], "{}")})
+			entry := map[string]any{"type": "function_call", "call_id": valueOr(item["call_id"], item["id"]), "name": item["name"], "arguments": valueOr(item["arguments"], "{}")}
+			if signature := stringValue(valueOr(item["thought_signature"], item["thoughtSignature"])); signature != "" {
+				entry["thought_signature"] = signature
+			}
+			result = append(result, entry)
 		case "message":
 			if text := messageText(item); text != "" {
 				result = append(result, map[string]any{"role": "assistant", "content": text})

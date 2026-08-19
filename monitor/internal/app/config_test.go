@@ -37,6 +37,15 @@ auth_json = "~/custom-auth.json"
 backend_base_url = "https://example.test/codex/"
 client_version = "9.9.9"
 
+[antigravity]
+enabled = true
+oauth_profile = "custom"
+credential_path = "~/antigravity/oauth_creds.json"
+endpoint = "https://cloudcode.example.test/"
+project = "projects/verified"
+catalog_ttl = 120.0
+project_ttl = 60.0
+
 [compat]
 drop_params = ["temperature", "top_p"]
 `
@@ -59,17 +68,31 @@ drop_params = ["temperature", "top_p"]
 	if cfg.TelemetryEnabled || cfg.TelemetryRetentionDays != 14 || cfg.TelemetryEventMemoryLimit != 80 || cfg.TelemetryQueueSize != 32 || cfg.DashboardEnabled || cfg.ReasoningSummaryDefault != "auto" {
 		t.Fatalf("monitor config = %#v", cfg)
 	}
+	normalizedCredentialPath := strings.ReplaceAll(cfg.AntigravityCredentialPath, "\\", "/")
+	if !cfg.AntigravityEnabled || cfg.AntigravityOAuthProfile != "custom" || cfg.AntigravityEndpoint != "https://cloudcode.example.test" || cfg.AntigravityProject != "projects/verified" || cfg.AntigravityCatalogTTL != 120*time.Second || cfg.AntigravityProjectTTL != 60*time.Second || !strings.HasSuffix(normalizedCredentialPath, "/antigravity/oauth_creds.json") {
+		t.Fatalf("Antigravity config = %#v", cfg)
+	}
 }
 
 func TestConfigEnvironmentOverridesFileValues(t *testing.T) {
 	t.Setenv("OPENAI_VIA_CODEX_PORT", "20001")
 	t.Setenv("OPENAI_VIA_CODEX_DEFAULT_MODEL", "gpt-env")
+	t.Setenv("OPENAI_VIA_CODEX_ANTIGRAVITY_ENABLED", "true")
+	t.Setenv("OPENAI_VIA_CODEX_ANTIGRAVITY_OAUTH_PROFILE", "custom")
+	t.Setenv("OPENAI_VIA_CODEX_ANTIGRAVITY_CATALOG_TTL", "90")
 	cfg := defaultConfig()
 	cfg.Port = 19090
 	cfg.Model = "gpt-file"
 	cfg.applyEnvironment()
-	if cfg.Port != 20001 || cfg.Model != "gpt-env" {
+	if cfg.Port != 20001 || cfg.Model != "gpt-env" || !cfg.AntigravityEnabled || cfg.AntigravityOAuthProfile != "custom" || cfg.AntigravityCatalogTTL != 90*time.Second {
 		t.Fatalf("config = %#v", cfg)
+	}
+}
+
+func TestExpandHomeExpandsWindowsEnvironmentPaths(t *testing.T) {
+	t.Setenv("AGENT_BRIDGE_TEST_ROOT", `C:\Users\test`)
+	if got := expandHome(`%AGENT_BRIDGE_TEST_ROOT%\AgentBridge\oauth_creds.json`); got != `C:\Users\test\AgentBridge\oauth_creds.json` {
+		t.Fatalf("expanded path = %q", got)
 	}
 }
 

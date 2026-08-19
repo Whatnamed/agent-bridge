@@ -51,6 +51,46 @@ lines from an interrupted older process are ignored. Set
 `OPENAI_VIA_CODEX_TELEMETRY_ENABLED=false` or
 `--telemetry-enabled=false` to disable collection and persistence.
 
+## Read-only Codex rollout collector
+
+When telemetry is enabled, the monitor can also import the official Codex local
+rollout JSONL files without changing them. The default directories are:
+
+```text
+%USERPROFILE%\.codex\sessions
+%USERPROFILE%\.codex\archived_sessions
+```
+
+The default import window is 30 days and the default discovery/tail interval is
+60 seconds. The collector recognizes the observed top-level `session_meta`,
+`turn_context`, and `event_msg` envelopes. Within `event_msg` it consumes only
+`task_started`, `task_complete`, and `token_count`; other events are ignored and
+counted. It tolerates malformed lines, oversized content, an incomplete final
+line, file truncation/rewrite, archive moves, and files that are unavailable at
+one scan. A byte offset checkpoint and stable hashed rollout/turn identity avoid
+re-reading a closed file or creating a second summary after restart.
+
+Codex turns are written separately under:
+
+```text
+<state-dir>/telemetry/codex/YYYY-MM-DD.jsonl
+<state-dir>/telemetry/codex/checkpoint.json
+```
+
+Only model/source labels, hashed identifiers, context-window metadata, timing,
+and per-sampling usage are retained. `last_token_usage` is treated as the
+per-sampling usage; the cumulative `total_token_usage` snapshot is never used
+as turn usage. Prompt, system/developer text, agent/reasoning text, tool
+arguments/results, command/file content, OAuth data, and raw rollout/session/
+turn IDs are not persisted. Codex records use `source=codex` and
+`record_kind=turn`; bridge records use `source=bridge` and
+`record_kind=request`, with the client classified as `ZCode`, `DSH`, or
+`Unknown`. Collector errors are fail-open and do not affect bridge requests.
+
+The `[codex]` settings are `collector_enabled`, `sessions_dir`,
+`archived_sessions_dir`, `import_days`, and `scan_interval`; the equivalent
+CLI flags and `OPENAI_VIA_CODEX_CODEX_*` environment variables are supported.
+
 ## Dashboard routes
 
 The UI is served at:
@@ -70,12 +110,14 @@ GET /dashboard/api/requests/{internal_request_id}
 ```
 
 Supported request filters include `range` (`1h`, `6h`, `24h`, `7d`, `30d`, or
-`today`), `model`, `effort`, `status`, and `endpoint`. Supported sorts are
+`today`), `source` (`ZCode`, `Codex`, `DSH`, `Unknown`, or `all`), `model`,
+`effort`, `status`, and `endpoint`. Supported sorts are
 `newest`, `slowest`, `highest_input`, and `highest_reasoning`; the UI exposes
-bounded pagination with 50 records per page. Detail responses include request
+bounded pagination with 50 mixed request/turn records per page. Detail responses include request
 and completion timestamps, HTTP/stream/client metadata, supplied usage fields,
 reasoning/tool/event counters, timing fields, and the bounded metadata
-timeline. Persistence deliberately excludes that timeline. The embedded UI is
+timeline. Codex details additionally expose per-sampling usage and collector
+identity hashes. Persistence deliberately excludes the bridge timeline. The embedded UI is
 Chinese (`lang=zh-CN`), uses `ms` below one second and seconds with two decimal
 places at or above one second, and labels a missing first text delta as
 `无文本`. On the first Requests page with newest sorting, the list refreshes
@@ -83,7 +125,11 @@ about every five seconds while the tab is visible; hidden tabs and later pages
 are not auto-refreshed or moved. Cache diagnostics expose only presence flags
 and hash prefixes. Request cache hit rate (requests with `cached_tokens > 0`)
 is shown separately from token cache ratio (`cached_tokens / input_tokens`).
-The dashboard also exposes Go Heap metrics and bounded store counts; these are
+The table combines input with cached input and output with reasoning; compact
+K/M values retain exact values in the detail drawer and title text. A null
+usage field remains unavailable rather than being displayed as zero. The
+dashboard also exposes Go Heap metrics, bounded store counts, and Codex
+collector metrics; these are
 runtime diagnostics, not a Windows Working Set measurement.
 
 When `dashboard.enabled=false`, all dashboard paths return `404`. Dashboard

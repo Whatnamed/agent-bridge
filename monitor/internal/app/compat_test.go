@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -16,7 +17,10 @@ func TestChatToResponseTranslatesMessagesToolsAndStructuredOutput(t *testing.T) 
 		"tool_choice":     map[string]any{"type": "function", "function": map[string]any{"name": "lookup"}},
 		"response_format": map[string]any{"type": "json_schema", "json_schema": map[string]any{"name": "answer", "strict": true, "schema": map[string]any{"type": "object"}}},
 	}
-	got := chatToResponse(body, defaultModel)
+	got, err := chatToResponse(body, defaultModel)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got["instructions"] != "Be terse." {
 		t.Fatalf("instructions = %#v", got["instructions"])
 	}
@@ -35,6 +39,61 @@ func TestChatToResponseTranslatesMessagesToolsAndStructuredOutput(t *testing.T) 
 	format := mapAny(mapAny(got["text"])["format"])
 	if format["type"] != "json_schema" || format["name"] != "answer" {
 		t.Fatalf("format = %#v", format)
+	}
+}
+
+func TestChatToolContinuationPreservesFunctionNameAndThoughtSignature(t *testing.T) {
+	response := map[string]any{
+		"id":    "resp_tool",
+		"model": "gemini-3.7-flash-high",
+		"output": []any{map[string]any{
+			"type": "function_call", "call_id": "call-1", "name": "get_test_value", "arguments": `{"name":"smoke"}`,
+			"thought_signature": "signature-1",
+		}},
+		"usage": map[string]any{"input_tokens": int64(3), "output_tokens": int64(8), "total_tokens": int64(11)},
+	}
+	completion := responseToChat(response, "fallback", false, 1)
+	message := mapAny(mapAny(sliceAny(completion["choices"])[0])["message"])
+	toolCalls := sliceAny(message["tool_calls"])
+	if len(toolCalls) != 1 {
+		t.Fatalf("tool calls = %#v", toolCalls)
+	}
+	toolCall := mapAny(toolCalls[0])
+	transportID := stringValue(toolCall["id"])
+	if !strings.HasPrefix(transportID, thoughtSignatureToolCallIDPrefix) {
+		t.Fatalf("thought signature was not carried by tool call id: %q", transportID)
+	}
+
+	converted, err := chatToResponse(map[string]any{
+		"model": "gemini-3.7-flash-high",
+		"messages": []any{
+			map[string]any{"role": "assistant", "tool_calls": toolCalls},
+			map[string]any{"role": "tool", "tool_call_id": transportID, "content": "AGY_POC_OK"},
+		},
+	}, "fallback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := sliceAny(converted["input"])
+	if len(input) != 2 {
+		t.Fatalf("converted input = %#v", input)
+	}
+	call := mapAny(input[0])
+	if call["call_id"] != "call-1" || call["name"] != "get_test_value" || call["thought_signature"] != "signature-1" {
+		t.Fatalf("converted function call = %#v", call)
+	}
+	output := mapAny(input[1])
+	if output["call_id"] != "call-1" || output["name"] != "get_test_value" {
+		t.Fatalf("converted function output = %#v", output)
+	}
+}
+
+func TestChatToolOutputWithoutAssistantCallFailsClosed(t *testing.T) {
+	_, err := chatToResponse(map[string]any{
+		"messages": []any{map[string]any{"role": "tool", "tool_call_id": "call-missing", "content": "value"}},
+	}, defaultModel)
+	if err == nil || !strings.Contains(err.Error(), "function name") {
+		t.Fatalf("orphan tool output was accepted: %v", err)
 	}
 }
 

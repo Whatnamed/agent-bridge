@@ -37,9 +37,9 @@ func runDaemonCommand(command string, args []string) error {
 	fs.BoolVar(&cfg.Verbose, "verbose", cfg.Verbose, "verbose logging")
 	stopSeconds := cfg.StopTimeout.Seconds()
 	fs.Float64Var(&stopSeconds, "stop-timeout", stopSeconds, "seconds to wait before force kill")
-	var backendTimeout *float64
+	var serverFlags *daemonServerFlags
 	if command == "start" {
-		backendTimeout = addDaemonServerFlags(fs, &cfg)
+		serverFlags = addDaemonServerFlags(fs, &cfg)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -47,11 +47,28 @@ func runDaemonCommand(command string, args []string) error {
 		}
 		return err
 	}
-	if backendTimeout != nil {
-		cfg.Timeout = time.Duration(*backendTimeout * float64(time.Second))
+	if serverFlags != nil {
+		cfg.Timeout = time.Duration(*serverFlags.timeout * float64(time.Second))
+		cfg.CodexScanInterval = time.Duration(*serverFlags.codexScanInterval * float64(time.Second))
+		cfg.AntigravityCatalogTTL = time.Duration(*serverFlags.antigravityCatalogTTL * float64(time.Second))
+		cfg.AntigravityProjectTTL = time.Duration(*serverFlags.antigravityProjectTTL * float64(time.Second))
 	}
-	if cfg.Port < 1 || cfg.Port > 65535 || stopSeconds <= 0 || cfg.Timeout <= 0 || cfg.MaxStored < 0 || cfg.Concurrency < 0 {
+	cfg.AntigravityOAuthProfile = strings.ToLower(strings.TrimSpace(cfg.AntigravityOAuthProfile))
+	cfg.AntigravityCredentialPath = expandHome(cfg.AntigravityCredentialPath)
+	cfg.AntigravityEndpoint = strings.TrimRight(strings.TrimSpace(cfg.AntigravityEndpoint), "/")
+	cfg.AntigravityProject = strings.TrimSpace(cfg.AntigravityProject)
+	if cfg.Port < 1 || cfg.Port > 65535 || stopSeconds <= 0 || cfg.Timeout <= 0 || cfg.MaxStored < 0 || cfg.Concurrency < 0 ||
+		cfg.CodexImportDays < 1 || cfg.CodexScanInterval < 5*time.Second {
 		return errors.New("port, timeout, storage, concurrency, or stop-timeout is invalid")
+	}
+	if cfg.CodexCollectorEnabled && (cfg.CodexSessionsDir == "" || cfg.CodexArchivedSessionsDir == "") {
+		return errors.New("Codex collector settings are invalid")
+	}
+	if cfg.AntigravityOAuthProfile != "" && cfg.AntigravityOAuthProfile != "antigravity" && cfg.AntigravityOAuthProfile != "custom" {
+		return errors.New("antigravity OAuth profile must be antigravity or custom")
+	}
+	if cfg.AntigravityEnabled && (cfg.AntigravityCredentialPath == "" || cfg.AntigravityEndpoint == "" || cfg.AntigravityCatalogTTL <= 0 || cfg.AntigravityProjectTTL <= 0) {
+		return errors.New("Antigravity provider settings are invalid")
 	}
 	cfg.StopTimeout = time.Duration(stopSeconds * float64(time.Second))
 	paths, err := resolveDaemonPaths(cfg, flagProvided(args, "host"), flagProvided(args, "pid-file"))
@@ -70,7 +87,14 @@ func runDaemonCommand(command string, args []string) error {
 	}
 }
 
-func addDaemonServerFlags(fs *flag.FlagSet, cfg *config) *float64 {
+type daemonServerFlags struct {
+	timeout               *float64
+	codexScanInterval     *float64
+	antigravityCatalogTTL *float64
+	antigravityProjectTTL *float64
+}
+
+func addDaemonServerFlags(fs *flag.FlagSet, cfg *config) *daemonServerFlags {
 	fs.StringVar(&cfg.Model, "default-model", cfg.Model, "default model")
 	fs.StringVar(&cfg.BackendURL, "backend-base-url", cfg.BackendURL, "Codex backend base URL")
 	fs.StringVar(&cfg.ClientVersion, "client-version", cfg.ClientVersion, "client version header")
@@ -86,7 +110,25 @@ func addDaemonServerFlags(fs *flag.FlagSet, cfg *config) *float64 {
 	fs.IntVar(&cfg.TelemetryQueueSize, "telemetry-queue-size", cfg.TelemetryQueueSize, "bounded telemetry writer queue size")
 	fs.BoolVar(&cfg.DashboardEnabled, "dashboard-enabled", cfg.DashboardEnabled, "enable the local dashboard")
 	fs.StringVar(&cfg.ReasoningSummaryDefault, "reasoning-summary-default", cfg.ReasoningSummaryDefault, "default reasoning summary: none or auto")
-	return &timeout
+	fs.BoolVar(&cfg.CodexCollectorEnabled, "codex-collector-enabled", cfg.CodexCollectorEnabled, "enable read-only Codex rollout import")
+	fs.StringVar(&cfg.CodexSessionsDir, "codex-sessions-dir", cfg.CodexSessionsDir, "Codex sessions directory")
+	fs.StringVar(&cfg.CodexArchivedSessionsDir, "codex-archived-sessions-dir", cfg.CodexArchivedSessionsDir, "Codex archived sessions directory")
+	fs.IntVar(&cfg.CodexImportDays, "codex-import-days", cfg.CodexImportDays, "days of Codex rollout history to import")
+	codexScanInterval := cfg.CodexScanInterval.Seconds()
+	fs.Float64Var(&codexScanInterval, "codex-scan-interval", codexScanInterval, "Codex rollout scan interval seconds")
+	fs.BoolVar(&cfg.AntigravityEnabled, "antigravity-enabled", cfg.AntigravityEnabled, "enable the Direct OAuth Antigravity provider")
+	fs.StringVar(&cfg.AntigravityOAuthProfile, "antigravity-oauth-profile", cfg.AntigravityOAuthProfile, "Antigravity OAuth profile: antigravity or custom")
+	fs.StringVar(&cfg.AntigravityCredentialPath, "antigravity-credential-path", cfg.AntigravityCredentialPath, "Antigravity OAuth credential path")
+	fs.StringVar(&cfg.AntigravityEndpoint, "antigravity-endpoint", cfg.AntigravityEndpoint, "Antigravity CloudCode endpoint")
+	fs.StringVar(&cfg.AntigravityProject, "antigravity-project", cfg.AntigravityProject, "explicit verified Cloud AI Companion project")
+	antigravityCatalogTTL := cfg.AntigravityCatalogTTL.Seconds()
+	antigravityProjectTTL := cfg.AntigravityProjectTTL.Seconds()
+	fs.Float64Var(&antigravityCatalogTTL, "antigravity-catalog-ttl", antigravityCatalogTTL, "Antigravity catalog cache TTL seconds")
+	fs.Float64Var(&antigravityProjectTTL, "antigravity-project-ttl", antigravityProjectTTL, "Antigravity project cache TTL seconds")
+	return &daemonServerFlags{
+		timeout: &timeout, codexScanInterval: &codexScanInterval,
+		antigravityCatalogTTL: &antigravityCatalogTTL, antigravityProjectTTL: &antigravityProjectTTL,
+	}
 }
 
 func flagProvided(args []string, name string) bool {
@@ -153,6 +195,11 @@ func startDaemon(cfg config, paths daemonPaths) error {
 	if _, err := newBackend(cfg).auth.borrow(); err != nil {
 		return preflightAuthError(err)
 	}
+	if cfg.AntigravityEnabled {
+		if _, err := newAntigravityProvider(cfg); err != nil {
+			return err
+		}
+	}
 	if pid := readPID(paths.PIDFile); pid > 0 {
 		if processAlive(pid) {
 			return fmt.Errorf("already running with PID %d (%s)", pid, paths.PIDFile)
@@ -212,6 +259,18 @@ func serverCommandArgs(command string, cfg config) []string {
 		"--telemetry-queue-size", strconv.Itoa(cfg.TelemetryQueueSize),
 		"--dashboard-enabled", strconv.FormatBool(cfg.DashboardEnabled),
 		"--reasoning-summary-default", cfg.ReasoningSummaryDefault,
+		"--codex-collector-enabled", strconv.FormatBool(cfg.CodexCollectorEnabled),
+		"--codex-sessions-dir", cfg.CodexSessionsDir,
+		"--codex-archived-sessions-dir", cfg.CodexArchivedSessionsDir,
+		"--codex-import-days", strconv.Itoa(cfg.CodexImportDays),
+		"--codex-scan-interval", formatSeconds(cfg.CodexScanInterval),
+		"--antigravity-enabled", strconv.FormatBool(cfg.AntigravityEnabled),
+		"--antigravity-oauth-profile", cfg.AntigravityOAuthProfile,
+		"--antigravity-credential-path", cfg.AntigravityCredentialPath,
+		"--antigravity-endpoint", cfg.AntigravityEndpoint,
+		"--antigravity-project", cfg.AntigravityProject,
+		"--antigravity-catalog-ttl", formatSeconds(cfg.AntigravityCatalogTTL),
+		"--antigravity-project-ttl", formatSeconds(cfg.AntigravityProjectTTL),
 	}
 	if command == "daemon-run" {
 		args = append(args, "--stop-timeout", formatSeconds(cfg.StopTimeout))

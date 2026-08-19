@@ -47,18 +47,34 @@ type requestIdentity struct {
 }
 
 type requestRecord struct {
-	InternalRequestID string    `json:"internal_request_id"`
-	StartedAt         time.Time `json:"started_at"`
-	CompletedAt       time.Time `json:"completed_at"`
-	Endpoint          string    `json:"endpoint"`
-	HTTPMethod        string    `json:"http_method"`
-	HTTPStatus        int       `json:"http_status"`
-	Outcome           string    `json:"outcome"`
-	RequestBytes      int64     `json:"request_bytes"`
-	ResponseBytes     int64     `json:"response_bytes"`
-	Stream            bool      `json:"stream"`
+	InternalRequestID string                 `json:"internal_request_id"`
+	StartedAt         time.Time              `json:"started_at"`
+	CompletedAt       time.Time              `json:"completed_at"`
+	Endpoint          string                 `json:"endpoint"`
+	HTTPMethod        string                 `json:"http_method"`
+	HTTPStatus        int                    `json:"http_status"`
+	Outcome           string                 `json:"outcome"`
+	RequestBytes      int64                  `json:"request_bytes"`
+	ResponseBytes     int64                  `json:"response_bytes"`
+	Stream            bool                   `json:"stream"`
+	Source            string                 `json:"source"`
+	RecordKind        string                 `json:"record_kind"`
+	SecondarySource   string                 `json:"secondary_source,omitempty"`
+	RolloutIDHash     string                 `json:"rollout_id_hash,omitempty"`
+	SessionIDHash     string                 `json:"session_id_hash,omitempty"`
+	TurnIDHash        string                 `json:"turn_id_hash,omitempty"`
+	Subagent          *bool                  `json:"subagent,omitempty"`
+	ContextWindow     *int64                 `json:"context_window,omitempty"`
+	SamplingCount     int                    `json:"sampling_count,omitempty"`
+	Sampling          []codexSamplingSummary `json:"sampling,omitempty"`
 
 	Model                         string         `json:"model"`
+	Provider                      string         `json:"provider,omitempty"`
+	RequestedModel                string         `json:"requested_model,omitempty"`
+	ActualUpstreamModel           string         `json:"actual_upstream_model,omitempty"`
+	ControlPlaneProjectAvailable  bool           `json:"control_plane_project_available"`
+	ModelCatalogSize              int            `json:"model_catalog_size,omitempty"`
+	OAuthTokenExpiry              *time.Time     `json:"oauth_token_expiry,omitempty"`
 	RequestedReasoningEffort      *string        `json:"requested_reasoning_effort"`
 	RequestedReasoningSummary     *string        `json:"requested_reasoning_summary"`
 	TextVerbosity                 *string        `json:"text_verbosity"`
@@ -101,6 +117,7 @@ type requestRecord struct {
 	TotalTokens       *int64 `json:"total_tokens"`
 
 	RequestDurationMS       int64  `json:"request_duration_ms"`
+	DurationAvailable       bool   `json:"duration_available"`
 	FirstUpstreamEventMS    *int64 `json:"first_upstream_event_ms"`
 	FirstReasoningEventMS   *int64 `json:"first_reasoning_event_ms"`
 	FirstOutputTextDeltaMS  *int64 `json:"first_output_text_delta_ms"`
@@ -173,6 +190,7 @@ type telemetryStore struct {
 	active       atomic.Int64
 	quota        *quotaState
 	fetcher      quotaFetcher
+	codex        *codexCollector
 	closeOnce    sync.Once
 }
 
@@ -428,6 +446,10 @@ func newTelemetryStore(cfg config, fetcher quotaFetcher) *telemetryStore {
 	}
 	store.wg.Add(1)
 	go store.writerLoop()
+	if cfg.CodexCollectorEnabled && (strings.TrimSpace(cfg.CodexSessionsDir) != "" || strings.TrimSpace(cfg.CodexArchivedSessionsDir) != "") {
+		store.codex = newCodexCollector(store)
+		store.codex.start()
+	}
 	return store
 }
 
@@ -436,9 +458,58 @@ func (s *telemetryStore) close() {
 		return
 	}
 	s.closeOnce.Do(func() {
+		if s.codex != nil {
+			s.codex.stopCollector()
+		}
 		close(s.stop)
 		s.wg.Wait()
 	})
+}
+
+func (s *telemetryStore) readCodexRecords(since time.Time) []*requestRecord {
+	if s == nil || !s.enabled {
+		return nil
+	}
+	directory := filepath.Join(s.telemetryDir, codexSummaryDirName)
+	if s.codex != nil {
+		directory = s.codex.summaryDir
+	}
+	s.historyMu.RLock()
+	defer s.historyMu.RUnlock()
+	var records []*requestRecord
+	for _, name := range telemetryHistoryFiles(directory, since) {
+		file, err := os.Open(name)
+		if err != nil {
+			continue
+		}
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 64*1024), maxTelemetryLineBytes)
+		for scanner.Scan() {
+			var record requestRecord
+			if json.Unmarshal(scanner.Bytes(), &record) != nil || record.InternalRequestID == "" {
+				continue
+			}
+			normalizeSourceRecord(&record)
+			if record.Source != "codex" {
+				continue
+			}
+			if !since.IsZero() && record.StartedAt.Before(since) {
+				continue
+			}
+			record.Timeline = nil
+			copy := record
+			records = append(records, &copy)
+		}
+		_ = file.Close()
+	}
+	return records
+}
+
+func (s *telemetryStore) codexSnapshot() map[string]any {
+	if s == nil || s.codex == nil {
+		return map[string]any{"enabled": false}
+	}
+	return s.codex.snapshot()
 }
 
 func (s *telemetryStore) begin(r *http.Request, endpoint string) *requestTelemetry {
@@ -452,6 +523,8 @@ func (s *telemetryStore) begin(r *http.Request, endpoint string) *requestTelemet
 		Endpoint:          endpoint,
 		HTTPMethod:        r.Method,
 		Outcome:           "failed",
+		Source:            "bridge",
+		RecordKind:        "request",
 		ClientType:        detectClientType(r.Header),
 		ToolTypes:         map[string]int{},
 	}
@@ -497,6 +570,7 @@ func (s *telemetryStore) finish(t *requestTelemetry, r *http.Request, capture *r
 	record.ResponseBytes = capture.bytes
 	record.HTTPStatus = capture.statusCode()
 	record.RequestDurationMS = maxInt64(0, record.CompletedAt.Sub(record.StartedAt).Microseconds()/1000)
+	record.DurationAvailable = true
 	if record.FirstOutputTextDeltaMS != nil {
 		record.TTFTMS = cloneInt64(record.FirstOutputTextDeltaMS)
 	}
@@ -621,6 +695,7 @@ func (s *telemetryStore) loadRecentRecords() {
 			if json.Unmarshal(scanner.Bytes(), &record) != nil || record.InternalRequestID == "" {
 				continue
 			}
+			normalizeSourceRecord(&record)
 			record.Timeline = nil
 			s.records = append(s.records, &record)
 			if len(s.records) > maxTelemetryRecords {
@@ -679,6 +754,7 @@ func (s *telemetryStore) readHistoryRecords(since time.Time) []*requestRecord {
 			if json.Unmarshal(scanner.Bytes(), &record) != nil || record.InternalRequestID == "" {
 				continue
 			}
+			normalizeSourceRecord(&record)
 			if !since.IsZero() && record.StartedAt.Before(since) {
 				continue
 			}
@@ -877,6 +953,13 @@ func (s *telemetryStore) findRecord(id string) *requestRecord {
 			return record
 		}
 	}
+	codex := s.readCodexRecords(time.Time{})
+	for i := len(codex) - 1; i >= 0; i-- {
+		record := codex[i]
+		if record.InternalRequestID == id {
+			return record
+		}
+	}
 	return nil
 }
 
@@ -989,6 +1072,29 @@ func recordForAPI(record *requestRecord, includeTimeline bool) map[string]any {
 	return result
 }
 
+func normalizeSourceRecord(record *requestRecord) {
+	if record == nil {
+		return
+	}
+	if record.Source == "" {
+		record.Source = "bridge"
+	}
+	if record.RecordKind == "" {
+		record.RecordKind = "request"
+	}
+	record.Source = strings.ToLower(strings.TrimSpace(record.Source))
+	if record.Source == "codex" {
+		if record.ClientType == "" {
+			record.ClientType = "Codex"
+		}
+		if record.RecordKind == "request" {
+			record.RecordKind = "turn"
+		}
+	} else if record.ClientType == "" {
+		record.ClientType = "Unknown"
+	}
+}
+
 func (t *requestTelemetry) observeRequest(body map[string]any, endpoint string) {
 	if t == nil || body == nil {
 		return
@@ -997,6 +1103,7 @@ func (t *requestTelemetry) observeRequest(body map[string]any, endpoint string) 
 	defer t.mu.Unlock()
 	t.record.Endpoint = endpoint
 	t.record.Model = stringValue(body["model"])
+	t.record.RequestedModel = t.record.Model
 	t.record.Stream = boolValue(body["stream"])
 	t.record.PreviousResponseIDPresent = strings.TrimSpace(stringValue(body["previous_response_id"])) != ""
 	incomingPromptCacheKey := strings.TrimSpace(stringValue(body["prompt_cache_key"]))
@@ -1073,6 +1180,30 @@ func (t *requestTelemetry) observePrepared(payload map[string]any) {
 			t.record.UpstreamEncryptedReasoningEnable = true
 			break
 		}
+	}
+}
+
+func (t *requestTelemetry) observeProvider(route providerRoute) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.record.Provider = safeToken(route.Provider)
+	if route.RequestedModel != "" {
+		t.record.RequestedModel = route.RequestedModel
+	}
+	if route.ActualUpstreamModel != "" {
+		t.record.ActualUpstreamModel = route.ActualUpstreamModel
+		t.record.Model = route.ActualUpstreamModel
+	}
+	t.record.ControlPlaneProjectAvailable = route.ControlPlaneProjectAvailable
+	if route.CatalogSize > 0 {
+		t.record.ModelCatalogSize = route.CatalogSize
+	}
+	if !route.OAuthTokenExpiry.IsZero() {
+		expiry := route.OAuthTokenExpiry.UTC()
+		t.record.OAuthTokenExpiry = &expiry
 	}
 }
 

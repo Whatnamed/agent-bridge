@@ -23,6 +23,7 @@ import (
 type server struct {
 	cfg       config
 	backend   codexBackend
+	providers *providerRouter
 	responses *responseStore
 	chats     *chatStore
 	slots     chan struct{}
@@ -48,9 +49,14 @@ func serve(cfg config, version string) error {
 	if _, err := b.auth.borrow(); err != nil {
 		return preflightAuthError(err)
 	}
+	providers, err := newProviderRouter(cfg, b)
+	if err != nil {
+		return err
+	}
 	s := &server{
 		cfg:       cfg,
 		backend:   b,
+		providers: providers,
 		responses: newResponseStore(cfg.MaxStored),
 		chats:     newChatStore(cfg.MaxStored),
 		telemetry: newTelemetryStore(cfg, b),
@@ -296,15 +302,50 @@ func (s *server) release() {
 	}
 }
 
+func (s *server) resolveProvider(ctx context.Context, payload map[string]any) (modelProvider, error) {
+	requested := strings.TrimSpace(stringValue(payload["model"]))
+	if s.providers == nil {
+		provider := codexModelProvider{backend: s.backend}
+		if observer := telemetryFromContext(ctx); observer != nil {
+			observer.observeProvider(providerRoute{
+				Provider: provider.ID(), RequestedModel: requested, ActualUpstreamModel: requested,
+			})
+		}
+		return provider, nil
+	}
+	provider, route, err := s.providers.resolve(ctx, requested)
+	if err != nil {
+		return nil, err
+	}
+	if observer := telemetryFromContext(ctx); observer != nil {
+		observer.observeProvider(route)
+	}
+	return provider, nil
+}
+
 func (s *server) models(w http.ResponseWriter, r *http.Request) {
 	if s.acquire(r.Context()) != nil {
 		return
 	}
 	defer s.release()
-	ids := s.backend.listModels(r.Context())
+	var ids []string
+	var err error
+	if s.providers != nil {
+		ids, err = s.providers.listModels(r.Context())
+	} else {
+		ids = s.backend.listModels(r.Context())
+	}
+	if err != nil {
+		writeBackendError(w, err)
+		return
+	}
 	data := make([]any, len(ids))
 	for i, id := range ids {
-		data[i] = map[string]any{"id": id, "object": "model", "created": 0, "owned_by": "codex"}
+		owner := "codex"
+		if isStableAntigravityModel(id) {
+			owner = antigravityProviderID
+		}
+		data[i] = map[string]any{"id": id, "object": "model", "created": 0, "owned_by": owner}
 	}
 	writeJSON(w, 200, map[string]any{"object": "list", "data": data})
 }
@@ -330,15 +371,23 @@ func (s *server) createResponse(w http.ResponseWriter, r *http.Request) {
 	}
 	downstream := cloneMap(prepared)
 	delete(downstream, "previous_response_id")
+	provider, err := s.resolveProvider(r.Context(), downstream)
+	if err != nil {
+		if observer := telemetryFromContext(r.Context()); observer != nil {
+			observer.observeStreamError()
+		}
+		writeBackendError(w, err)
+		return
+	}
 	if boolValue(body["stream"]) {
-		s.streamResponse(w, r, prepared, downstream, previous)
+		s.streamResponse(w, r, provider, prepared, downstream, previous)
 		return
 	}
 	if s.acquire(r.Context()) != nil {
 		return
 	}
 	defer s.release()
-	response, err := s.backend.collect(r.Context(), downstream)
+	response, err := provider.collect(r.Context(), downstream)
 	if err != nil {
 		if observer := telemetryFromContext(r.Context()); observer != nil {
 			observer.observeStreamError()
@@ -358,7 +407,7 @@ func (s *server) createResponse(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, response)
 }
 
-func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, prepared, downstream map[string]any, previous string) {
+func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, provider modelProvider, prepared, downstream map[string]any, previous string) {
 	setSSE(w)
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -372,7 +421,7 @@ func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, prepared
 	var outputs []any
 	stored := false
 	seq := 0
-	err := s.backend.stream(r.Context(), downstream, func(event map[string]any) error {
+	err := provider.stream(r.Context(), downstream, func(event map[string]any) error {
 		eventType := stringValue(event["type"])
 		if item := mapAny(event["item"]); eventType == "response.output_item.done" && item != nil {
 			outputs = append(outputs, item)
@@ -583,17 +632,32 @@ func (s *server) chatCollection(w http.ResponseWriter, r *http.Request) {
 	if observer := telemetryFromContext(r.Context()); observer != nil {
 		observer.observeRequest(body, "/v1/chat/completions")
 	}
-	responsePayload := chatToResponse(body, s.cfg.Model)
+	responsePayload, err := chatToResponse(body, s.cfg.Model)
+	if err != nil {
+		if observer := telemetryFromContext(r.Context()); observer != nil {
+			observer.observeStreamError()
+		}
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", nil, nil)
+		return
+	}
+	provider, err := s.resolveProvider(r.Context(), responsePayload)
+	if err != nil {
+		if observer := telemetryFromContext(r.Context()); observer != nil {
+			observer.observeStreamError()
+		}
+		writeBackendError(w, err)
+		return
+	}
 	legacy := body["functions"] != nil || body["function_call"] != nil
 	if boolValue(body["stream"]) {
-		s.streamChat(w, r, responsePayload, body, legacy)
+		s.streamChat(w, r, provider, responsePayload, body, legacy)
 		return
 	}
 	if s.acquire(r.Context()) != nil {
 		return
 	}
 	defer s.release()
-	response, err := s.backend.collect(r.Context(), responsePayload)
+	response, err := provider.collect(r.Context(), responsePayload)
 	if err != nil {
 		if observer := telemetryFromContext(r.Context()); observer != nil {
 			observer.observeStreamError()
@@ -616,7 +680,7 @@ func (s *server) chatCollection(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, completion)
 }
 
-func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayload, body map[string]any, legacy bool) {
+func (s *server) streamChat(w http.ResponseWriter, r *http.Request, provider modelProvider, responsePayload, body map[string]any, legacy bool) {
 	setSSE(w)
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -643,7 +707,7 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, responsePayl
 			emit(chatChunk(state, map[string]any{"role": "assistant"}, nil, nil, nil))
 		}
 	}
-	err := s.backend.stream(r.Context(), responsePayload, func(event map[string]any) error {
+	err := provider.stream(r.Context(), responsePayload, func(event map[string]any) error {
 		typ := stringValue(event["type"])
 		switch typ {
 		case "response.created":
@@ -782,6 +846,9 @@ func toolDelta(item map[string]any, index int, args string, identity, legacy boo
 		fn := map[string]any{"arguments": args}
 		if identity {
 			fn["name"] = stringValue(item["name"])
+			if signature := firstMapString(item, "thought_signature", "thoughtSignature"); signature != "" {
+				fn["thought_signature"] = signature
+			}
 		}
 		return map[string]any{"function_call": fn}
 	}
@@ -789,7 +856,10 @@ func toolDelta(item map[string]any, index int, args string, identity, legacy boo
 	call := map[string]any{"index": index, "function": fn}
 	if identity {
 		fn["name"] = stringValue(item["name"])
-		call["id"] = stringValue(valueOr(item["call_id"], valueOr(item["id"], fmt.Sprintf("call_%d", index))))
+		call["id"] = functionCallTransportID(item)
+		if stringValue(call["id"]) == "" {
+			call["id"] = fmt.Sprintf("call_%d", index)
+		}
 		call["type"] = "function"
 	}
 	return map[string]any{"tool_calls": []any{call}}
