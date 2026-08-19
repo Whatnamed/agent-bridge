@@ -145,13 +145,13 @@ func TestDashboardAssetsExposeSourceFilterDrawerAndPrivacyContract(t *testing.T)
 			t.Fatalf("dashboard script marker %q is missing", marker)
 		}
 	}
-	for _, marker := range []string{"请求 / 轮次", "已导入轮次", "采集延迟", "当前堆分配", "使用中的堆", "Go 堆保留", "Response 缓存", "Chat 缓存", "未知"} {
+	for _, marker := range []string{"请求 / 轮次", "已导入轮次", "采集延迟", "当前堆分配", "使用中的堆", "Go 堆保留", "Response 缓存", "Chat 缓存", "记录详情", "未知", `All: "全部"`, `all: "全部"`} {
 		if !strings.Contains(pageText+appText, marker) {
 			t.Fatalf("Chinese dashboard label %q is missing", marker)
 		}
 	}
 	for _, forbidden := range []string{
-		"请求 / turns", "当前范围没有请求或 turns。", "esc(item.record_kind || \"request\")",
+		"请求 / turns", "当前范围没有请求或 turns。", "esc(item.record_kind || \"request\")", "来源：\" + (data.source || \"All\")", "RECORD DETAIL",
 		"[\"记录类型\", item.record_kind]", "[\"secondary source\"", "[\"requested model\"",
 		"[\"actual upstream model\"", "[\"provider\"", "[\"context window\"", "[\"subagent\"",
 		"[\"sampling 数\"", "[\"Reasoning 条目\"", "[\"Summary delta\"", "[\"Function call 数\"", "[\"Tool call 数\"",

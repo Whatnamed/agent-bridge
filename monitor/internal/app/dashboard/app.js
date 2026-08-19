@@ -28,7 +28,7 @@
     const value = String(item?.client_type || "Unknown");
     return ["ZCode", "DSH", "Unknown"].includes(value) ? value : "Unknown";
   };
-  const sourceValueLabel = (value) => ({ Unknown: "未知", unknown: "未知" }[String(value)] || value || "—");
+  const sourceValueLabel = (value) => ({ All: "全部", all: "全部", Unknown: "未知", unknown: "未知" }[String(value)] || value || "—");
   const sourceLabel = (item) => sourceValueLabel(sourceKey(item));
   const sourceClass = (item) => sourceKey(item).toLowerCase();
   const recordKindLabel = (value) => ({ request: "请求", turn: "轮次" }[String(value)] || value || "—");
@@ -129,7 +129,7 @@
       $("dropped").textContent = num(data.dropped_telemetry_count);
       $("writer-errors").textContent = num(data.telemetry_writer_errors);
       $("last-quota").textContent = data.last_quota_update ? time(data.last_quota_update) : "未获取";
-      $("selected-range-label").textContent = "当前范围：" + rangeLabel(data.range || range) + " · 来源：" + (data.source || "All");
+      $("selected-range-label").textContent = "当前范围：" + rangeLabel(data.range || range) + " · 来源：" + sourceValueLabel(data.source || "All");
       renderQuota(data.quota);
       renderCodexCollector(data.codex);
       const stats = data.stats || {};
