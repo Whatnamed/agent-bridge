@@ -299,6 +299,14 @@ func TestAntigravityToolStreamProducesFunctionCallResponse(t *testing.T) {
 	if item["type"] != "function_call" || item["name"] != "get_test_value" || item["thought_signature"] != "sig-1" {
 		t.Fatalf("function output = %#v", item)
 	}
+	transportID := stringValue(item["call_id"])
+	callID, signature, err := decodeThoughtSignatureToolCallID(transportID)
+	if err != nil || callID != "call-1" || signature != "sig-1" || !strings.HasPrefix(transportID, thoughtSignatureToolCallIDPrefix) {
+		t.Fatalf("function output transport id = %q call_id=%q signature=%q err=%v", transportID, callID, signature, err)
+	}
+	if stringValue(item["id"]) != transportID {
+		t.Fatalf("function output id/call_id mismatch = %#v", item)
+	}
 	types := make([]string, 0, len(received))
 	for _, event := range received {
 		types = append(types, stringValue(event["type"]))
@@ -317,8 +325,32 @@ func TestAntigravityToolStreamProducesFunctionCallResponse(t *testing.T) {
 		}
 	}
 	done := received[4]
-	if done["name"] != "get_test_value" || done["item_id"] != "call-1" || done["arguments"] != `{"name":"smoke"}` {
+	if done["name"] != "get_test_value" || done["item_id"] != transportID || done["arguments"] != `{"name":"smoke"}` {
 		t.Fatalf("function arguments done = %#v", done)
+	}
+	if received[3]["item_id"] != transportID {
+		t.Fatalf("function arguments delta lost transport id = %#v", received[3])
+	}
+	if added := mapAny(received[2]["item"]); stringValue(added["id"]) != transportID || stringValue(added["call_id"]) != transportID {
+		t.Fatalf("function output added payload = %#v", received[2])
+	}
+
+	request, err := buildAntigravityRequest(map[string]any{
+		"model": stableAntigravityModel,
+		"input": []any{
+			map[string]any{"role": "user", "content": "use the tool result"},
+			item,
+			map[string]any{"type": "function_call_output", "call_id": transportID, "output": `{"value":"AGY_POC_OK"}`},
+		},
+	}, stableAntigravityModel, "projects/test-project")
+	if err != nil {
+		t.Fatalf("Responses tool continuation rejected transport id: %v", err)
+	}
+	if got := request.Request.Contents[1].Parts[0].FunctionCall; got == nil || got.ID != "call-1" || got.Name != "get_test_value" || got.Args["name"] != "smoke" || request.Request.Contents[1].Parts[0].ThoughtSignature != "sig-1" {
+		t.Fatalf("decoded function call = %#v", request.Request.Contents[1].Parts[0])
+	}
+	if got := request.Request.Contents[2].Parts[0].FunctionResponse; got == nil || got.ID != "call-1" || got.Name != "get_test_value" || got.Response["value"] != "AGY_POC_OK" {
+		t.Fatalf("decoded function response = %#v", request.Request.Contents[2].Parts[0])
 	}
 }
 

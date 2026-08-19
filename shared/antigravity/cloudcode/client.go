@@ -38,6 +38,21 @@ type Client struct {
 	HTTPUserAgent    string
 }
 
+// HTTPError preserves only the upstream HTTP status. Response bodies are not
+// retained because they may contain provider-specific or credential-adjacent
+// details that must not cross the bridge boundary.
+type HTTPError struct {
+	Operation  string
+	StatusCode int
+}
+
+func (e *HTTPError) Error() string {
+	if e == nil {
+		return "CloudCode HTTP request failed"
+	}
+	return fmt.Sprintf("CloudCode %s returned HTTP %d", e.Operation, e.StatusCode)
+}
+
 func NewClient(endpoint string, tokenSource TokenSource) *Client {
 	if strings.TrimSpace(endpoint) == "" {
 		endpoint = DefaultEndpoint
@@ -182,7 +197,7 @@ func (c *Client) jsonRequest(ctx context.Context, method, path string, body []by
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64*1024))
-		return nil, fmt.Errorf("CloudCode %s returned HTTP %d", path, response.StatusCode)
+		return nil, &HTTPError{Operation: path, StatusCode: response.StatusCode}
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, 4*1024*1024))
 	if err != nil {
@@ -258,7 +273,7 @@ func (c *Client) StreamGenerateContent(ctx context.Context, request GenerateRequ
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		_ = response.Body.Close()
-		return nil, fmt.Errorf("CloudCode streamGenerateContent returned HTTP %d", response.StatusCode)
+		return nil, &HTTPError{Operation: "streamGenerateContent", StatusCode: response.StatusCode}
 	}
 	return &Stream{
 		response:           response,

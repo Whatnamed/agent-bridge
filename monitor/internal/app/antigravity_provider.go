@@ -198,6 +198,10 @@ func (p *antigravityProvider) stream(ctx context.Context, payload map[string]any
 	}
 	stream, err := p.client.StreamGenerateContent(ctx, request)
 	if err != nil {
+		var httpErr *cloudcode.HTTPError
+		if errors.As(err, &httpErr) {
+			return &backendError{502, fmt.Sprintf("Antigravity streamGenerateContent failed (upstream HTTP %d).", httpErr.StatusCode)}
+		}
 		return &backendError{502, "Antigravity streamGenerateContent failed."}
 	}
 	defer stream.Close()
@@ -353,7 +357,11 @@ func (p *antigravityProvider) emitCanonicalStream(ctx context.Context, stream *c
 			}
 			if _, seen := functionKeys[key]; seen {
 				for _, item := range items {
-					if stringValue(item["call_id"]) == callID && stringValue(item["name"]) == call.Name {
+					existingCallID, _, decodeErr := decodeThoughtSignatureToolCallID(stringValue(item["call_id"]))
+					if decodeErr != nil {
+						return decodeErr
+					}
+					if existingCallID == callID && stringValue(item["name"]) == call.Name {
 						functionArguments[stringValue(item["id"])] = arguments
 						if stringValue(item["thought_signature"]) == "" {
 							if signature := functionThoughtSignature(event, call); signature != "" {
@@ -366,20 +374,22 @@ func (p *antigravityProvider) emitCanonicalStream(ctx context.Context, stream *c
 				continue
 			}
 			functionKeys[key] = struct{}{}
+			signature := functionThoughtSignature(event, call)
+			transportID := encodeThoughtSignatureToolCallID(callID, signature)
 			item := map[string]any{
-				"id": callID, "type": "function_call", "status": "in_progress", "call_id": callID,
+				"id": transportID, "type": "function_call", "status": "in_progress", "call_id": transportID,
 				"name": call.Name, "arguments": "",
 			}
-			if signature := functionThoughtSignature(event, call); signature != "" {
+			if signature != "" {
 				item["thought_signature"] = signature
 			}
 			items = append(items, item)
 			outputIndex := len(items) - 1
-			functionArguments[callID] = arguments
+			functionArguments[transportID] = arguments
 			if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": cloneMap(item)}); err != nil {
 				return err
 			}
-			if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.function_call_arguments.delta", "output_index": outputIndex, "item_id": callID, "delta": arguments}); err != nil {
+			if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.function_call_arguments.delta", "output_index": outputIndex, "item_id": transportID, "delta": arguments}); err != nil {
 				return err
 			}
 		}
@@ -662,14 +672,25 @@ func antigravityContents(input []any) ([]cloudcode.Content, []cloudcode.ContentP
 		typ := stringValue(item["type"])
 		switch typ {
 		case "function_call":
-			callID := strings.TrimSpace(stringValue(valueOr(item["call_id"], item["id"])))
+			transportID := strings.TrimSpace(stringValue(valueOr(item["call_id"], item["id"])))
 			name := strings.TrimSpace(stringValue(item["name"]))
-			if callID == "" || name == "" {
+			if transportID == "" || name == "" {
 				return nil, nil, errors.New("function_call must include call_id and name")
+			}
+			callID, transportSignature, err := decodeThoughtSignatureToolCallID(transportID)
+			if err != nil {
+				return nil, nil, err
 			}
 			args := mapValueFromJSON(item["arguments"])
 			part := cloudcode.ContentPart{FunctionCall: &cloudcode.FunctionCall{ID: callID, Name: name, Args: args}}
-			if signature := firstMapString(item, "thought_signature", "thoughtSignature"); signature != "" {
+			signature := firstMapString(item, "thought_signature", "thoughtSignature")
+			if transportSignature != "" {
+				if signature != "" && signature != transportSignature {
+					return nil, nil, errors.New("function_call thought signature does not match its transport id")
+				}
+				signature = transportSignature
+			}
+			if signature != "" {
 				part.ThoughtSignature = signature
 			}
 			contents = append(contents, cloudcode.Content{Role: "model", Parts: []cloudcode.ContentPart{part}})
@@ -678,8 +699,12 @@ func antigravityContents(input []any) ([]cloudcode.Content, []cloudcode.ContentP
 			if err != nil {
 				return nil, nil, err
 			}
+			callID, _, err := decodeThoughtSignatureToolCallID(stringValue(item["call_id"]))
+			if err != nil {
+				return nil, nil, err
+			}
 			response := functionResponseValue(item["output"])
-			contents = append(contents, cloudcode.Content{Role: "user", Parts: []cloudcode.ContentPart{{FunctionResponse: &cloudcode.FunctionResponse{ID: stringValue(item["call_id"]), Name: name, Response: response}}}})
+			contents = append(contents, cloudcode.Content{Role: "user", Parts: []cloudcode.ContentPart{{FunctionResponse: &cloudcode.FunctionResponse{ID: callID, Name: name, Response: response}}}})
 		case "reasoning":
 			if encrypted := firstMapString(item, "encrypted_content", "encryptedContent"); encrypted != "" {
 				contents = append(contents, cloudcode.Content{Role: "model", Parts: []cloudcode.ContentPart{{EncryptedContent: encrypted}}})

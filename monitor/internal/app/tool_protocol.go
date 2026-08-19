@@ -25,6 +25,14 @@ func encodeThoughtSignatureToolCallID(callID, signature string) string {
 	if signature == "" {
 		return callID
 	}
+	// The provider response can cross more than one compatibility boundary
+	// (Responses -> Chat -> Responses). Keep an already encoded ID stable so a
+	// second boundary does not wrap the transport envelope again.
+	if strings.HasPrefix(callID, thoughtSignatureToolCallIDPrefix) {
+		if _, existingSignature, err := decodeThoughtSignatureToolCallID(callID); err == nil && existingSignature != "" {
+			return callID
+		}
+	}
 	payload, err := json.Marshal(thoughtSignatureToolCallID{CallID: callID, Signature: signature})
 	if err != nil {
 		return callID
@@ -68,15 +76,21 @@ func responseFunctionCallNames(input []any) (map[string]string, error) {
 		if item == nil || stringValue(item["type"]) != "function_call" {
 			continue
 		}
-		callID := strings.TrimSpace(stringValue(valueOr(item["call_id"], item["id"])))
+		transportID := strings.TrimSpace(stringValue(valueOr(item["call_id"], item["id"])))
 		name := strings.TrimSpace(stringValue(item["name"]))
-		if callID == "" || name == "" {
+		if transportID == "" || name == "" {
 			return nil, fmt.Errorf("function_call must include call_id and name")
 		}
-		if previous, ok := names[callID]; ok && previous != name {
-			return nil, fmt.Errorf("function_call reused call_id with a different name")
+		callID, _, err := decodeThoughtSignatureToolCallID(transportID)
+		if err != nil {
+			return nil, err
 		}
-		names[callID] = name
+		for _, key := range []string{transportID, callID} {
+			if previous, ok := names[key]; ok && previous != name {
+				return nil, fmt.Errorf("function_call reused call_id with a different name")
+			}
+			names[key] = name
+		}
 	}
 	return names, nil
 }

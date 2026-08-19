@@ -16,16 +16,54 @@ import (
 
 type scriptedModelProvider struct {
 	events []map[string]any
+	err    error
 }
 
 func (p scriptedModelProvider) ID() string { return "scripted" }
 func (p scriptedModelProvider) stream(_ context.Context, _ map[string]any, fn func(map[string]any) error) error {
+	if p.err != nil {
+		return p.err
+	}
 	for _, event := range p.events {
 		if err := fn(event); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func TestStreamResponseInitialProviderErrorUsesHTTPError(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	s := &server{}
+	s.streamResponse(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", nil), scriptedModelProvider{
+		err: &backendError{Status: http.StatusBadGateway, Message: "Antigravity streamGenerateContent failed (upstream HTTP 503)."},
+	}, map[string]any{"model": "gemini-3.7-flash-high"}, map[string]any{"model": "gemini-3.7-flash-high"}, "")
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "upstream HTTP 503") {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "[DONE]") || strings.Contains(recorder.Body.String(), `"type":"error"`) {
+		t.Fatalf("initial provider error was encoded as a successful stream: %s", recorder.Body.String())
+	}
+}
+
+func TestStreamChatInitialProviderErrorUsesHTTPError(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	s := &server{}
+	s.streamChat(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), scriptedModelProvider{
+		err: &backendError{Status: http.StatusBadGateway, Message: "Antigravity streamGenerateContent failed (upstream HTTP 503)."},
+	}, map[string]any{"model": "gemini-3.7-flash-high"}, map[string]any{"model": "gemini-3.7-flash-high", "stream": true}, false)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "upstream HTTP 503") {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "[DONE]") || strings.Contains(recorder.Body.String(), `"error":{"message"`) {
+		t.Fatalf("initial provider error was encoded as a successful stream: %s", recorder.Body.String())
+	}
 }
 func (scriptedModelProvider) collect(context.Context, map[string]any) (map[string]any, error) {
 	return nil, errors.New("scripted provider collect is not used")
