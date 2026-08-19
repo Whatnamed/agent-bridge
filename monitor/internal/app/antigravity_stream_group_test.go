@@ -50,3 +50,42 @@ func TestAntigravityStreamAssignsPositionalV2EnvelopeToParallelCalls(t *testing.
 		}
 	}
 }
+
+func TestAntigravityStreamGroupsParallelCallsAcrossSSEEvents(t *testing.T) {
+	provider, _, closeServer := newTestAntigravityProvider(t, []string{
+		`{"response":{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"bash-1","name":"Bash","args":{"command":"one"}},"thoughtSignature":"sig-bash"}]}}]}}`,
+		`{"response":{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"bash-2","name":"Bash","args":{"command":"two"}}}]}}]}}`,
+		`{"response":{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"bash-3","name":"Bash","args":{"command":"three"}}}]}}]}}`,
+		`{"response":{"candidates":[{"finishReason":"STOP"}]}}`,
+	})
+	defer closeServer()
+	var events []map[string]any
+	if err := provider.stream(context.Background(), map[string]any{
+		"model": stableAntigravityModel,
+		"input": []any{map[string]any{"role": "user", "content": "run three commands"}},
+	}, func(event map[string]any) error {
+		events = append(events, event)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var output []any
+	for _, event := range events {
+		if event["type"] == "response.completed" {
+			output = sliceAny(mapAny(event["response"])["output"])
+		}
+	}
+	if len(output) != 3 {
+		t.Fatalf("output = %#v", output)
+	}
+	for index, raw := range output {
+		item := mapAny(raw)
+		decoded, err := decodeFunctionCallTransportID(stringValue(item["call_id"]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decoded.Version != 2 || decoded.PartIndex != index || decoded.GroupSize != 3 || decoded.StepID == "" {
+			t.Fatalf("output[%d] transport = %#v", index, decoded)
+		}
+	}
+}

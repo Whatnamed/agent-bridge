@@ -454,9 +454,93 @@ func (p *antigravityProvider) emitCanonicalStream(ctx context.Context, stream *c
 	items := make([]map[string]any, 0, 3)
 	functionKeys := make(map[string]struct{})
 	functionArguments := make(map[string]string)
+	pendingFunctionCalls := make([]cloudcode.FunctionCall, 0)
 	var messageItem map[string]any
 	var reasoningItem map[string]any
 	functionGroupSequence := 0
+	flushPendingFunctionCalls := func() error {
+		if len(pendingFunctionCalls) == 0 {
+			return nil
+		}
+		calls := pendingFunctionCalls
+		pendingFunctionCalls = nil
+		groupSize := len(calls)
+		stepID := ""
+		if groupSize > 1 {
+			stepID = fmt.Sprintf("%s:%d", responseID, functionGroupSequence)
+		}
+		functionGroupSequence++
+		for partIndex, call := range calls {
+			callID := strings.TrimSpace(call.ID)
+			if callID == "" {
+				callID = newID("call")
+			}
+			call.Name = strings.TrimSpace(call.Name)
+			if call.Name == "" {
+				return errors.New("Antigravity function call did not include a name")
+			}
+			key := callID + "\x00" + call.Name
+			arguments := "{}"
+			if call.Args != nil {
+				encoded, err := json.Marshal(call.Args)
+				if err != nil {
+					return fmt.Errorf("encode Antigravity function call arguments: %w", err)
+				}
+				arguments = string(encoded)
+			}
+			if _, seen := functionKeys[key]; seen {
+				found := false
+				for _, item := range items {
+					existingCallID, _, decodeErr := decodeThoughtSignatureToolCallID(stringValue(item["call_id"]))
+					if decodeErr != nil {
+						return decodeErr
+					}
+					if existingCallID == callID && stringValue(item["name"]) == call.Name {
+						found = true
+						signature := strings.TrimSpace(call.ThoughtSignature)
+						if signature != "" {
+							existingSignature := firstMapString(item, "thought_signature", "thoughtSignature")
+							if existingSignature == "" {
+								return errors.New("Antigravity function call signature arrived after its transport id was emitted")
+							}
+							if existingSignature != signature {
+								return errors.New("Antigravity function call thought signature changed for an existing call")
+							}
+						}
+						functionArguments[stringValue(item["id"])] = arguments
+						break
+					}
+				}
+				if !found {
+					return errors.New("Antigravity function call identity changed during streaming")
+				}
+				continue
+			}
+			functionKeys[key] = struct{}{}
+			signature := strings.TrimSpace(call.ThoughtSignature)
+			transportID := encodeFunctionCallTransportID(callID, signature, stepID, partIndex, groupSize)
+			if groupSize > 1 && !strings.HasPrefix(transportID, functionCallTransportV2Prefix) {
+				return errors.New("Antigravity parallel function call transport envelope could not be created")
+			}
+			item := map[string]any{
+				"id": transportID, "type": "function_call", "status": "in_progress", "call_id": transportID,
+				"name": call.Name, "arguments": "",
+			}
+			if signature != "" {
+				item["thought_signature"] = signature
+			}
+			items = append(items, item)
+			outputIndex := len(items) - 1
+			functionArguments[transportID] = arguments
+			if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": cloneMap(item)}); err != nil {
+				return err
+			}
+			if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.function_call_arguments.delta", "output_index": outputIndex, "item_id": transportID, "delta": arguments}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	for {
 		event, err := stream.Next()
 		if err != nil {
@@ -467,6 +551,11 @@ func (p *antigravityProvider) emitCanonicalStream(ctx context.Context, stream *c
 		}
 		if event.FinishReason != "" {
 			finishReason = event.FinishReason
+		}
+		if len(pendingFunctionCalls) > 0 && (event.Reasoning != "" || event.Text != "") {
+			if err := flushPendingFunctionCalls(); err != nil {
+				return err
+			}
 		}
 		if event.Reasoning != "" {
 			reasoning.WriteString(event.Reasoning)
@@ -517,86 +606,12 @@ func (p *antigravityProvider) emitCanonicalStream(ctx context.Context, stream *c
 			}
 		}
 		for _, calls := range functionCallGroups(event) {
-			groupSize := len(calls)
-			if groupSize == 0 {
-				continue
-			}
-			stepID := ""
-			if groupSize > 1 {
-				stepID = fmt.Sprintf("%s:%d", responseID, functionGroupSequence)
-			}
-			functionGroupSequence++
-			for partIndex, call := range calls {
-				callID := strings.TrimSpace(call.ID)
-				if callID == "" {
-					callID = newID("call")
-				}
-				call.Name = strings.TrimSpace(call.Name)
-				if call.Name == "" {
-					return errors.New("Antigravity function call did not include a name")
-				}
-				key := callID + "\x00" + call.Name
-				arguments := "{}"
-				if call.Args != nil {
-					encoded, err := json.Marshal(call.Args)
-					if err != nil {
-						return fmt.Errorf("encode Antigravity function call arguments: %w", err)
-					}
-					arguments = string(encoded)
-				}
-				if _, seen := functionKeys[key]; seen {
-					found := false
-					for _, item := range items {
-						existingCallID, _, decodeErr := decodeThoughtSignatureToolCallID(stringValue(item["call_id"]))
-						if decodeErr != nil {
-							return decodeErr
-						}
-						if existingCallID == callID && stringValue(item["name"]) == call.Name {
-							found = true
-							signature := strings.TrimSpace(call.ThoughtSignature)
-							if signature != "" {
-								existingSignature := firstMapString(item, "thought_signature", "thoughtSignature")
-								if existingSignature == "" {
-									return errors.New("Antigravity function call signature arrived after its transport id was emitted")
-								}
-								if existingSignature != signature {
-									return errors.New("Antigravity function call thought signature changed for an existing call")
-								}
-							}
-							functionArguments[stringValue(item["id"])] = arguments
-							break
-						}
-					}
-					if !found {
-						return errors.New("Antigravity function call identity changed during streaming")
-					}
-					continue
-				}
-				functionKeys[key] = struct{}{}
-				signature := strings.TrimSpace(call.ThoughtSignature)
-				transportID := encodeFunctionCallTransportID(callID, signature, stepID, partIndex, groupSize)
-				if groupSize > 1 && !strings.HasPrefix(transportID, functionCallTransportV2Prefix) {
-					return errors.New("Antigravity parallel function call transport envelope could not be created")
-				}
-				item := map[string]any{
-					"id": transportID, "type": "function_call", "status": "in_progress", "call_id": transportID,
-					"name": call.Name, "arguments": "",
-				}
-				if signature != "" {
-					item["thought_signature"] = signature
-				}
-				items = append(items, item)
-				outputIndex := len(items) - 1
-				functionArguments[transportID] = arguments
-				if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": cloneMap(item)}); err != nil {
-					return err
-				}
-				if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.function_call_arguments.delta", "output_index": outputIndex, "item_id": transportID, "delta": arguments}); err != nil {
-					return err
-				}
-			}
+			pendingFunctionCalls = append(pendingFunctionCalls, calls...)
 		}
 		if event.Done {
+			if err := flushPendingFunctionCalls(); err != nil {
+				return err
+			}
 			break
 		}
 	}
