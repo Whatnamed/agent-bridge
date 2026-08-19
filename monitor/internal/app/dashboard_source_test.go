@@ -11,12 +11,13 @@ import (
 	"time"
 )
 
-func addDashboardBridgeRecord(t *testing.T, store *telemetryStore, userAgent, model string) {
+func addDashboardBridgeRecord(t *testing.T, store *telemetryStore, userAgent, model, provider string) {
 	t.Helper()
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("{}"))
 	request.Header.Set("User-Agent", userAgent)
 	telemetry := store.begin(request, "/v1/responses")
 	telemetry.observeRequest(map[string]any{"model": model}, "/v1/responses")
+	telemetry.observeProvider(providerRoute{Provider: provider, RequestedModel: model, ActualUpstreamModel: model})
 	capture := &responseCapture{ResponseWriter: httptest.NewRecorder()}
 	capture.Write([]byte("ok"))
 	store.finish(telemetry, request, capture, 2)
@@ -27,8 +28,8 @@ func TestDashboardSourceFilterMixesCodexAndBridgeRecords(t *testing.T) {
 	cfg.StateDir = t.TempDir()
 	store := newTelemetryStore(cfg, nil)
 	defer store.close()
-	addDashboardBridgeRecord(t, store, "ZCode/desktop", "zcode-model")
-	addDashboardBridgeRecord(t, store, "DSH/desktop", "dsh-model")
+	addDashboardBridgeRecord(t, store, "ZCode/desktop", "zcode-model", "antigravity")
+	addDashboardBridgeRecord(t, store, "DSH/desktop", "dsh-model", "codex")
 
 	codexDir := filepath.Join(cfg.StateDir, "telemetry", codexSummaryDirName)
 	if err := os.MkdirAll(codexDir, 0700); err != nil {
@@ -82,6 +83,26 @@ func TestDashboardSourceFilterMixesCodexAndBridgeRecords(t *testing.T) {
 		t.Fatalf("Codex filter = %#v body=%s", codexPayload["total"], codex.Body.String())
 	}
 
+	antigravity := httptest.NewRecorder()
+	server.ServeHTTP(antigravity, httptest.NewRequest(http.MethodGet, "/dashboard/api/requests?range=30d&provider=Antigravity&limit=10", nil))
+	var antigravityPayload map[string]any
+	if err := json.Unmarshal(antigravity.Body.Bytes(), &antigravityPayload); err != nil {
+		t.Fatal(err)
+	}
+	if total, ok := numberAsInt(antigravityPayload["total"]); !ok || total != 1 || !strings.Contains(antigravity.Body.String(), "zcode-model") {
+		t.Fatalf("Antigravity filter = %#v body=%s", antigravityPayload["total"], antigravity.Body.String())
+	}
+
+	combined := httptest.NewRecorder()
+	server.ServeHTTP(combined, httptest.NewRequest(http.MethodGet, "/dashboard/api/requests?range=30d&source=DSH&provider=Antigravity&limit=10", nil))
+	var combinedPayload map[string]any
+	if err := json.Unmarshal(combined.Body.Bytes(), &combinedPayload); err != nil {
+		t.Fatal(err)
+	}
+	if total, ok := numberAsInt(combinedPayload["total"]); !ok || total != 0 {
+		t.Fatalf("source/provider combination was not independent: %#v body=%s", combinedPayload["total"], combined.Body.String())
+	}
+
 	overview := httptest.NewRecorder()
 	server.ServeHTTP(overview, httptest.NewRequest(http.MethodGet, "/dashboard/api/overview?range=30d&source=ZCode", nil))
 	var overviewPayload map[string]any
@@ -129,13 +150,13 @@ func TestDashboardAssetsExposeSourceFilterDrawerAndPrivacyContract(t *testing.T)
 		t.Fatal(err)
 	}
 	pageText, appText, styleText := string(page), string(app), string(style)
-	for _, marker := range []string{"source-filter", "detail-drawer", "Codex 本地采集", "record_kind"} {
+	for _, marker := range []string{"source-filter", "provider-filter", "detail-drawer", "Codex 本地采集", "record_kind", "provider"} {
 		if !strings.Contains(pageText+appText, marker) {
 			t.Fatalf("dashboard marker %q is missing", marker)
 		}
 	}
 	for _, marker := range []string{
-		"compactToken", "tokenRatioText", "sampling", "Escape", "source:", "缓存诊断",
+		"compactToken", "tokenRatioText", "sampling", "Escape", "source:", "provider:", "缓存诊断",
 		"recordKindLabel", "sourceValueLabel", "secondarySourceLabel", "directionLabel", "eventTypeLabel",
 		`request: "请求"`, `turn: "轮次"`, `Unknown: "未知"`, `cli: "命令行"`, `subagent: "子智能体"`,
 		"values.map(([label, value, precise])", "exact(stats.input_tokens)", "exact(stats.cached_input_tokens)", "exact(stats.output_tokens)", "exact(stats.reasoning_tokens)",

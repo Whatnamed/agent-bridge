@@ -36,6 +36,8 @@ h1 { font-size: 28px; margin: 0 0 4px; letter-spacing: -.04em; }
 .topbar-actions { display: flex; align-items: flex-start; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }
 .source-control { display: flex; align-items: center; gap: 8px; color: var(--muted); }
 .source-control select { padding: 5px 9px; }
+.provider-control { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+.provider-control select { padding: 5px 9px; }
 .table-wrap { max-height: 64vh; overflow: auto; border-radius: 9px; }
 thead th { position: sticky; top: 0; z-index: 2; background: #14232b; box-shadow: 0 1px 0 var(--line); }
 .cell-main, .cell-sub { display: block; }

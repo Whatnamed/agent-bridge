@@ -101,6 +101,7 @@ func (s *server) dashboardOverview(w http.ResponseWriter, r *http.Request) {
 		"quota":                   quota,
 		"range":                   dashboardRangeName(r.URL.Query()),
 		"source":                  dashboardSourceName(r.URL.Query()),
+		"provider":                dashboardProviderName(r.URL.Query()),
 		"providers": func() map[string]any {
 			if s.providers == nil {
 				return (&providerRouter{}).diagnostics()
@@ -258,6 +259,7 @@ func localDayStart(value time.Time) time.Time {
 func filterTelemetryRecords(records []*requestRecord, query url.Values) []*requestRecord {
 	since := telemetrySince(query)
 	source := strings.TrimSpace(query.Get("source"))
+	provider := strings.TrimSpace(query.Get("provider"))
 	model := strings.TrimSpace(query.Get("model"))
 	effort := strings.TrimSpace(query.Get("effort"))
 	outcome := strings.TrimSpace(query.Get("status"))
@@ -274,6 +276,9 @@ func filterTelemetryRecords(records []*requestRecord, query url.Values) []*reque
 			continue
 		}
 		if source != "" && source != "all" && !telemetrySourceMatches(record, source) {
+			continue
+		}
+		if provider != "" && provider != "all" && !telemetryProviderMatches(record, provider) {
 			continue
 		}
 		if model != "" && record.Model != model {
@@ -407,6 +412,20 @@ func dashboardSourceName(query url.Values) string {
 	}
 }
 
+func dashboardProviderName(query url.Values) string {
+	value := strings.ToLower(strings.TrimSpace(query.Get("provider")))
+	switch value {
+	case "codex":
+		return "Codex"
+	case "antigravity":
+		return "Antigravity"
+	case "unknown":
+		return "Unknown"
+	default:
+		return "All"
+	}
+}
+
 func telemetrySourceName(record *requestRecord) string {
 	if record == nil {
 		return "Unknown"
@@ -431,6 +450,31 @@ func telemetrySourceMatches(record *requestRecord, filter string) bool {
 		return true
 	}
 	return strings.EqualFold(telemetrySourceName(record), value)
+}
+
+func telemetryProviderName(record *requestRecord) string {
+	if record == nil {
+		return "Unknown"
+	}
+	provider := strings.ToLower(strings.TrimSpace(record.Provider))
+	switch provider {
+	case "codex":
+		return "Codex"
+	case "antigravity":
+		return "Antigravity"
+	}
+	if strings.EqualFold(record.Source, "codex") {
+		return "Codex"
+	}
+	return "Unknown"
+}
+
+func telemetryProviderMatches(record *requestRecord, filter string) bool {
+	value := strings.ToLower(strings.TrimSpace(filter))
+	if value == "" || value == "all" {
+		return true
+	}
+	return strings.EqualFold(telemetryProviderName(record), value)
 }
 
 func recordDuration(record *requestRecord) (int64, bool) {
