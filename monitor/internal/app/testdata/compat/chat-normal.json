@@ -1,0 +1,11 @@
+{
+  "entrypoint": "chat",
+  "source": "openai-compatible",
+  "request": {
+    "model": "gemini-3.7-flash-medium",
+    "messages": [
+      {"role": "system", "content": "Be concise."},
+      {"role": "user", "content": "Reply with one short sentence."}
+    ]
+  }
+}

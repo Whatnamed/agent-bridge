@@ -76,6 +76,28 @@ func TestParseEventReadsThoughtsUsageAndFunctionCall(t *testing.T) {
 	}
 }
 
+func TestParseEventBindsThoughtSignaturesToExactFunctionCallParts(t *testing.T) {
+	data := []byte(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"bash-1","name":"Bash","args":{"command":"one"}},"thoughtSignature":"sig-1"},{"functionCall":{"id":"bash-2","name":"Bash","args":{"command":"two"}}},{"functionCall":{"id":"lookup-1","name":"lookup","args":{}}}]}}]}}`)
+	event, err := parseEvent(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(event.FunctionCalls) != 3 || len(event.Candidates) != 1 || len(event.Candidates[0].Parts) != 3 {
+		t.Fatalf("event = %#v", event)
+	}
+	for index, call := range event.FunctionCalls {
+		if call.PartIndex != index {
+			t.Fatalf("call %d part index = %d", index, call.PartIndex)
+		}
+	}
+	if event.FunctionCalls[0].ThoughtSignature != "sig-1" || event.FunctionCalls[1].ThoughtSignature != "" || event.FunctionCalls[2].ThoughtSignature != "" {
+		t.Fatalf("positional signatures = %#v", event.FunctionCalls)
+	}
+	if len(event.ThoughtSignatures) != 1 || event.ThoughtSignatures[0] != "sig-1" {
+		t.Fatalf("flattened signature index = %#v", event.ThoughtSignatures)
+	}
+}
+
 func TestNewRequestModesKeepRequiredOuterContract(t *testing.T) {
 	compat, err := NewRequest(ModeCompat, "gemini-3.7-flash-high", "project", "OAUTH_OK", false)
 	if err != nil {
@@ -175,6 +197,26 @@ func TestClientRefreshesOnceAfter401(t *testing.T) {
 	}
 	if source.refreshes != 1 || requests.Load() != 2 {
 		t.Fatalf("refreshes=%d requests=%d", source.refreshes, requests.Load())
+	}
+}
+
+func TestHTTPErrorKeepsOnlySafeRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "17")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, testStaticToken{value: "test-token"})
+	client.HTTPClient = server.Client()
+	_, err := client.LoadCodeAssist(context.Background())
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusTooManyRequests || httpErr.RetryAfter != "17" {
+		t.Fatalf("error = %#v", err)
+	}
+	for _, value := range []string{"-1", "86401", "not-a-delay"} {
+		if got := safeRetryAfter(value); got != "" {
+			t.Fatalf("unsafe Retry-After %q became %q", value, got)
+		}
 	}
 }
 

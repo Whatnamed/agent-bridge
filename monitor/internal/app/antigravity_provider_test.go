@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +24,10 @@ type fakeAntigravityCloudCode struct {
 	streamCalls    int
 	generateBodies []map[string]any
 	streamEvents   []string
+	streamStatus   int
+	retryAfter     string
+	loadStatus     int
+	modelStatus    int
 }
 
 func newFakeAntigravityCloudCode(t *testing.T, events []string) (*fakeAntigravityCloudCode, *httptest.Server) {
@@ -32,18 +37,40 @@ func newFakeAntigravityCloudCode(t *testing.T, events []string) (*fakeAntigravit
 		switch r.URL.Path {
 		case "/v1internal:loadCodeAssist":
 			fake.mu.Lock()
+			loadStatus := fake.loadStatus
 			fake.loadCalls++
 			fake.mu.Unlock()
+			if loadStatus != 0 {
+				w.WriteHeader(loadStatus)
+				return
+			}
 			writeFakeJSON(w, map[string]any{"cloudaicompanionProject": "projects/test-project", "gcpManaged": false})
 		case "/v1internal:fetchAvailableModels":
 			fake.mu.Lock()
+			modelStatus := fake.modelStatus
 			fake.modelCalls++
 			fake.mu.Unlock()
+			if modelStatus != 0 {
+				w.WriteHeader(modelStatus)
+				return
+			}
 			writeFakeJSON(w, map[string]any{"models": map[string]any{
+				gemini37LowModel:          map[string]any{"displayName": "Gemini Flash Low"},
+				gemini37MediumModel:       map[string]any{"displayName": "Gemini Flash Medium"},
 				stableAntigravityModel:    map[string]any{"displayName": "Gemini Flash High"},
 				"gemini-internal-preview": map[string]any{"displayName": "internal"},
 			}, "defaultAgentModelId": stableAntigravityModel})
 		case "/v1internal:streamGenerateContent":
+			fake.mu.Lock()
+			streamStatus, retryAfter := fake.streamStatus, fake.retryAfter
+			fake.mu.Unlock()
+			if streamStatus != 0 {
+				if retryAfter != "" {
+					w.Header().Set("Retry-After", retryAfter)
+				}
+				w.WriteHeader(streamStatus)
+				return
+			}
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
 				http.Error(w, "read failed", http.StatusBadRequest)
@@ -114,7 +141,7 @@ func TestAntigravityControlPlaneCachesAndListsOnlyStableModels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(first) != 1 || first[0] != stableAntigravityModel || len(second) != 1 || second[0] != stableAntigravityModel {
+	if len(first) != 3 || first[0] != stableAntigravityModel || first[1] != gemini37LowModel || first[2] != gemini37MediumModel || len(second) != 3 || second[0] != stableAntigravityModel || second[1] != gemini37LowModel || second[2] != gemini37MediumModel {
 		t.Fatalf("stable model list = %#v / %#v", first, second)
 	}
 	resolution, err := provider.resolveModel(ctx, stableAntigravityModel)
@@ -126,6 +153,142 @@ func TestAntigravityControlPlaneCachesAndListsOnlyStableModels(t *testing.T) {
 	fake.mu.Unlock()
 	if loadCalls != 1 || modelCalls != 1 {
 		t.Fatalf("control-plane calls = load:%d models:%d, want one each", loadCalls, modelCalls)
+	}
+}
+
+func TestAntigravityModelsExposeOnlyVerifiedGemini37Presets(t *testing.T) {
+	provider, _, closeServer := newTestAntigravityProvider(t, nil)
+	defer closeServer()
+	ids, err := provider.listModels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{stableAntigravityModel, gemini37LowModel, gemini37MediumModel} {
+		found := false
+		for _, got := range ids {
+			if got == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("verified preset %q missing from %#v", id, ids)
+		}
+	}
+	for _, id := range ids {
+		if strings.Contains(id, "tiered") || strings.HasPrefix(id, "chat_") || strings.HasPrefix(id, "tab_") || id == "gemini-internal-preview" {
+			t.Fatalf("unstable/internal model exposed: %q", id)
+		}
+	}
+}
+
+func TestAntigravityModelsUseProviderOwnership(t *testing.T) {
+	provider, _, closeServer := newTestAntigravityProvider(t, nil)
+	defer closeServer()
+	server := &server{
+		cfg:       config{},
+		backend:   testCodexBackend{},
+		providers: &providerRouter{codex: codexModelProvider{backend: testCodexBackend{}}, antigravity: provider},
+	}
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("models status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var document map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &document); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, raw := range sliceAny(document["data"]) {
+		model := mapAny(raw)
+		if isStableAntigravityModel(stringValue(model["id"])) {
+			if stringValue(model["owned_by"]) != antigravityProviderID {
+				t.Fatalf("model ownership = %#v", model)
+			}
+			seen[stringValue(model["id"])] = true
+		}
+	}
+	for _, id := range []string{gemini37LowModel, gemini37MediumModel, stableAntigravityModel} {
+		if !seen[id] {
+			t.Fatalf("model %q missing from /v1/models", id)
+		}
+	}
+}
+
+func TestAntigravityReasoningEffortMustMatchGemini37Preset(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		model   string
+		effort  string
+		wantErr bool
+	}{
+		{name: "low matches", model: gemini37LowModel, effort: "low"},
+		{name: "medium matches", model: gemini37MediumModel, effort: "medium"},
+		{name: "high matches", model: stableAntigravityModel, effort: "high"},
+		{name: "no explicit effort", model: stableAntigravityModel},
+		{name: "conflicting effort", model: stableAntigravityModel, effort: "low", wantErr: true},
+		{name: "unknown effort", model: stableAntigravityModel, effort: "minimal", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := map[string]any{"model": tc.model, "input": "hello"}
+			if tc.effort != "" {
+				payload["reasoning"] = map[string]any{"effort": tc.effort}
+			}
+			err := validateAntigravityReasoningPreset(payload)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr=%t", err, tc.wantErr)
+			}
+			if err == nil && tc.effort != "" {
+				request, buildErr := buildAntigravityRequest(payload, tc.model, "projects/test-project")
+				if buildErr != nil {
+					t.Fatal(buildErr)
+				}
+				if request.Request.GenerationConfig == nil || request.Request.GenerationConfig.ThinkingConfig == nil || request.Request.GenerationConfig.ThinkingConfig.ThinkingLevel != strings.ToUpper(tc.effort) {
+					t.Fatalf("thinking config = %#v", request.Request.GenerationConfig)
+				}
+			}
+		})
+	}
+}
+
+func TestAntigravityHTTPGenerationParametersPreserveJSONNumbersAndZero(t *testing.T) {
+	provider, fake, closeServer := newTestAntigravityProvider(t, nil)
+	defer closeServer()
+	router := &providerRouter{codex: codexModelProvider{backend: testCodexBackend{}}, antigravity: provider}
+	s := &server{cfg: config{}, backend: testCodexBackend{}, providers: router, responses: newResponseStore(5), chats: newChatStore(5)}
+	requests := []struct {
+		path string
+		body string
+	}{
+		{
+			path: "/v1/responses",
+			body: `{"model":"gemini-3.7-flash-high","input":"hello","temperature":0,"top_p":0}`,
+		},
+		{
+			path: "/v1/chat/completions",
+			body: `{"model":"gemini-3.7-flash-high","messages":[{"role":"user","content":"hello"}],"temperature":0,"top_p":0}`,
+		},
+	}
+	for _, tc := range requests {
+		response := httptest.NewRecorder()
+		s.ServeHTTP(response, httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body)))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status = %d body=%s", tc.path, response.Code, response.Body.String())
+		}
+	}
+	fake.mu.Lock()
+	bodies := append([]map[string]any(nil), fake.generateBodies...)
+	fake.mu.Unlock()
+	if len(bodies) != len(requests) {
+		t.Fatalf("generation bodies = %d, want %d", len(bodies), len(requests))
+	}
+	for index, body := range bodies {
+		request := mapAny(body["request"])
+		generation := mapAny(request["generationConfig"])
+		if generation == nil || generation["temperature"] != float64(0) || generation["topP"] != float64(0) {
+			t.Fatalf("request %d generation config = %#v", index, generation)
+		}
 	}
 }
 
@@ -144,7 +307,7 @@ func TestAntigravityModelResolutionFailsClosedWithoutGeneration(t *testing.T) {
 	defer closeServer()
 	router := &providerRouter{codex: codexModelProvider{backend: testCodexBackend{}}, antigravity: provider}
 	s := &server{cfg: config{}, backend: testCodexBackend{}, providers: router, responses: newResponseStore(5), chats: newChatStore(5)}
-	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gemini-3.7-flash-low","input":"hello"}`))
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gemini-3.7-flash-tiered","input":"hello"}`))
 	response := httptest.NewRecorder()
 	s.ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "no fallback") {
@@ -245,7 +408,7 @@ func TestAntigravityToolReasoningAndSignatureTranslation(t *testing.T) {
 		"model": stableAntigravityModel,
 		"input": []any{
 			map[string]any{"role": "user", "content": "continue"},
-			map[string]any{"type": "function_call", "call_id": "call-2", "name": "get_test_value", "arguments": `{"name":"smoke"}`},
+			map[string]any{"type": "function_call", "call_id": "call-2", "name": "get_test_value", "arguments": `{"name":"smoke"}`, "thought_signature": "signature-2"},
 			map[string]any{"type": "function_call_output", "call_id": "call-2", "output": "plain tool value"},
 		},
 	}
@@ -418,6 +581,137 @@ func TestAntigravityTextStreamUsesCanonicalLifecycle(t *testing.T) {
 	}
 }
 
+func TestAntigravityStructuredOutputMapsToGenerateConfig(t *testing.T) {
+	tests := []struct {
+		name       string
+		format     map[string]any
+		wantMime   string
+		wantSchema any
+	}{
+		{
+			name:     "json object",
+			format:   map[string]any{"type": "json_object"},
+			wantMime: "application/json",
+		},
+		{
+			name: "json schema",
+			format: map[string]any{
+				"type": "json_schema",
+				"name": "answer",
+				"schema": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"ok": map[string]any{"type": "boolean"}},
+					"required":   []any{"ok"},
+				},
+			},
+			wantMime: "application/json",
+			wantSchema: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"ok": map[string]any{"type": "boolean"}},
+				"required":   []any{"ok"},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			request, err := buildAntigravityRequest(map[string]any{
+				"model": stableAntigravityModel,
+				"input": []any{map[string]any{"role": "user", "content": "return an answer"}},
+				"text":  map[string]any{"format": tc.format},
+			}, stableAntigravityModel, "projects/test-project")
+			if err != nil {
+				t.Fatal(err)
+			}
+			config := request.Request.GenerationConfig
+			if config == nil || config.ResponseMimeType != tc.wantMime {
+				t.Fatalf("generation config = %#v", config)
+			}
+			if tc.wantSchema == nil {
+				if config.ResponseSchema != nil {
+					t.Fatalf("json_object unexpectedly has schema: %#v", config.ResponseSchema)
+				}
+			} else if !reflect.DeepEqual(config.ResponseSchema, tc.wantSchema) {
+				t.Fatalf("schema = %#v, want %#v", config.ResponseSchema, tc.wantSchema)
+			}
+		})
+	}
+	if _, err := buildAntigravityRequest(map[string]any{
+		"model": stableAntigravityModel,
+		"input": []any{map[string]any{"role": "user", "content": "bad"}},
+		"text":  map[string]any{"format": map[string]any{"type": "json_schema"}},
+	}, stableAntigravityModel, "projects/test-project"); err == nil || !strings.Contains(err.Error(), "requires schema") {
+		t.Fatalf("missing schema was accepted: %v", err)
+	}
+	if _, err := buildAntigravityRequest(map[string]any{
+		"model": stableAntigravityModel,
+		"input": []any{map[string]any{"role": "user", "content": "bad"}},
+		"text": map[string]any{"format": map[string]any{
+			"type": "json_schema", "schema": map[string]any{
+				"type": "object", "properties": map[string]any{
+					"answer": map[string]any{"type": "string", "pattern": "^[a-z]+$"},
+				},
+			},
+		}},
+	}, stableAntigravityModel, "projects/test-project"); err == nil || !strings.Contains(err.Error(), "unsupported schema keyword") {
+		t.Fatalf("unsupported structured schema keyword was accepted: %v", err)
+	}
+	if _, err := buildAntigravityRequest(map[string]any{
+		"model": stableAntigravityModel,
+		"input": []any{map[string]any{"role": "user", "content": "bad"}},
+		"tools": []any{map[string]any{"type": "function", "function": map[string]any{
+			"name": "lookup", "parameters": map[string]any{
+				"type": "object", "properties": map[string]any{
+					"query": map[string]any{"type": "string", "minLength": 1},
+				},
+			},
+		}}},
+	}, stableAntigravityModel, "projects/test-project"); err == nil || !strings.Contains(err.Error(), "schema keyword") {
+		t.Fatalf("unsupported function schema keyword was accepted: %v", err)
+	}
+	chat, err := chatToResponse(map[string]any{
+		"model":           "gemini-3.7-flash-high",
+		"messages":        []any{map[string]any{"role": "user", "content": "return JSON"}},
+		"response_format": map[string]any{"type": "json_object"},
+	}, stableAntigravityModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chatRequest, err := buildAntigravityRequest(chat, stableAntigravityModel, "projects/test-project")
+	if err != nil {
+		t.Fatalf("Chat structured output was not mapped: %v", err)
+	}
+	if chatRequest.Request.GenerationConfig == nil || chatRequest.Request.GenerationConfig.ResponseMimeType != "application/json" {
+		t.Fatalf("Chat generation config = %#v", chatRequest.Request.GenerationConfig)
+	}
+}
+
+func TestAntigravityStructuredSchemaAcceptsDocumentedSubset(t *testing.T) {
+	schema := map[string]any{
+		"type":                 "object",
+		"title":                "answer",
+		"additionalProperties": false,
+		"properties": map[string]any{
+			"score":  map[string]any{"type": "number", "minimum": 0, "maximum": 1},
+			"date":   map[string]any{"type": "string", "format": "date"},
+			"maybe":  map[string]any{"type": []any{"string", "null"}},
+			"choice": map[string]any{"anyOf": []any{map[string]any{"type": "string"}, map[string]any{"type": "null"}}},
+			"tags":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1, "maxItems": 3},
+		},
+		"required": []any{"score"},
+	}
+	request, err := buildAntigravityRequest(map[string]any{
+		"model": stableAntigravityModel,
+		"input": []any{map[string]any{"role": "user", "content": "return the answer"}},
+		"text":  map[string]any{"format": map[string]any{"type": "json_schema", "schema": schema}},
+	}, stableAntigravityModel, "projects/test-project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Request.GenerationConfig == nil || request.Request.GenerationConfig.ResponseMimeType != "application/json" || !reflect.DeepEqual(request.Request.GenerationConfig.ResponseSchema, cloneMap(schema)) {
+		t.Fatalf("structured schema was not preserved: %#v", request.Request.GenerationConfig)
+	}
+}
+
 func TestAntigravityUnsupportedCapabilitiesReturnBadRequestBeforeStreaming(t *testing.T) {
 	provider, fake, closeServer := newTestAntigravityProvider(t, []string{`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"must not run"}]},"finishReason":"STOP"}]}}`})
 	defer closeServer()
@@ -429,42 +723,12 @@ func TestAntigravityUnsupportedCapabilitiesReturnBadRequestBeforeStreaming(t *te
 		body map[string]any
 	}{
 		{
-			name: "responses json schema",
-			path: "/v1/responses",
-			body: map[string]any{
-				"model": stableAntigravityModel, "stream": true, "input": "hello",
-				"text": map[string]any{"format": map[string]any{"type": "json_schema"}},
-			},
-		},
-		{
-			name: "chat json object",
+			name: "chat unknown response format",
 			path: "/v1/chat/completions",
 			body: map[string]any{
 				"model": stableAntigravityModel, "stream": true,
 				"messages":        []any{map[string]any{"role": "user", "content": "hello"}},
-				"response_format": map[string]any{"type": "json_object"},
-			},
-		},
-		{
-			name: "responses input image",
-			path: "/v1/responses",
-			body: map[string]any{
-				"model": stableAntigravityModel, "stream": true,
-				"input": []any{map[string]any{"role": "user", "content": []any{
-					map[string]any{"type": "input_text", "text": "describe"},
-					map[string]any{"type": "input_image", "image_url": "data:image/png;base64,AA=="},
-				}}},
-			},
-		},
-		{
-			name: "chat image url",
-			path: "/v1/chat/completions",
-			body: map[string]any{
-				"model": stableAntigravityModel, "stream": true,
-				"messages": []any{map[string]any{"role": "user", "content": []any{
-					map[string]any{"type": "text", "text": "describe"},
-					map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,AA=="}},
-				}}},
+				"response_format": map[string]any{"type": "yaml"},
 			},
 		},
 		{
@@ -488,6 +752,16 @@ func TestAntigravityUnsupportedCapabilitiesReturnBadRequestBeforeStreaming(t *te
 			body: map[string]any{
 				"model": stableAntigravityModel, "stream": true,
 				"input": []any{map[string]any{"role": "user", "content": []any{
+					map[string]any{"type": "input_file", "file_id": "file_1"},
+				}}},
+			},
+		},
+		{
+			name: "chat unknown content part",
+			path: "/v1/chat/completions",
+			body: map[string]any{
+				"model": stableAntigravityModel, "stream": true,
+				"messages": []any{map[string]any{"role": "user", "content": []any{
 					map[string]any{"type": "input_file", "file_id": "file_1"},
 				}}},
 			},

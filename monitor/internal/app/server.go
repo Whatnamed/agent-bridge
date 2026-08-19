@@ -82,6 +82,12 @@ func serve(cfg config, version string) error {
 	}
 	serveResult := make(chan error, 1)
 	go func() { serveResult <- httpServer.Serve(listener) }()
+	if providers != nil {
+		// Prewarm shares antigravityProvider.ensureControlPlane's serialized
+		// refresh path. It starts after the listener is live and is never part of
+		// bridge startup readiness; Codex remains immediately available.
+		go providers.prewarm(context.Background())
+	}
 
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
@@ -425,7 +431,7 @@ func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, provider
 	}
 	defer s.release()
 	var outputs []any
-	stored := false
+	var completedResponse map[string]any
 	seq := 0
 	started := false
 	err := provider.stream(r.Context(), downstream, func(event map[string]any) error {
@@ -450,10 +456,7 @@ func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, provider
 					response["previous_response_id"] = previous
 				}
 				event["response"] = response
-				if !stored {
-					s.responses.remember(stringValue(response["id"]), sliceAny(prepared["input"]), response)
-					stored = true
-				}
+				completedResponse = cloneMap(response)
 			}
 		}
 		if event["sequence_number"] == nil {
@@ -476,10 +479,14 @@ func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, provider
 			return
 		}
 		writeSSE(w, map[string]any{"type": "error", "sequence_number": seq, "code": nil, "message": publicStreamError(err), "param": nil})
+		return
 	}
 	if !started {
 		writeBackendError(w, errors.New("provider returned no stream events."))
 		return
+	}
+	if completedResponse != nil {
+		s.responses.remember(stringValue(completedResponse["id"]), sliceAny(prepared["input"]), completedResponse)
 	}
 	io.WriteString(w, "data: [DONE]\n\n")
 	flusher.Flush()
@@ -718,6 +725,7 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, provider mod
 	state := chatStreamState{ID: newID("chatcmpl"), Created: int(time.Now().Unix()), Model: stringValue(responsePayload["model"]), ChoiceCount: chatChoiceCount(body["n"])}
 	includeUsage := boolValue(mapAny(body["stream_options"])["include_usage"])
 	var outputs []any
+	var completedChat map[string]any
 	emitted := map[int]string{}
 	toolIndexesByOutput := map[int]int{}
 	toolIndexesByItem := map[string]int{}
@@ -846,9 +854,7 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, provider mod
 				if metadata := mapAny(body["metadata"]); metadata != nil {
 					completion["metadata"] = cloneMap(metadata)
 				}
-				if boolValue(body["store"]) {
-					s.chats.remember(stringValue(completion["id"]), completion, mapOrEmpty(body["metadata"]))
-				}
+				completedChat = cloneMap(completion)
 				finish := stringValue(mapAny(sliceAny(completion["choices"])[0])["finish_reason"])
 				emit(chatChunk(state, map[string]any{}, &finish, nil, nil))
 				if includeUsage {
@@ -868,10 +874,14 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, provider mod
 			return
 		}
 		emit(map[string]any{"error": map[string]any{"message": publicStreamError(err), "type": "api_error", "param": nil, "code": nil}})
+		return
 	}
 	if !started {
 		writeBackendError(w, errors.New("provider returned no stream events."))
 		return
+	}
+	if completedChat != nil && boolValue(body["store"]) {
+		s.chats.remember(stringValue(completedChat["id"]), completedChat, mapOrEmpty(body["metadata"]))
 	}
 	io.WriteString(w, "data: [DONE]\n\n")
 	flusher.Flush()
@@ -939,6 +949,9 @@ func toolDelta(item map[string]any, index int, args string, identity, legacy boo
 			call["id"] = fmt.Sprintf("call_%d", index)
 		}
 		call["type"] = "function"
+		if signature := firstMapString(item, "thought_signature", "thoughtSignature"); signature != "" {
+			call["extra_content"] = map[string]any{"google": map[string]any{"thought_signature": signature}}
+		}
 	}
 	return map[string]any{"tool_calls": []any{call}}
 }
@@ -1113,6 +1126,18 @@ func writeError(w http.ResponseWriter, status int, message, typ string, param *s
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": typ, "param": p, "code": code}})
 }
 func writeBackendError(w http.ResponseWriter, err error) {
+	var providerErr *providerBackendError
+	if errors.As(err, &providerErr) {
+		if providerErr.RetryAfter != "" {
+			w.Header().Set("Retry-After", providerErr.RetryAfter)
+		}
+		typ := providerErr.ErrorType
+		if typ == "" {
+			typ = "api_error"
+		}
+		writeError(w, providerErr.Status, providerErr.Message, typ, nil, providerErr.Code)
+		return
+	}
 	var be *backendError
 	if errors.As(err, &be) {
 		writeError(w, be.Status, be.Message, "api_error", nil, nil)
@@ -1121,6 +1146,10 @@ func writeBackendError(w http.ResponseWriter, err error) {
 	}
 }
 func publicStreamError(err error) string {
+	var providerErr *providerBackendError
+	if errors.As(err, &providerErr) {
+		return providerErr.Message
+	}
 	var be *backendError
 	if errors.As(err, &be) {
 		return be.Message

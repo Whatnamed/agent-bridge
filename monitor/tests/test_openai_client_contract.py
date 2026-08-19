@@ -344,7 +344,18 @@ async def test_contract_health_and_models(runtime_server: tuple[str, str]) -> No
         api_key="contract-server-key", base_url=f"{base_url}/v1"
     ) as client:
         models = await client.models.list()
-    assert [model.id for model in models.data] == ["gpt-5.6-luna"], runtime
+    models_by_id = {model.id: model for model in models.data}
+    assert "gpt-5.6-luna" in models_by_id, runtime
+    antigravity_models = {
+        "gemini-3.7-flash-low",
+        "gemini-3.7-flash-medium",
+        "gemini-3.7-flash-high",
+    }
+    assert antigravity_models <= models_by_id.keys(), runtime
+    assert all(
+        models_by_id[model_id].owned_by == "antigravity"
+        for model_id in antigravity_models
+    ), runtime
 
     async with httpx.AsyncClient(
         base_url=base_url,

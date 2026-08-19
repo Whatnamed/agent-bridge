@@ -33,6 +33,37 @@ type backendError struct {
 
 func (e *backendError) Error() string { return e.Message }
 
+// providerBackendError carries only sanitized provider metadata. In
+// particular, it never retains an upstream response body, Authorization
+// header, token, prompt, or tool payload.
+type providerBackendError struct {
+	Status         int
+	Message        string
+	ErrorType      string
+	Code           string
+	Provider       string
+	Operation      string
+	UpstreamStatus int
+	ErrorClass     string
+	Retryable      bool
+	RetryAfter     string
+	Cause          error
+}
+
+func (e *providerBackendError) Error() string {
+	if e == nil {
+		return "provider request failed"
+	}
+	return e.Message
+}
+
+func (e *providerBackendError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
 func newBackend(cfg config) *backend {
 	client := &http.Client{Timeout: cfg.Timeout}
 	return &backend{

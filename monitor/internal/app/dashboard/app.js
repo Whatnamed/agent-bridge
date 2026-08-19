@@ -31,6 +31,15 @@
   const sourceValueLabel = (value) => ({ All: "全部", all: "全部", Unknown: "未知", unknown: "未知" }[String(value)] || value || "—");
   const sourceLabel = (item) => sourceValueLabel(sourceKey(item));
   const sourceClass = (item) => sourceKey(item).toLowerCase();
+  const providerKey = (item) => {
+    const value = String(item?.provider || "").toLowerCase();
+    if (value === "codex") return "Codex";
+    if (value === "antigravity") return "Antigravity";
+    if (String(item?.source || "").toLowerCase() === "codex") return "Codex";
+    return "Unknown";
+  };
+  const providerValueLabel = (value) => ({ All: "全部", all: "全部", Codex: "Codex", codex: "Codex", Antigravity: "Antigravity", antigravity: "Antigravity", Unknown: "未知", unknown: "未知" }[String(value)] || value || "—");
+  const providerLabel = (item) => providerValueLabel(providerKey(item));
   const recordKindLabel = (value) => ({ request: "请求", turn: "轮次" }[String(value)] || value || "—");
   const secondarySourceLabel = (value) => ({ cli: "命令行", user: "用户", subagent: "子智能体", Unknown: "未知", unknown: "未知" }[String(value)] || value || "—");
   const directionLabel = (value) => ({ upstream: "上游", downstream: "下游" }[String(value)] || value || "—");
@@ -44,6 +53,7 @@
     tool_call_output: "工具调用结果"
   }[String(value)] || value || "—");
   const sourceFilter = () => $("source-filter")?.value || "all";
+  const providerFilter = () => $("provider-filter")?.value || "all";
   const windowDuration = (minutes) => {
     if (minutes == null) return "周期不可用";
     const value = Number(minutes);
@@ -121,7 +131,7 @@
     overviewInFlight = true;
     try {
       const range = $("range")?.value || "today";
-      const query = new URLSearchParams({ range, source: sourceFilter() });
+      const query = new URLSearchParams({ range, source: sourceFilter(), provider: providerFilter() });
       const data = await json("/dashboard/api/overview?" + query.toString());
       $("bridge-status").textContent = data.bridge_status === "running" ? "运行中" : (data.bridge_status || "未知");
       $("quota-status").textContent = ({ fresh: "最新", stale: "较旧", pending: "读取中", unavailable: "不可用" }[data.quota_status] || data.quota_status || "不可用");
@@ -129,7 +139,7 @@
       $("dropped").textContent = num(data.dropped_telemetry_count);
       $("writer-errors").textContent = num(data.telemetry_writer_errors);
       $("last-quota").textContent = data.last_quota_update ? time(data.last_quota_update) : "未获取";
-      $("selected-range-label").textContent = "当前范围：" + rangeLabel(data.range || range) + " · 来源：" + sourceValueLabel(data.source || "All");
+      $("selected-range-label").textContent = "当前范围：" + rangeLabel(data.range || range) + " · 来源：" + sourceValueLabel(data.source || "All") + " · 提供方：" + providerValueLabel(data.provider || "All");
       renderQuota(data.quota);
       renderCodexCollector(data.codex);
       const stats = data.stats || {};
@@ -173,7 +183,7 @@
     const rows = data.data || [];
     $("request-table").innerHTML = rows.length ? rows.map((item) => {
       const statusClass = item.outcome === "success" ? "ok" : item.outcome === "cancelled" ? "warn" : "bad";
-      return '<tr data-id="' + esc(item.internal_request_id) + '"><td>' + esc(time(item.started_at)) + '</td><td><span class="source-badge source-' + sourceClass(item) + '">' + esc(sourceLabel(item)) + '</span><span class="cell-sub">' + esc(recordKindLabel(item.record_kind || "request")) + '</span></td><td title="' + esc(item.model || "不可用") + '">' + esc(item.model || "—") + '</td><td>' + esc(effortDisplay(item)) + '</td><td>' + tokenCell(item.input_tokens, item.cached_input_tokens, "缓存") + '</td><td>' + tokenCell(item.output_tokens, item.reasoning_tokens, "推理") + '</td><td>' + formatDuration(item.first_upstream_event_ms) + '</td><td>' + formatDuration(item.ttft_ms, "无文本") + '</td><td>' + formatDuration(durationForItem(item)) + '</td><td class="' + statusClass + '">' + esc(statusLabel(item.outcome)) + '</td></tr>';
+      return '<tr data-id="' + esc(item.internal_request_id) + '"><td>' + esc(time(item.started_at)) + '</td><td><span class="source-badge source-' + sourceClass(item) + '">' + esc(sourceLabel(item)) + '</span><span class="cell-sub">' + esc(recordKindLabel(item.record_kind || "request")) + ' · ' + esc(providerLabel(item)) + '</span></td><td title="' + esc(item.model || "不可用") + '">' + esc(item.model || "—") + '</td><td>' + esc(effortDisplay(item)) + '</td><td>' + tokenCell(item.input_tokens, item.cached_input_tokens, "缓存") + '</td><td>' + tokenCell(item.output_tokens, item.reasoning_tokens, "推理") + '</td><td>' + formatDuration(item.first_upstream_event_ms) + '</td><td>' + formatDuration(item.ttft_ms, "无文本") + '</td><td>' + formatDuration(durationForItem(item)) + '</td><td class="' + statusClass + '">' + esc(statusLabel(item.outcome)) + '</td></tr>';
     }).join("") : '<tr><td colspan="10" class="empty">当前范围没有请求或轮次。</td></tr>';
     document.querySelectorAll("#request-table tr[data-id]").forEach((row) => row.addEventListener("click", () => loadDetail(row.dataset.id)));
     updatePagination(data);
@@ -185,7 +195,7 @@
     }
     if (auto && !requestsAutoRefreshEligible()) return;
     const generation = requestGeneration;
-    const query = new URLSearchParams({ range: $("range").value, source: sourceFilter(), limit: String(requestPageSize), offset: String(requestOffset), sort: $("sort-filter").value });
+    const query = new URLSearchParams({ range: $("range").value, source: sourceFilter(), provider: providerFilter(), limit: String(requestPageSize), offset: String(requestOffset), sort: $("sort-filter").value });
     const model = $("model-filter").value.trim(), effort = $("effort-filter").value, status = $("outcome-filter").value, endpoint = $("endpoint-filter").value;
     if (model) query.set("model", model); if (effort) query.set("effort", effort); if (status) query.set("status", status); if (endpoint) query.set("endpoint", endpoint);
     requestInFlight = true;
@@ -268,6 +278,7 @@
   $("refresh-requests").addEventListener("click", () => loadRequests({ force: true }));
   $("range").addEventListener("change", () => { loadOverview(); resetRequestPage(); });
   $("source-filter").addEventListener("change", () => { loadOverview(); resetRequestPage(); });
+  $("provider-filter").addEventListener("change", () => { loadOverview(); resetRequestPage(); });
   $("model-filter").addEventListener("keydown", (event) => { if (event.key === "Enter") resetRequestPage(); });
   $("effort-filter").addEventListener("change", resetRequestPage);
   $("outcome-filter").addEventListener("change", resetRequestPage);

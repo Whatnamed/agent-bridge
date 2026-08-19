@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -143,6 +144,9 @@ type requestRecord struct {
 	UpstreamEncryptedReasoningEnable bool    `json:"upstream_encrypted_reasoning_enabled"`
 	ClientDisconnected               bool    `json:"client_disconnected"`
 	UpstreamStreamError              bool    `json:"upstream_stream_error"`
+	UpstreamStatus                   *int    `json:"upstream_status,omitempty"`
+	ErrorClass                       string  `json:"error_class,omitempty"`
+	Retryable                        *bool   `json:"retryable,omitempty"`
 
 	Timeline []telemetryEvent `json:"-"`
 }
@@ -1382,6 +1386,27 @@ func (t *requestTelemetry) observeStreamError() {
 	t.mu.Lock()
 	t.record.UpstreamStreamError = true
 	t.mu.Unlock()
+}
+
+func (t *requestTelemetry) observeProviderError(err error) {
+	if t == nil || err == nil {
+		return
+	}
+	var providerErr *providerBackendError
+	if !errors.As(err, &providerErr) {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if providerErr.UpstreamStatus != 0 {
+		status := providerErr.UpstreamStatus
+		t.record.UpstreamStatus = &status
+	}
+	if providerErr.ErrorClass != "" {
+		t.record.ErrorClass = safeToken(providerErr.ErrorClass)
+	}
+	retryable := providerErr.Retryable
+	t.record.Retryable = &retryable
 }
 
 func observeUsage(record *requestRecord, usage map[string]any) {

@@ -21,13 +21,13 @@ type scriptedModelProvider struct {
 
 func (p scriptedModelProvider) ID() string { return "scripted" }
 func (p scriptedModelProvider) stream(_ context.Context, _ map[string]any, fn func(map[string]any) error) error {
-	if p.err != nil {
-		return p.err
-	}
 	for _, event := range p.events {
 		if err := fn(event); err != nil {
 			return err
 		}
+	}
+	if p.err != nil {
+		return p.err
 	}
 	return nil
 }
