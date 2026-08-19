@@ -773,7 +773,7 @@ func TestTelemetryQuotaRefreshIsBoundedAndFailOpen(t *testing.T) {
 	defer store.close()
 	store.refreshQuota()
 	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) && fetcher.calls.Load() == 0 {
+	for time.Now().Before(deadline) && (fetcher.calls.Load() == 0 || store.quotaSnapshot() == nil || store.quotaUpdateTime().IsZero()) {
 		time.Sleep(time.Millisecond)
 	}
 	store.refreshQuota()
