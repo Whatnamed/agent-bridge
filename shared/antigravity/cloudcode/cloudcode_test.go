@@ -178,6 +178,28 @@ func TestClientRefreshesOnceAfter401(t *testing.T) {
 	}
 }
 
+func TestStreamGenerateContentPreservesUpstreamHTTPStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":{"message":"provider detail must not be retained"}}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, testStaticToken{value: "test-token"})
+	client.HTTPClient = server.Client()
+	_, err := client.StreamGenerateContent(context.Background(), GenerateRequest{Model: "model"})
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("error = %v, want HTTPError", err)
+	}
+	if httpErr.StatusCode != http.StatusServiceUnavailable || httpErr.Operation != "streamGenerateContent" {
+		t.Fatalf("HTTP error = %+v", httpErr)
+	}
+	if strings.Contains(err.Error(), "provider detail") {
+		t.Fatalf("upstream response body leaked: %v", err)
+	}
+}
+
 func TestStreamCancellationClosesRequest(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

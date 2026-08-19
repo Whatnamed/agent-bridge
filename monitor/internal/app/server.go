@@ -415,7 +415,6 @@ func (s *server) createResponse(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, provider modelProvider, prepared, downstream map[string]any, previous string) {
-	setSSE(w)
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, 500, "Streaming unsupported.", "api_error", nil, nil)
@@ -428,7 +427,12 @@ func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, provider
 	var outputs []any
 	stored := false
 	seq := 0
+	started := false
 	err := provider.stream(r.Context(), downstream, func(event map[string]any) error {
+		if !started {
+			setSSE(w)
+			started = true
+		}
 		eventType := stringValue(event["type"])
 		if item := mapAny(event["item"]); eventType == "response.output_item.done" && item != nil {
 			outputs = append(outputs, item)
@@ -467,7 +471,15 @@ func (s *server) streamResponse(w http.ResponseWriter, r *http.Request, provider
 		if observer := telemetryFromContext(r.Context()); observer != nil {
 			observer.observeStreamError()
 		}
+		if !started {
+			writeBackendError(w, err)
+			return
+		}
 		writeSSE(w, map[string]any{"type": "error", "sequence_number": seq, "code": nil, "message": publicStreamError(err), "param": nil})
+	}
+	if !started {
+		writeBackendError(w, errors.New("provider returned no stream events."))
+		return
 	}
 	io.WriteString(w, "data: [DONE]\n\n")
 	flusher.Flush()
@@ -695,7 +707,6 @@ func (s *server) chatCollection(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) streamChat(w http.ResponseWriter, r *http.Request, provider modelProvider, responsePayload, body map[string]any, legacy bool) {
-	setSSE(w)
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return
@@ -711,6 +722,7 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, provider mod
 	toolIndexesByOutput := map[int]int{}
 	toolIndexesByItem := map[string]int{}
 	nextToolIndex := 0
+	started := false
 	assignToolIndex := func(outputIndex int, itemID string) int {
 		if index, ok := toolIndexesByOutput[outputIndex]; ok {
 			if itemID != "" {
@@ -740,6 +752,10 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, provider mod
 		return index, ok
 	}
 	emit := func(v map[string]any) {
+		if !started {
+			setSSE(w)
+			started = true
+		}
 		if observer := telemetryFromContext(r.Context()); observer != nil {
 			observer.observeDownstreamEvent(v)
 		}
@@ -847,7 +863,15 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, provider mod
 		if observer := telemetryFromContext(r.Context()); observer != nil {
 			observer.observeStreamError()
 		}
+		if !started {
+			writeBackendError(w, err)
+			return
+		}
 		emit(map[string]any{"error": map[string]any{"message": publicStreamError(err), "type": "api_error", "param": nil, "code": nil}})
+	}
+	if !started {
+		writeBackendError(w, errors.New("provider returned no stream events."))
+		return
 	}
 	io.WriteString(w, "data: [DONE]\n\n")
 	flusher.Flush()
