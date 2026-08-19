@@ -379,6 +379,13 @@ func (s *server) createResponse(w http.ResponseWriter, r *http.Request) {
 		writeBackendError(w, err)
 		return
 	}
+	if err := validateProviderPayload(provider, downstream); err != nil {
+		if observer := telemetryFromContext(r.Context()); observer != nil {
+			observer.observeStreamError()
+		}
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", nil, nil)
+		return
+	}
 	if boolValue(body["stream"]) {
 		s.streamResponse(w, r, provider, prepared, downstream, previous)
 		return
@@ -646,6 +653,13 @@ func (s *server) chatCollection(w http.ResponseWriter, r *http.Request) {
 			observer.observeStreamError()
 		}
 		writeBackendError(w, err)
+		return
+	}
+	if err := validateProviderPayload(provider, responsePayload); err != nil {
+		if observer := telemetryFromContext(r.Context()); observer != nil {
+			observer.observeStreamError()
+		}
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", nil, nil)
 		return
 	}
 	legacy := body["functions"] != nil || body["function_call"] != nil

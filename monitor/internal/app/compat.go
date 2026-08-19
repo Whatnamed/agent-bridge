@@ -472,10 +472,10 @@ func responseToChat(response map[string]any, fallback string, legacy bool, n int
 			continue
 		}
 		fn := map[string]any{"name": stringValue(item["name"]), "arguments": stringValue(item["arguments"])}
-		if signature := firstMapString(item, "thought_signature", "thoughtSignature"); signature != "" {
-			fn["thought_signature"] = signature
-		}
 		if legacy {
+			if signature := firstMapString(item, "thought_signature", "thoughtSignature"); signature != "" {
+				fn["thought_signature"] = signature
+			}
 			if legacyCall == nil {
 				legacyCall = fn
 			}

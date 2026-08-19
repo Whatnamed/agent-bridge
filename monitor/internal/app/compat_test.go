@@ -63,6 +63,9 @@ func TestChatToolContinuationPreservesFunctionNameAndThoughtSignature(t *testing
 	if !strings.HasPrefix(transportID, thoughtSignatureToolCallIDPrefix) {
 		t.Fatalf("thought signature was not carried by tool call id: %q", transportID)
 	}
+	if fn := mapAny(toolCall["function"]); fn["thought_signature"] != nil {
+		t.Fatalf("modern Chat function leaked thought signature: %#v", fn)
+	}
 
 	converted, err := chatToResponse(map[string]any{
 		"model": "gemini-3.7-flash-high",
@@ -85,6 +88,30 @@ func TestChatToolContinuationPreservesFunctionNameAndThoughtSignature(t *testing
 	output := mapAny(input[1])
 	if output["call_id"] != "call-1" || output["name"] != "get_test_value" {
 		t.Fatalf("converted function output = %#v", output)
+	}
+	legacyCompletion := responseToChat(response, "fallback", true, 1)
+	legacyCall := mapAny(mapAny(sliceAny(legacyCompletion["choices"])[0])["message"])["function_call"]
+	if mapAny(legacyCall)["thought_signature"] != "signature-1" {
+		t.Fatalf("legacy function_call lost thought signature: %#v", legacyCall)
+	}
+}
+
+func TestModernChatToolDeltaUsesTransportIDWithoutNonstandardFunctionField(t *testing.T) {
+	item := map[string]any{
+		"id": "call-1", "call_id": "call-1", "name": "get_test_value", "arguments": `{"name":"smoke"}`,
+		"thought_signature": "signature-1",
+	}
+	delta := toolDelta(item, 0, item["arguments"].(string), true, false)
+	toolCall := mapAny(sliceAny(delta["tool_calls"])[0])
+	if !strings.HasPrefix(stringValue(toolCall["id"]), thoughtSignatureToolCallIDPrefix) {
+		t.Fatalf("stream tool call did not use transport id: %#v", toolCall)
+	}
+	if fn := mapAny(toolCall["function"]); fn["thought_signature"] != nil {
+		t.Fatalf("stream modern function leaked thought signature: %#v", fn)
+	}
+	legacy := toolDelta(item, 0, "", true, true)
+	if mapAny(legacy["function_call"])["thought_signature"] != "signature-1" {
+		t.Fatalf("legacy stream function_call lost thought signature: %#v", legacy)
 	}
 }
 

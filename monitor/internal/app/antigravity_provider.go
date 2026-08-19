@@ -60,6 +60,10 @@ func newAntigravityProvider(cfg config) (*antigravityProvider, error) {
 
 func (p *antigravityProvider) ID() string { return antigravityProviderID }
 
+func (p *antigravityProvider) validatePayload(payload map[string]any) error {
+	return validateAntigravityPayload(payload)
+}
+
 func (p *antigravityProvider) listModels(ctx context.Context) ([]string, error) {
 	if err := p.ensureControlPlane(ctx); err != nil {
 		return nil, err
@@ -308,15 +312,17 @@ func (p *antigravityProvider) emitCanonicalStream(ctx context.Context, stream *c
 		if event.Text != "" {
 			text.WriteString(event.Text)
 			if messageItem == nil {
-				messageItem = map[string]any{"id": newID("msg"), "type": "message", "role": "assistant", "status": "in_progress", "phase": "final_answer", "content": []any{map[string]any{"type": "output_text", "text": "", "annotations": []any{}, "logprobs": []any{}}}}
+				messageItem = map[string]any{"id": newID("msg"), "type": "message", "role": "assistant", "status": "in_progress", "phase": "final_answer", "content": []any{}}
 				items = append(items, messageItem)
 				outputIndex := len(items) - 1
 				if err := emitAntigravityEvent(ctx, fn, map[string]any{"type": "response.output_item.added", "output_index": outputIndex, "item": cloneMap(messageItem)}); err != nil {
 					return err
 				}
+				part := map[string]any{"type": "output_text", "text": "", "annotations": []any{}, "logprobs": []any{}}
+				messageItem["content"] = []any{part}
 				if err := emitAntigravityEvent(ctx, fn, map[string]any{
 					"type": "response.content_part.added", "output_index": outputIndex, "item_id": messageItem["id"], "content_index": 0,
-					"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}, "logprobs": []any{}},
+					"part": cloneMap(part),
 				}); err != nil {
 					return err
 				}
@@ -422,7 +428,7 @@ func (p *antigravityProvider) emitCanonicalStream(ctx context.Context, stream *c
 			item["arguments"] = arguments
 			item["status"] = "completed"
 			if err := emitAntigravityEvent(ctx, fn, map[string]any{
-				"type": "response.function_call_arguments.done", "output_index": outputIndex, "item_id": item["id"], "arguments": arguments,
+				"type": "response.function_call_arguments.done", "output_index": outputIndex, "item_id": item["id"], "name": item["name"], "arguments": arguments,
 			}); err != nil {
 				return err
 			}
@@ -514,6 +520,9 @@ func antigravityUsage(usage cloudcode.Usage) map[string]any {
 }
 
 func buildAntigravityRequest(payload map[string]any, model, project string) (cloudcode.GenerateRequest, error) {
+	if err := validateAntigravityPayload(payload); err != nil {
+		return cloudcode.GenerateRequest{}, err
+	}
 	requestID, err := cloudcode.NewRequestID()
 	if err != nil {
 		return cloudcode.GenerateRequest{}, err
@@ -558,6 +567,60 @@ func buildAntigravityRequest(payload map[string]any, model, project string) (clo
 		request.Request.GenerationConfig = generation
 	}
 	return request, nil
+}
+
+func validateAntigravityPayload(payload map[string]any) error {
+	if parallel, ok := payload["parallel_tool_calls"]; ok && parallel != nil {
+		if enabled, ok := parallel.(bool); ok && !enabled {
+			return errors.New("Antigravity does not support parallel_tool_calls=false")
+		}
+	}
+	if text, ok := payload["text"].(map[string]any); ok {
+		if format, exists := text["format"]; exists && format != nil {
+			formatType := strings.TrimSpace(stringValue(mapAny(format)["type"]))
+			if formatType == "" {
+				return errors.New("Antigravity does not support text.format")
+			}
+			return fmt.Errorf("Antigravity does not support text.format %q", formatType)
+		}
+	}
+	if raw, exists := payload["response_format"]; exists && raw != nil {
+		formatType := ""
+		if format := mapAny(raw); format != nil {
+			formatType = strings.TrimSpace(stringValue(format["type"]))
+		}
+		if formatType == "" {
+			return errors.New("Antigravity does not support response_format")
+		}
+		return fmt.Errorf("Antigravity does not support response_format %q", formatType)
+	}
+	if inputType := unsupportedAntigravityInputType(payload["input"]); inputType != "" {
+		return fmt.Errorf("Antigravity does not support %s input", inputType)
+	}
+	return nil
+}
+
+func unsupportedAntigravityInputType(value any) string {
+	switch current := value.(type) {
+	case []any:
+		for _, item := range current {
+			if typ := unsupportedAntigravityInputType(item); typ != "" {
+				return typ
+			}
+		}
+	case map[string]any:
+		typ := strings.ToLower(strings.TrimSpace(stringValue(current["type"])))
+		switch typ {
+		case "image", "image_url", "input_image":
+			return typ
+		}
+		for _, child := range current {
+			if typ := unsupportedAntigravityInputType(child); typ != "" {
+				return typ
+			}
+		}
+	}
+	return ""
 }
 
 func antigravityContents(input []any) ([]cloudcode.Content, []cloudcode.ContentPart, error) {
